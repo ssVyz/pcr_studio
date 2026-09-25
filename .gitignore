@@ -1,1 +1,7 @@
 /target
+/context
+
+.claude/
+*.md
+!README.md
+!CHANGELOG.md
