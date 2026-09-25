@@ -11,7 +11,7 @@ use crate::db::{self, Db};
 use crate::display::SortKey;
 use crate::fasta;
 use crate::mapper::{self, MapParams};
-use crate::model::{Annotation, AnnotationKind, ConsensusThreshold, DocInfo, DocKind, Document, Row};
+use crate::model::{Annotation, AnnotationKind, ConsensusThreshold, DocInfo, DocKind, Document, Folder, Row};
 use crate::primer::{self, OligoSource, Orientation, PrimerOptions};
 use crate::search::{self, Scope};
 use canvas::ViewMsg;
@@ -69,6 +69,19 @@ impl std::fmt::Display for GroupChoice {
     }
 }
 
+/// Destination folder in the "Move to" pick list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderChoice {
+    pub id: Option<i64>,
+    pub label: String,
+}
+
+impl std::fmt::Display for FolderChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
 pub struct LoadedDoc {
     open: OpenDoc,
 }
@@ -87,6 +100,15 @@ pub enum Message {
     AskRename(i64),
     AskDelete(i64),
     ConfirmDelete(i64),
+    SelectFolder(i64),
+    ToggleFolder(i64),
+    NewFolder,
+    AskRenameFolder(i64),
+    AskDeleteFolder(i64),
+    ConfirmDeleteFolder(i64),
+    MoveTo(FolderChoice),
+    ExtractSlice,
+    SliceDone(Payload<Result<(i64, String), String>>),
     // Viewer
     View(ViewMsg),
     ZoomIn,
@@ -164,6 +186,9 @@ pub struct App {
     db_path: PathBuf,
     library: Vec<DocInfo>,
     library_selected: Option<i64>,
+    folders: Vec<Folder>,
+    /// Selected folder (mutually exclusive with `library_selected`).
+    folder_selected: Option<i64>,
     open: Option<OpenDoc>,
     settings: AppSettings,
     job: Option<Job>,
@@ -185,11 +210,26 @@ impl App {
         };
         let settings: AppSettings = db.setting(SETTINGS_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let library = db.list_documents().unwrap_or_default();
+        let folders = db.list_folders().unwrap_or_default();
         let status = format!("Library: {} · {} document(s)", db_path.display(), library.len());
         // FASTA files given on the command line ("Open with…") are imported right away.
         let paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).filter(|p| p.is_file()).collect();
         let task = if paths.is_empty() { Task::none() } else { Task::done(Message::ImportPicked(Some(paths))) };
-        (App { db, db_path, library, library_selected: None, open: None, settings, job: None, modal: None, status, error }, task)
+        let app = App {
+            db,
+            db_path,
+            library,
+            library_selected: None,
+            folders,
+            folder_selected: None,
+            open: None,
+            settings,
+            job: None,
+            modal: None,
+            status,
+            error,
+        };
+        (app, task)
     }
 
     fn title(&self) -> String {
@@ -228,6 +268,45 @@ impl App {
             Ok(l) => self.library = l,
             Err(e) => self.error = Some(e),
         }
+        match self.db.list_folders() {
+            Ok(f) => self.folders = f,
+            Err(e) => self.error = Some(e),
+        }
+        if self.folder_selected.is_some_and(|id| !self.folders.iter().any(|f| f.id == id)) {
+            self.folder_selected = None;
+        }
+    }
+
+    /// Folder that receives new documents: the selected folder, or the folder
+    /// of the selected document.
+    fn target_folder(&self) -> Option<i64> {
+        self.folder_selected
+            .or_else(|| self.library_selected.and_then(|id| self.library.iter().find(|d| d.id == id)).and_then(|d| d.folder))
+    }
+
+    /// Makes all ancestors of `folder` expanded so its content is visible.
+    fn reveal_folder(&mut self, folder: Option<i64>) {
+        let mut cur = folder;
+        while let Some(id) = cur {
+            let Some(f) = self.folders.iter_mut().find(|f| f.id == id) else { break };
+            if f.collapsed {
+                f.collapsed = false;
+                let _ = self.db.set_folder_collapsed(id, false);
+            }
+            cur = f.parent;
+        }
+    }
+
+    /// Folder ids of `id` and everything below it.
+    fn folder_subtree(&self, id: i64) -> Vec<i64> {
+        let mut out = vec![id];
+        let mut i = 0;
+        while i < out.len() {
+            let cur = out[i];
+            out.extend(self.folders.iter().filter(|f| f.parent == Some(cur)).map(|f| f.id));
+            i += 1;
+        }
+        out
     }
 
     fn busy(&self) -> bool {
@@ -287,10 +366,91 @@ impl App {
             Message::Tick | Message::Noop => {}
             Message::Key(e) => return self.on_key(e),
             Message::SelectLibraryDoc(id) => {
+                self.folder_selected = None;
                 if self.library_selected == Some(id) {
                     return self.open_document(id);
                 }
                 self.library_selected = Some(id);
+            }
+            Message::SelectFolder(id) => {
+                // A second click on the selected folder expands/collapses it.
+                if self.folder_selected == Some(id) {
+                    return self.update(Message::ToggleFolder(id));
+                }
+                self.folder_selected = Some(id);
+                self.library_selected = None;
+            }
+            Message::ToggleFolder(id) => {
+                if let Some(f) = self.folders.iter_mut().find(|f| f.id == id) {
+                    f.collapsed = !f.collapsed;
+                    if let Err(e) = self.db.set_folder_collapsed(id, f.collapsed) {
+                        self.error = Some(e);
+                    }
+                }
+            }
+            Message::NewFolder => {
+                let parent = self.target_folder();
+                match self.db.create_folder("New folder", parent) {
+                    Ok(id) => {
+                        self.reload_library();
+                        self.reveal_folder(parent);
+                        self.folder_selected = Some(id);
+                        self.library_selected = None;
+                        self.modal = Some(Modal::Rename { id, text: "New folder".into(), folder: true });
+                        return dialogs::focus_rename();
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            Message::AskRenameFolder(id) => {
+                if let Some(f) = self.folders.iter().find(|f| f.id == id) {
+                    self.modal = Some(Modal::Rename { id, text: f.name.clone(), folder: true });
+                    return dialogs::focus_rename();
+                }
+            }
+            Message::AskDeleteFolder(id) => {
+                if let Some(f) = self.folders.iter().find(|f| f.id == id) {
+                    self.modal = Some(Modal::ConfirmDeleteFolder { id, name: f.name.clone() });
+                }
+            }
+            Message::ConfirmDeleteFolder(id) => {
+                self.modal = None;
+                if let Err(e) = self.db.delete_folder(id) {
+                    self.error = Some(e);
+                }
+                self.folder_selected = None;
+                self.reload_library();
+            }
+            Message::MoveTo(choice) => {
+                let result = match (self.library_selected, self.folder_selected) {
+                    (Some(doc), _) => self.db.move_document(doc, choice.id),
+                    (None, Some(folder)) => self.db.move_folder(folder, choice.id),
+                    _ => Ok(()),
+                };
+                match result {
+                    Ok(()) => {
+                        self.reload_library();
+                        self.reveal_folder(choice.id);
+                        self.status = format!("Moved to {}", choice.label.trim_start_matches(['·', ' ']));
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            Message::ExtractSlice => return self.extract_slice(),
+            Message::SliceDone(p) => {
+                self.job = None;
+                match p.take() {
+                    Some(Ok((id, msg))) => {
+                        self.reload_library();
+                        let folder = self.library.iter().find(|d| d.id == id).and_then(|d| d.folder);
+                        self.reveal_folder(folder);
+                        self.library_selected = Some(id);
+                        self.folder_selected = None;
+                        self.status = msg;
+                    }
+                    Some(Err(e)) => self.error = Some(e),
+                    None => {}
+                }
             }
             Message::OpenDocument(id) => return self.open_document(id),
             Message::DocLoaded(p) => {
@@ -331,6 +491,7 @@ impl App {
             }
             Message::ImportPicked(Some(paths)) if !paths.is_empty() => {
                 let db_path = self.db_path.clone();
+                let folder = self.target_folder();
                 return self.start_job(
                     "Importing FASTA",
                     false,
@@ -344,7 +505,7 @@ impl App {
                             let imp = fasta::read_fasta(path, &|f| p.set(base + f * 0.7 / n, &label))?;
                             p.set(base + 0.7 / n, "Saving to library");
                             let desc = format!("Imported from {}", path.display());
-                            let id = db.insert_document(&imp.name, imp.kind, &imp.document, None, &desc, &|f| {
+                            let id = db.insert_document(&imp.name, imp.kind, &imp.document, None, &desc, folder, &|f| {
                                 p.set_fraction(base + (0.7 + 0.3 * f) / n)
                             })?;
                             ids.push(id);
@@ -371,7 +532,8 @@ impl App {
             }
             Message::AskRename(id) => {
                 if let Some(d) = self.library.iter().find(|d| d.id == id) {
-                    self.modal = Some(Modal::Rename { id, text: d.name.clone() });
+                    self.modal = Some(Modal::Rename { id, text: d.name.clone(), folder: false });
+                    return dialogs::focus_rename();
                 }
             }
             Message::AskDelete(id) => {
@@ -437,7 +599,11 @@ impl App {
                 od.search.mismatches = m;
                 od.search.searched = false;
             }),
-            Message::SetHighlight(h) => self.set_pref(|p| p.highlight = h),
+            Message::SetHighlight(h) => {
+                self.set_pref(|p| p.highlight = h);
+                let prefs = self.settings.view.clone();
+                self.with_doc(|od, _| od.recompute_graphs(&prefs));
+            }
             Message::ToggleDots(b) => self.set_pref(|p| p.use_dots = b),
             Message::ToggleGaps(b) => self.set_pref(|p| p.highlight_gaps = b),
             Message::ToggleConsensus(b) => self.set_pref(|p| p.show_consensus = b),
@@ -960,13 +1126,14 @@ impl App {
                 }
             }
             ModalMsg::RenameConfirm => {
-                if let Some(Modal::Rename { id, text }) = self.modal.take() {
+                if let Some(Modal::Rename { id, text, folder }) = self.modal.take() {
                     let name = text.trim();
                     if !name.is_empty() {
-                        if let Err(e) = self.db.rename_document(id, name) {
+                        let r = if folder { self.db.rename_folder(id, name) } else { self.db.rename_document(id, name) };
+                        if let Err(e) = r {
                             self.error = Some(e);
                         }
-                        if let Some(od) = self.open.as_mut().filter(|o| o.info.id == id) {
+                        if let Some(od) = self.open.as_mut().filter(|o| !folder && o.info.id == id) {
                             od.info.name = name.to_string();
                         }
                         self.reload_library();
@@ -1098,10 +1265,12 @@ impl App {
             && let Some(r) = od.reference {
                 query_rows.retain(|&i| i != r);
             }
+        let od_folder = od.info.folder;
         self.settings.map = params.clone();
         self.save_settings();
         self.modal = None;
         let db_path = self.db_path.clone();
+        let folder = od_folder;
         self.start_job(
             "Map to reference",
             true,
@@ -1136,14 +1305,53 @@ impl App {
                     r.seconds
                 );
                 p.set(0.96, "Saving contig");
-                let id = db.insert_document(&name, DocKind::Contig, &out.contig, Some(0), &report, &|f| p.set_fraction(0.96 + f * 0.03))?;
+                let id = db.insert_document(&name, DocKind::Contig, &out.contig, Some(0), &report, folder, &|f| p.set_fraction(0.96 + f * 0.03))?;
                 if save_unmapped && !out.unmapped.is_empty() {
                     let un = Document::new(out.unmapped);
-                    db.insert_document(&format!("{name} – unmapped"), DocKind::Sequences, &un, None, "Sequences that did not map", &|_| {})?;
+                    db.insert_document(&format!("{name} – unmapped"), DocKind::Sequences, &un, None, "Sequences that did not map", folder, &|_| {})?;
                 }
                 Ok((id, report))
             },
             |r| Message::MapDone(Payload::new(r.unwrap_or_else(|| Err("Mapping failed unexpectedly".into())))),
+        )
+    }
+
+    /// Saves the selected columns of all sequences (without the reference) as a
+    /// new library document next to the open one.
+    fn extract_slice(&mut self) -> Task<Message> {
+        if self.busy() {
+            return Task::none();
+        }
+        let Some(od) = self.open.as_ref() else { return Task::none() };
+        let Some(sel) = od.selection else {
+            self.error = Some("Select a column range first (drag across the alignment).".into());
+            return Task::none();
+        };
+        let doc = od.doc.clone();
+        let reference = od.reference;
+        let folder = od.info.folder;
+        let kind = if od.info.kind == DocKind::Sequences { DocKind::Sequences } else { DocKind::Alignment };
+        let range = match od.ref_range(sel.c0, sel.c1) {
+            Some((a, b)) => format!("ref {a}-{b}"),
+            None => format!("columns {}-{}", sel.c0 + 1, sel.c1),
+        };
+        let name = format!("{} [{range}]", od.info.name);
+        let source = od.info.name.clone();
+        let db_path = self.db_path.clone();
+        self.start_job(
+            "Extracting slice",
+            false,
+            move |p| {
+                let slice = doc.slice_columns(sel.c0, sel.c1, reference);
+                if slice.rows.is_empty() {
+                    return Err("No sequence has bases in the selected columns".to_string());
+                }
+                let mut db = Db::open(&db_path)?;
+                let desc = format!("Slice {range} of “{source}”");
+                let id = db.insert_document(&name, kind, &slice, None, &desc, folder, &|f| p.set_fraction(f))?;
+                Ok((id, format!("Saved “{name}”: {} sequences × {} columns", canvas::group_digits(slice.rows.len()), slice.width)))
+            },
+            |r| Message::SliceDone(Payload::new(r.unwrap_or_else(|| Err("Extracting the slice failed".into())))),
         )
     }
 
@@ -1152,6 +1360,7 @@ impl App {
             return Task::none();
         }
         let db_path = self.db_path.clone();
+        let folder = self.target_folder();
         self.start_job(
             "Generating demo data",
             false,
@@ -1162,7 +1371,7 @@ impl App {
                 let mut rows = vec![reference];
                 rows.extend(queries);
                 let doc = Document::new(rows);
-                let id = db.insert_document("Demo genomes (35 kb × 2,000)", DocKind::Sequences, &doc, Some(0), "Synthetic demo data", &|f| {
+                let id = db.insert_document("Demo genomes (35 kb × 2,000)", DocKind::Sequences, &doc, Some(0), "Synthetic demo data", folder, &|f| {
                     p.set_fraction(0.3 + 0.7 * f)
                 })?;
                 Ok(vec![id])

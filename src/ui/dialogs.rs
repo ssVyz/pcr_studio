@@ -7,12 +7,21 @@ use crate::model::DocInfo;
 use iced::widget::{Space, button, checkbox, column, container, pick_list, row, rule, text, text_input};
 use iced::{Element, Fill, Length, Task};
 
+/// Id of the rename text field, focused when the dialog opens.
+pub const RENAME_INPUT: &str = "rename-input";
+
+/// Focuses the rename field and selects its text.
+pub fn focus_rename<T: Send + 'static>() -> Task<T> {
+    Task::batch([iced::widget::operation::focus(RENAME_INPUT), iced::widget::operation::select_all(RENAME_INPUT)])
+}
+
 pub enum Modal {
     Map(MapDialog),
     Export(ExportDialog),
     Settings(SettingsDialog),
-    Rename { id: i64, text: String },
+    Rename { id: i64, text: String, folder: bool },
     ConfirmDelete { id: i64, name: String },
+    ConfirmDeleteFolder { id: i64, name: String },
     NameFields { delimiter: String, keys: String },
     Info { title: String, text: String },
 }
@@ -552,8 +561,9 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
         Modal::Map(d) => d.view(),
         Modal::Export(d) => d.view(),
         Modal::Settings(d) => d.view(),
-        Modal::Rename { text: t, .. } => {
+        Modal::Rename { text: t, folder, .. } => {
             let body = text_input("Name", t)
+                .id(RENAME_INPUT)
                 .on_input(|s| Message::Modal(ModalMsg::RenameInput(s)))
                 .on_submit(Message::Modal(ModalMsg::RenameConfirm))
                 .padding(8);
@@ -563,7 +573,7 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
                 button("Rename").on_press(Message::Modal(ModalMsg::RenameConfirm)).style(button::primary),
             ]
             .spacing(10);
-            dialog_frame("Rename document", body.into(), buttons.into(), 420.0)
+            dialog_frame(if *folder { "Rename folder" } else { "Rename document" }, body.into(), buttons.into(), 420.0)
         }
         Modal::ConfirmDelete { id, name } => {
             let body = text(format!("Delete “{name}” from the library? This cannot be undone.")).size(14);
@@ -574,6 +584,16 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
             ]
             .spacing(10);
             dialog_frame("Delete document", body.into(), buttons.into(), 420.0)
+        }
+        Modal::ConfirmDeleteFolder { id, name } => {
+            let body = text(format!("Delete the folder “{name}”? Its documents and subfolders are kept and move up one level.")).size(14);
+            let buttons = row![
+                Space::new().width(Fill),
+                button("Cancel").on_press(Message::CloseModal).style(button::secondary),
+                button("Delete folder").on_press(Message::ConfirmDeleteFolder(*id)).style(button::danger),
+            ]
+            .spacing(10);
+            dialog_frame("Delete folder", body.into(), buttons.into(), 440.0)
         }
         Modal::NameFields { delimiter, keys } => {
             let body = column![

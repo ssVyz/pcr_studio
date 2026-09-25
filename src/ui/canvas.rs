@@ -821,8 +821,10 @@ impl Drawer<'_, '_> {
                     if ca >= width {
                         break;
                     }
-                    // Zoomed out: the weakest column of the pixel, so variable sites stay visible.
-                    if let Some(v) = track[ca..cb].iter().flatten().copied().reduce(f32::min) {
+                    // Zoomed out: mean of the pixel's columns (on the log scale a single
+                    // variable site still pulls a conserved bin down visibly).
+                    let (sum, n) = track[ca..cb].iter().flatten().fold((0.0f32, 0u32), |(s, n), v| (s + v, n + 1));
+                    if let Some(v) = (n > 0).then(|| sum / n as f32) {
                         bar(f, x, 1.0, v);
                     }
                 }

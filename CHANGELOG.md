@@ -7,6 +7,29 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.0.3] - 2026-09-25
+
+### Added
+
+- Library folders: nested, collapsible folders (state persisted), "New folder", rename,
+  delete (contents move up one level), "Move to…" for documents and folders with cycle
+  protection. Imports, demo data, mapping results and slices are stored in the current
+  folder. Existing libraries are upgraded automatically (`folders` table, `folder_id` column).
+- "Extract slice" (selection panel and oligo report): saves the selected columns of all
+  sequences, without the reference and with the original names and metadata, as a new
+  library document; empty sequences and all-gap columns are dropped
+  (`Document::slice_columns`).
+- Rename dialogs focus the name field with its text selected.
+
+### Changed
+
+- Identity and conservation graphs never count gaps as identical: they compare against the
+  reference (when highlighting disagreements to it) or the column's majority state; a gap or
+  missing comparison residue scores 0, and gap/gap pairs no longer count as identical pairs.
+  The graphs update when the highlight mode changes.
+- Zoomed out, the graph shows the mean of each pixel's columns instead of the minimum.
+- Larger folder expand/collapse arrow in the library.
+
 ## [0.0.2] - 2026-09-25
 
 Initial implementation of PCR Studio: a desktop sequence viewer for PCR

@@ -255,10 +255,25 @@ impl OpenDoc {
     pub fn recompute_stats(&mut self, prefs: &ViewPrefs) {
         self.stats = ColumnStats::compute(&self.doc, self.reference);
         self.consensus = self.stats.consensus(prefs.threshold, b' ');
-        self.identity = self.stats.identity_track();
-        self.conservation = self.stats.conservation_track();
         self.ref_coords = self.reference.map(|r| RefCoords::new(&self.doc.rows[r], self.doc.width));
+        self.recompute_graphs(prefs);
         self.row_identity = None;
+    }
+
+    /// Identity/conservation tracks against the comparison sequence: the
+    /// reference when highlighting disagreements to it, otherwise the
+    /// per-column majority state. Gaps never count as identical.
+    pub fn recompute_graphs(&mut self, prefs: &ViewPrefs) {
+        let stats = &self.stats;
+        let (identity, conservation) = match (prefs.highlight, self.reference) {
+            (Highlight::Reference, Some(r)) => {
+                let row = &self.doc.rows[r];
+                stats.graph_tracks(|c| row.at(c))
+            }
+            _ => stats.graph_tracks(|c| stats.majority_state(c)),
+        };
+        self.identity = identity;
+        self.conservation = conservation;
     }
 
     pub fn recompute_consensus(&mut self, prefs: &ViewPrefs) {

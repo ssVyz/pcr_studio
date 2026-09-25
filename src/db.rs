@@ -1,6 +1,6 @@
 //! SQLite document library, stored next to the executable (`pcr_studio.db`).
 
-use crate::model::{Annotation, AnnotationKind, DocInfo, DocKind, Document, Row};
+use crate::model::{Annotation, AnnotationKind, DocInfo, DocKind, Document, Folder, Row};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS annotations (
     end_col     INTEGER NOT NULL,
     note        TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS folders (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL,
+    parent_id   INTEGER REFERENCES folders(id) ON DELETE CASCADE,
+    collapsed   INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -69,13 +75,22 @@ impl Db {
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
             .map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| format!("Cannot initialize database: {e}"))?;
+        // Libraries created before folders existed get the column added.
+        let has_folder: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('documents') WHERE name = 'folder_id'")
+            .and_then(|mut st| st.exists([]))
+            .map_err(|e| e.to_string())?;
+        if !has_folder {
+            conn.execute_batch("ALTER TABLE documents ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL;")
+                .map_err(|e| format!("Cannot upgrade database: {e}"))?;
+        }
         Ok(Db { conn })
     }
 
     pub fn list_documents(&self) -> Result<Vec<DocInfo>, String> {
         let mut st = self
             .conn
-            .prepare("SELECT id, name, kind, n_rows, width, reference, created, description FROM documents ORDER BY id")
+            .prepare("SELECT id, name, kind, n_rows, width, reference, created, description, folder_id FROM documents ORDER BY id")
             .map_err(|e| e.to_string())?;
         let rows = st
             .query_map([], |r| {
@@ -88,6 +103,7 @@ impl Db {
                     reference: r.get::<_, Option<i64>>(5)?.map(|x| x as usize),
                     created: r.get(6)?,
                     description: r.get(7)?,
+                    folder: r.get(8)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -106,12 +122,13 @@ impl Db {
         doc: &Document,
         reference: Option<usize>,
         description: &str,
+        folder: Option<i64>,
         progress: &dyn Fn(f32),
     ) -> Result<i64, String> {
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
         tx.execute(
-            "INSERT INTO documents (name, kind, n_rows, width, reference, description) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![name, kind.as_str(), doc.rows.len() as i64, doc.width as i64, reference.map(|r| r as i64), description],
+            "INSERT INTO documents (name, kind, n_rows, width, reference, description, folder_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![name, kind.as_str(), doc.rows.len() as i64, doc.width as i64, reference.map(|r| r as i64), description, folder],
         )
         .map_err(|e| e.to_string())?;
         let id = tx.last_insert_rowid();
@@ -223,6 +240,65 @@ impl Db {
         Ok(())
     }
 
+    pub fn list_folders(&self) -> Result<Vec<Folder>, String> {
+        let mut st = self
+            .conn
+            .prepare("SELECT id, name, parent_id, collapsed FROM folders ORDER BY name COLLATE NOCASE, id")
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map([], |r| Ok(Folder { id: r.get(0)?, name: r.get(1)?, parent: r.get(2)?, collapsed: r.get::<_, i64>(3)? != 0 }))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    pub fn create_folder(&self, name: &str, parent: Option<i64>) -> Result<i64, String> {
+        self.conn
+            .execute("INSERT INTO folders (name, parent_id) VALUES (?1, ?2)", params![name, parent])
+            .map_err(|e| e.to_string())?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn rename_folder(&self, id: i64, name: &str) -> Result<(), String> {
+        self.conn.execute("UPDATE folders SET name = ?2 WHERE id = ?1", params![id, name]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn set_folder_collapsed(&self, id: i64, collapsed: bool) -> Result<(), String> {
+        self.conn
+            .execute("UPDATE folders SET collapsed = ?2 WHERE id = ?1", params![id, collapsed as i64])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Moves a folder under `parent` (`None` = top level). Refuses to create cycles.
+    pub fn move_folder(&self, id: i64, parent: Option<i64>) -> Result<(), String> {
+        let folders = self.list_folders()?;
+        let mut cur = parent;
+        while let Some(p) = cur {
+            if p == id {
+                return Err("A folder cannot be moved into itself".into());
+            }
+            cur = folders.iter().find(|f| f.id == p).and_then(|f| f.parent);
+        }
+        self.conn.execute("UPDATE folders SET parent_id = ?2 WHERE id = ?1", params![id, parent]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn move_document(&self, id: i64, folder: Option<i64>) -> Result<(), String> {
+        self.conn.execute("UPDATE documents SET folder_id = ?2 WHERE id = ?1", params![id, folder]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Deletes a folder; its documents and subfolders move to its parent.
+    pub fn delete_folder(&mut self, id: i64) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let parent: Option<i64> = tx.query_row("SELECT parent_id FROM folders WHERE id = ?1", params![id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        tx.execute("UPDATE documents SET folder_id = ?2 WHERE folder_id = ?1", params![id, parent]).map_err(|e| e.to_string())?;
+        tx.execute("UPDATE folders SET parent_id = ?2 WHERE parent_id = ?1", params![id, parent]).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM folders WHERE id = ?1", params![id]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     pub fn setting(&self, key: &str) -> Option<String> {
         self.conn
             .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0))
@@ -254,7 +330,7 @@ mod tests {
         let mut r = Row::from_gapped("s1".into(), "desc".into(), b"--ACG-T".to_vec());
         r.set_meta("host", "human".into());
         let doc = Document::new(vec![r, Row::from_gapped("s2".into(), String::new(), b"AAACGTT".to_vec())]);
-        let id = db.insert_document("test", DocKind::Alignment, &doc, Some(1), "", &|_| {}).unwrap();
+        let id = db.insert_document("test", DocKind::Alignment, &doc, Some(1), "", None, &|_| {}).unwrap();
         let (info, loaded, anns) = db.load_document(id, &|_| {}).unwrap();
         assert_eq!(info.reference, Some(1));
         assert_eq!(loaded.width, 7);
@@ -268,6 +344,19 @@ mod tests {
         db.set_setting("k", "v1").unwrap();
         db.set_setting("k", "v2").unwrap();
         assert_eq!(db.setting("k").as_deref(), Some("v2"));
+        // Folders: nesting, moving, cycle protection, deletion keeps contents.
+        let a = db.create_folder("A", None).unwrap();
+        let b = db.create_folder("B", Some(a)).unwrap();
+        db.move_document(id, Some(b)).unwrap();
+        assert_eq!(db.list_documents().unwrap()[0].folder, Some(b));
+        assert!(db.move_folder(a, Some(b)).is_err());
+        db.set_folder_collapsed(a, true).unwrap();
+        assert!(db.list_folders().unwrap().iter().find(|f| f.id == a).unwrap().collapsed);
+        db.delete_folder(b).unwrap();
+        assert_eq!(db.list_documents().unwrap()[0].folder, Some(a));
+        db.delete_folder(a).unwrap();
+        assert_eq!(db.list_documents().unwrap()[0].folder, None);
+        assert!(db.list_folders().unwrap().is_empty());
         db.delete_document(id).unwrap();
         assert!(db.list_documents().unwrap().is_empty());
         assert!(db.annotations(id).unwrap().is_empty());

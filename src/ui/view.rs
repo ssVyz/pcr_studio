@@ -3,7 +3,7 @@
 use super::canvas::{AlignmentView, group_digits};
 use super::dialogs::{self, ModalMsg};
 use super::state::{BASE_COL_W, GraphMode, Highlight, OpenDoc};
-use super::{App, GroupChoice, Message, style};
+use super::{App, FolderChoice, GroupChoice, Message, style};
 use crate::display::{Item, SortKey};
 use crate::model::{AnnotationKind, ConsensusThreshold, DocKind};
 use crate::primer::{self, OligoSource, Orientation, PrimerReport};
@@ -14,6 +14,7 @@ use iced::widget::{
     stack, text, text_input, tooltip,
 };
 use iced::{Alignment, Color, Element, Fill, Font, Length, Point, Rectangle, Renderer, Size, Theme, mouse};
+use std::collections::HashSet;
 
 const LIBRARY_W: f32 = 260.0;
 const OPTIONS_W: f32 = 300.0;
@@ -65,8 +66,99 @@ impl App {
     }
 
     fn library_panel(&self) -> Element<'_, Message> {
-        let mut list = column![].spacing(2);
-        for d in &self.library {
+        let known: HashSet<i64> = self.folders.iter().map(|f| f.id).collect();
+        let mut entries: Vec<Element<Message>> = Vec::new();
+        self.push_tree(&mut entries, None, 0, &known);
+        let mut list = column(entries).spacing(2);
+        if self.library.is_empty() && self.folders.is_empty() {
+            list = list.push(text("No documents yet. Import FASTA files or generate demo data.").size(12).style(style::muted));
+        }
+        let idle = !self.busy();
+        let (open, rename, delete) = match (self.library_selected, self.folder_selected) {
+            (Some(d), _) => (idle.then_some(Message::OpenDocument(d)), Some(Message::AskRename(d)), idle.then_some(Message::AskDelete(d))),
+            (None, Some(f)) => (None, Some(Message::AskRenameFolder(f)), Some(Message::AskDeleteFolder(f))),
+            _ => (None, None, None),
+        };
+        let actions = row![
+            button(text("Open").size(12)).padding([4, 10]).on_press_maybe(open),
+            button(text("Rename").size(12)).padding([4, 10]).style(button::secondary).on_press_maybe(rename),
+            button(text("Delete").size(12)).padding([4, 10]).style(button::danger).on_press_maybe(delete),
+        ]
+        .spacing(6);
+        let mut organize = row![
+            tooltip(
+                button(text("New folder").size(12)).padding([4, 10]).style(button::secondary).on_press(Message::NewFolder),
+                container(text("Creates a folder inside the selected folder (or next to the selected document)").size(12))
+                    .padding(6)
+                    .style(container::rounded_box),
+                tooltip::Position::Top,
+            ),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        if self.library_selected.is_some() || self.folder_selected.is_some() {
+            organize = organize.push(
+                pick_list(self.move_targets(), None::<FolderChoice>, Message::MoveTo).placeholder("Move to…").text_size(12).padding(4).width(Fill),
+            );
+        }
+        let info: Option<Element<Message>> = if let Some(d) = self.library_selected.and_then(|id| self.library.iter().find(|d| d.id == id)) {
+            Some(
+                column![
+                    text(d.description.as_str()).size(11).style(style::muted).wrapping(text::Wrapping::WordOrGlyph),
+                    text(format!("Created {}", d.created)).size(11).style(style::muted)
+                ]
+                .spacing(2)
+                .into(),
+            )
+        } else {
+            self.folder_selected.map(|id| {
+                let n = self.folder_doc_count(id);
+                text(format!("Folder · {n} document(s) · click again to expand/collapse")).size(11).style(style::muted).into()
+            })
+        };
+        let mut col = column![
+            row![text("Library").size(15), Space::new().width(Fill), text(format!("{}", self.library.len())).size(12).style(style::muted)],
+            scrollable(list).height(Fill),
+            actions,
+            organize,
+        ]
+        .spacing(8);
+        if let Some(info) = info {
+            col = col.push(info);
+        }
+        container(col).padding(10).width(LIBRARY_W).height(Fill).style(style::panel).into()
+    }
+
+    /// Adds the folders and documents below `parent` (depth-first) to `out`.
+    fn push_tree<'a>(&'a self, out: &mut Vec<Element<'a, Message>>, parent: Option<i64>, depth: usize, known: &HashSet<i64>) {
+        let indent = depth as f32 * 14.0;
+        // Unknown parents (should not happen) fall back to the top level.
+        let parent_of = |p: Option<i64>| p.filter(|id| known.contains(id));
+        for f in self.folders.iter().filter(|f| parent_of(f.parent) == parent) {
+            let selected = self.folder_selected == Some(f.id);
+            let arrow = button(text(if f.collapsed { "▸" } else { "▾" }).size(18).line_height(1.0))
+                .padding([2, 4])
+                .style(button::text)
+                .on_press(Message::ToggleFolder(f.id));
+            let label = row![
+                text(f.name.as_str()).size(13).font(Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT }).width(Fill),
+                text(format!("{}", self.folder_doc_count(f.id))).size(11).style(style::muted),
+            ]
+            .align_y(Alignment::Center);
+            out.push(
+                row![
+                    Space::new().width(indent),
+                    arrow,
+                    button(label).width(Fill).padding([5, 6]).style(style::list_item(selected)).on_press(Message::SelectFolder(f.id)),
+                ]
+                .align_y(Alignment::Center)
+                .into(),
+            );
+            if !f.collapsed {
+                self.push_tree(out, Some(f.id), depth + 1, known);
+            }
+        }
+        for d in self.library.iter().filter(|d| parent_of(d.folder) == parent) {
             let selected = self.library_selected == Some(d.id);
             let open = self.open.as_ref().is_some_and(|o| o.info.id == d.id);
             let kind = match d.kind {
@@ -77,37 +169,37 @@ impl App {
             let subtitle = format!("{kind} · {} seqs · {} bp", group_digits(d.n_rows), group_digits(d.width));
             let name = if open { format!("● {}", d.name) } else { d.name.clone() };
             let entry = column![text(name).size(13), text(subtitle).size(11).style(style::muted)].spacing(1);
-            list = list.push(
-                button(entry).width(Fill).padding([5, 8]).style(style::list_item(selected)).on_press(Message::SelectLibraryDoc(d.id)),
+            // Documents line up with folder names (past the arrow button).
+            let pad = if depth > 0 || !self.folders.is_empty() { indent + 20.0 } else { indent };
+            out.push(
+                row![
+                    Space::new().width(pad),
+                    button(entry).width(Fill).padding([5, 8]).style(style::list_item(selected)).on_press(Message::SelectLibraryDoc(d.id)),
+                ]
+                .into(),
             );
         }
-        if self.library.is_empty() {
-            list = list.push(text("No documents yet. Import FASTA files or generate demo data.").size(12).style(style::muted));
+    }
+
+    /// Documents in a folder including its subfolders.
+    fn folder_doc_count(&self, id: i64) -> usize {
+        let sub: HashSet<i64> = self.folder_subtree(id).into_iter().collect();
+        self.library.iter().filter(|d| d.folder.is_some_and(|f| sub.contains(&f))).count()
+    }
+
+    /// Destinations for "Move to": top level plus all folders in tree order,
+    /// without the selected folder's own subtree.
+    fn move_targets(&self) -> Vec<FolderChoice> {
+        let exclude: HashSet<i64> = self.folder_selected.map(|f| self.folder_subtree(f)).unwrap_or_default().into_iter().collect();
+        let mut out = vec![FolderChoice { id: None, label: "Library (top level)".into() }];
+        fn walk(app: &App, parent: Option<i64>, depth: usize, exclude: &HashSet<i64>, out: &mut Vec<FolderChoice>) {
+            for f in app.folders.iter().filter(|f| f.parent == parent && !exclude.contains(&f.id)) {
+                out.push(FolderChoice { id: Some(f.id), label: format!("{}{}", "· ".repeat(depth + 1), f.name) });
+                walk(app, Some(f.id), depth + 1, exclude, out);
+            }
         }
-        let sel = self.library_selected;
-        let actions = row![
-            button(text("Open").size(12)).padding([4, 10]).on_press_maybe(sel.filter(|_| !self.busy()).map(Message::OpenDocument)),
-            button(text("Rename").size(12)).padding([4, 10]).style(button::secondary).on_press_maybe(sel.map(Message::AskRename)),
-            button(text("Delete").size(12)).padding([4, 10]).style(button::danger).on_press_maybe(sel.filter(|_| !self.busy()).map(Message::AskDelete)),
-        ]
-        .spacing(6);
-        let info = self.library_selected.and_then(|id| self.library.iter().find(|d| d.id == id)).map(|d| {
-            column![
-                text(d.description.as_str()).size(11).style(style::muted).wrapping(text::Wrapping::WordOrGlyph),
-                text(format!("Created {}", d.created)).size(11).style(style::muted)
-            ]
-                .spacing(2)
-        });
-        let mut col = column![
-            row![text("Library").size(15), Space::new().width(Fill), text(format!("{}", self.library.len())).size(12).style(style::muted)],
-            scrollable(list).height(Fill),
-            actions,
-        ]
-        .spacing(8);
-        if let Some(info) = info {
-            col = col.push(info);
-        }
-        container(col).padding(10).width(LIBRARY_W).height(Fill).style(style::panel).into()
+        walk(self, None, 0, &exclude, &mut out);
+        out
     }
 
     fn center_panel(&self) -> Element<'_, Message> {
@@ -343,6 +435,16 @@ impl App {
                     text(format!("{} columns ({}–{}){rr}", sel.len(), group_digits(sel.c0 + 1), group_digits(sel.c1))).size(12),
                     row![
                         button(text("Oligo report").size(12)).padding([4, 8]).on_press(Message::ShowPopup),
+                        tooltip(
+                            button(text("Extract slice").size(12))
+                                .padding([4, 8])
+                                .style(button::secondary)
+                                .on_press_maybe((!self.busy()).then_some(Message::ExtractSlice)),
+                            container(text("Save these columns of all sequences (without the reference) as a new library document").size(12))
+                                .padding(6)
+                                .style(container::rounded_box),
+                            tooltip::Position::Bottom,
+                        ),
                         button(text("Clear").size(12)).padding([4, 8]).style(button::text).on_press(Message::ClearSelection),
                     ]
                     .spacing(6)
@@ -477,6 +579,10 @@ impl App {
         body = body.push(
             row![
                 button(text("Add annotation").size(12)).padding([4, 8]).on_press(Message::AddAnnotation),
+                button(text("Extract slice").size(12))
+                    .padding([4, 8])
+                    .style(button::secondary)
+                    .on_press_maybe((!self.busy()).then_some(Message::ExtractSlice)),
                 Space::new().width(Fill),
                 button(text("Copy oligo").size(12)).padding([4, 8]).style(button::secondary).on_press(Message::CopyOligo),
                 button(text("Copy report").size(12)).padding([4, 8]).style(button::secondary).on_press(Message::CopyReport),

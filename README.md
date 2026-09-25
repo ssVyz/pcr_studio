@@ -29,7 +29,11 @@ FASTA files given on the command line are imported at startup.
    gaps are treated as missing data, not deletions. `key=value` and `[key=value]`
    tokens in FASTA descriptions become metadata. **Demo data** adds a synthetic
    35 kb × 2,000 genome set.
-2. **Open** a document from the library (click it twice).
+2. **Open** a document from the library (click it twice). Organize the library in folders:
+   **New folder** creates one inside the selected folder (or next to the selected document),
+   **Move to…** moves the selected document or folder, the arrow or a second click on a folder
+   expands/collapses it (remembered). Deleting a folder keeps its contents (they move up one
+   level). New documents (imports, mapping results, slices) go to the current folder.
 3. **Map to Reference** (Ctrl+M): pick the reference from this or another document,
    choose a sensitivity preset or custom values, optional fine tuning. The result is
    a new contig document with the reference pinned on top.
@@ -40,7 +44,10 @@ FASTA files given on the command line are imported at startup.
    grouped, inclusivity per group. Switch between consensus/reference as the source
    and forward/reverse orientation. Add the selection as an annotation (forward
    primer, reverse primer, probe, region).
-5. **Export** (Ctrl+E) all, shown or selected sequences, optionally only the selected
+5. **Extract slice** (selection panel or oligo report): saves the selected columns of all
+   sequences, without the reference and with the original names, as a new library document
+   next to the source. Sequences without bases in the range and empty columns are dropped.
+6. **Export** (Ctrl+E) all, shown or selected sequences, optionally only the selected
    columns, gapped or ungapped, with reference and/or consensus.
 
 ### Viewer
@@ -58,10 +65,13 @@ FASTA files given on the command line are imported at startup.
 | Escape | Close dialog/report, then clear the selection |
 
 Display options (right panel): consensus threshold (majority or 50–100 %), graph mode
-(**conservation** = share of sequences carrying the most common residue, on a log scale,
-colored ≥99.99 / 99 / 95 / 90 / 75 %; or Geneious-style **pairwise identity**),
-highlighting of disagreements to the reference or the consensus, dots for identical bases,
-gap highlighting, base colors, sorting, grouping, collapsing identical sequences and a name
+(**conservation** = share of sequences identical to the comparison residue, on a log scale,
+colored ≥99.99 / 99 / 95 / 90 / 75 %; or Geneious-style **pairwise identity**). The comparison
+residue is the reference when highlighting disagreements to the reference, otherwise the
+column's most common state. Gaps never count as identical: a column that is a gap in the
+consensus or reference scores 0, and gap/gap pairs do not count as identical pairs.
+Further options: highlighting of disagreements to the reference or the consensus, dots for
+identical bases, gap highlighting, base colors, sorting, grouping, collapsing identical sequences and a name
 filter. Metadata can be imported from a CSV/TSV table (first column = sequence name) or
 split from sequence names at a delimiter.
 
@@ -77,7 +87,7 @@ split from sequence names at a delimiter.
 | `primer.rs` | Oligo/selection evaluation |
 | `display.rs` | Sorting, grouping, collapsing, filtering |
 | `search.rs` | Motif search |
-| `db.rs` | SQLite library |
+| `db.rs` | SQLite library (documents, rows, annotations, folders, settings) |
 | `demo.rs` | Synthetic data |
 | `ui/` | iced application: `mod.rs` state/messages/update, `view.rs` layout and panels, `canvas.rs` alignment renderer, `dialogs.rs`, `state.rs` viewer state, `style.rs`, `job.rs` background jobs |
 
