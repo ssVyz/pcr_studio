@@ -1,6 +1,21 @@
 [package]
 name = "pcr_studio_1"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 
 [dependencies]
+iced = { version = "0.14", features = ["canvas", "tokio"] }
+bio = "4.0.1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+rayon = "1"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Debug builds stay usable with large alignments: optimize dependencies fully
+# and this crate lightly.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
