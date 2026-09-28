@@ -45,13 +45,25 @@ pub fn title_x(id: MenuId) -> f32 {
 
 pub enum Entry {
     /// `action == None` shows the entry disabled.
-    Item { label: &'static str, shortcut: &'static str, action: Option<Message> },
+    Item { label: &'static str, shortcut: &'static str, action: Option<Message>, danger: bool },
     Separator,
 }
 
 impl Entry {
     pub fn item(label: &'static str, shortcut: &'static str, action: Option<Message>) -> Entry {
-        Entry::Item { label, shortcut, action }
+        Entry::Item { label, shortcut, action, danger: false }
+    }
+
+    /// A destructive entry (shown in red).
+    pub fn danger(label: &'static str, action: Option<Message>) -> Entry {
+        Entry::Item { label, shortcut: "", action, danger: true }
+    }
+
+    fn height(&self) -> f32 {
+        match self {
+            Entry::Item { .. } => 31.0,
+            Entry::Separator => 9.0,
+        }
     }
 }
 
@@ -82,11 +94,22 @@ pub fn bar<'a>(open: Option<MenuId>, document: Option<&'a str>) -> Element<'a, M
 
 /// The drop-down panel with its entries.
 pub fn panel<'a>(entries: Vec<Entry>) -> Element<'a, Message> {
+    panel_with_width(entries, PANEL_W)
+}
+
+/// Approximate panel height (for keeping context menus inside the window).
+pub fn panel_height(entries: &[Entry]) -> f32 {
+    entries.iter().map(Entry::height).sum::<f32>() + 10.0
+}
+
+pub const CONTEXT_W: f32 = 210.0;
+
+pub fn panel_with_width<'a>(entries: Vec<Entry>, width: f32) -> Element<'a, Message> {
     let mut col = column![].spacing(0);
     for e in entries {
         match e {
             Entry::Separator => col = col.push(container(rule::horizontal(1)).padding([4, 6])),
-            Entry::Item { label, shortcut, action } => {
+            Entry::Item { label, shortcut, action, danger } => {
                 let enabled = action.is_some();
                 let content = row![
                     text(label).size(13).width(Fill),
@@ -100,13 +123,13 @@ pub fn panel<'a>(entries: Vec<Entry>) -> Element<'a, Message> {
                     button(content)
                         .width(Fill)
                         .padding([6, 12])
-                        .style(item_style)
+                        .style(move |t: &Theme, s| item_style(t, s, danger))
                         .on_press_maybe(action.map(|m| Message::MenuAction(Box::new(m)))),
                 );
             }
         }
     }
-    container(col).padding(4).width(Length::Fixed(PANEL_W)).style(panel_style).into()
+    container(col).padding(4).width(Length::Fixed(width)).style(panel_style).into()
 }
 
 fn title_style(theme: &Theme, status: button::Status, active: bool) -> button::Style {
@@ -128,12 +151,14 @@ fn title_style(theme: &Theme, status: button::Status, active: bool) -> button::S
     }
 }
 
-fn item_style(theme: &Theme, status: button::Status) -> button::Style {
+fn item_style(theme: &Theme, status: button::Status, danger: bool) -> button::Style {
     let p = theme.extended_palette();
+    let accent = if danger { p.danger.base } else { p.primary.base };
+    let normal = if danger { p.danger.base.color } else { p.background.base.text };
     let (bg, fg) = match status {
-        button::Status::Hovered | button::Status::Pressed => (Some(Background::Color(p.primary.base.color)), p.primary.base.text),
-        button::Status::Disabled => (None, Color { a: 0.4, ..p.background.base.text }),
-        _ => (None, p.background.base.text),
+        button::Status::Hovered | button::Status::Pressed => (Some(Background::Color(accent.color)), accent.text),
+        button::Status::Disabled => (None, Color { a: 0.4, ..normal }),
+        _ => (None, normal),
     };
     button::Style { background: bg, text_color: fg, border: Border { radius: 4.0.into(), ..Default::default() }, ..Default::default() }
 }

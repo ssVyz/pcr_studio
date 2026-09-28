@@ -20,8 +20,8 @@ pub enum Modal {
     Export(ExportDialog),
     Settings(SettingsDialog),
     Rename { id: i64, text: String, folder: bool },
-    ConfirmDelete { id: i64, name: String },
-    ConfirmDeleteFolder { id: i64, name: String },
+    ConfirmDelete { id: i64, name: String, detail: String },
+    ConfirmDeleteFolder { id: i64, name: String, documents: usize, subfolders: usize },
     NameFields { delimiter: String, keys: String },
     Info { title: String, text: String },
 }
@@ -547,6 +547,29 @@ impl SettingsDialog {
 
 // ---------------------------------------------------------------- common
 
+/// Prominent "cannot be undone" notice for destructive confirmations.
+fn irreversible<'a>(what: &'a str) -> Element<'a, Message> {
+    container(
+        column![
+            text("This cannot be undone.").size(13).font(iced::Font { weight: iced::font::Weight::Bold, ..iced::Font::DEFAULT }),
+            text(what).size(12),
+        ]
+        .spacing(2),
+    )
+    .padding([8, 10])
+    .width(Fill)
+    .style(|t: &iced::Theme| {
+        let p = t.extended_palette();
+        container::Style {
+            background: Some(iced::Color { a: 0.12, ..p.danger.base.color }.into()),
+            border: iced::Border { color: p.danger.base.color, width: 1.0, radius: 5.0.into() },
+            text_color: Some(p.danger.strong.color),
+            ..Default::default()
+        }
+    })
+    .into()
+}
+
 pub fn dialog_frame<'a>(title: &'a str, body: Element<'a, Message>, buttons: Element<'a, Message>, width: f32) -> Element<'a, Message> {
     container(column![text(title).size(20), body, buttons].spacing(16))
         .padding(22)
@@ -575,8 +598,13 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
             .spacing(10);
             dialog_frame(if *folder { "Rename folder" } else { "Rename document" }, body.into(), buttons.into(), 420.0)
         }
-        Modal::ConfirmDelete { id, name } => {
-            let body = text(format!("Delete “{name}” from the library? This cannot be undone.")).size(14);
+        Modal::ConfirmDelete { id, name, detail } => {
+            let body = column![
+                text(format!("Delete “{name}” from the library?")).size(14),
+                text(detail.as_str()).size(12).style(style::muted),
+                irreversible("The document, its sequences and its annotations are removed permanently."),
+            ]
+            .spacing(10);
             let buttons = row![
                 Space::new().width(Fill),
                 button("Cancel").on_press(Message::CloseModal).style(button::secondary),
@@ -585,8 +613,17 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
             .spacing(10);
             dialog_frame("Delete document", body.into(), buttons.into(), 420.0)
         }
-        Modal::ConfirmDeleteFolder { id, name } => {
-            let body = text(format!("Delete the folder “{name}”? Its documents and subfolders are kept and move up one level.")).size(14);
+        Modal::ConfirmDeleteFolder { id, name, documents, subfolders } => {
+            let contents = match (documents, subfolders) {
+                (0, 0) => "The folder is empty.".to_string(),
+                (d, s) => format!("Its {d} document(s) and {s} subfolder(s) are kept and move up one level."),
+            };
+            let body = column![
+                text(format!("Delete the folder “{name}”?")).size(14),
+                text(contents).size(12).style(style::muted),
+                irreversible("The folder itself is removed permanently."),
+            ]
+            .spacing(10);
             let buttons = row![
                 Space::new().width(Fill),
                 button("Cancel").on_press(Message::CloseModal).style(button::secondary),

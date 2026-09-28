@@ -45,7 +45,10 @@ Entries that do not apply (e.g. without an open document or selection) are disab
    document or folder onto a folder to move it there, or onto the free space below the
    entries to move it to the top level (hovering a collapsed folder expands it, the list
    scrolls at its edges, Escape cancels, invalid targets are marked red). **Move to…** does
-   the same from a list. The chevron or a double-click expands/collapses a folder (remembered). Deleting a folder keeps its contents (they move up one
+   the same from a list. The chevron or a double-click expands/collapses a folder (remembered).
+   **Right-click** an entry for Open / Rename… / Delete… (documents) or Expand/Collapse /
+   New subfolder / Rename… / Delete folder… (folders); deleting always asks for confirmation
+   and warns that it cannot be undone. Deleting a folder keeps its contents (they move up one
    level). New documents (imports, mapping results, slices) go to the current folder.
 3. **Map to Reference** (Tools menu or Ctrl+M): pick the reference from this or another document,
    choose a sensitivity preset or custom values, optional fine tuning. The result is

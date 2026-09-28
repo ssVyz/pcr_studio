@@ -82,6 +82,13 @@ pub enum LibKey {
     Folder(i64),
 }
 
+/// Right-click menu of a library entry, opened at `pos` (window coordinates).
+#[derive(Debug, Clone, Copy)]
+pub struct ContextMenu {
+    pub target: LibKey,
+    pub pos: iced::Point,
+}
+
 /// Where a dragged library entry would land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropTarget {
@@ -147,6 +154,12 @@ pub enum Message {
     DragRelease,
     DragTick,
     DragZone(i8),
+    /// Cursor position over the library panel (panel coordinates).
+    LibCursor(iced::Point),
+    /// Right-click on a library entry.
+    LibContext(LibKey),
+    CloseContext,
+    WindowSize(iced::Size),
     NewFolder,
     AskRenameFolder(i64),
     AskDeleteFolder(i64),
@@ -250,6 +263,10 @@ pub struct App {
     drag: Option<LibDrag>,
     /// Library entry under the cursor.
     lib_hover: Option<LibKey>,
+    /// Open right-click menu.
+    context: Option<ContextMenu>,
+    lib_cursor: iced::Point,
+    window_size: iced::Size,
     open: Option<OpenDoc>,
     settings: AppSettings,
     job: Option<Job>,
@@ -275,7 +292,9 @@ impl App {
         let status = format!("Library: {} · {} document(s)", db_path.display(), library.len());
         // FASTA files given on the command line ("Open with…") are imported right away.
         let paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).filter(|p| p.is_file()).collect();
-        let task = if paths.is_empty() { Task::none() } else { Task::done(Message::ImportPicked(Some(paths))) };
+        let import = if paths.is_empty() { Task::none() } else { Task::done(Message::ImportPicked(Some(paths))) };
+        let size = iced::window::latest().and_then(iced::window::size).map(Message::WindowSize);
+        let task = Task::batch([import, size]);
         let app = App {
             db,
             db_path,
@@ -286,6 +305,9 @@ impl App {
             menu: None,
             drag: None,
             lib_hover: None,
+            context: None,
+            lib_cursor: iced::Point::ORIGIN,
+            window_size: iced::Size::new(1500.0, 920.0),
             open: None,
             settings,
             job: None,
@@ -308,7 +330,10 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let mut subs = vec![keyboard::listen().map(Message::Key)];
+        let mut subs = vec![
+            keyboard::listen().map(Message::Key),
+            iced::window::resize_events().map(|(_id, size)| Message::WindowSize(size)),
+        ];
         if self.job.is_some() {
             subs.push(iced::time::every(std::time::Duration::from_millis(120)).map(|_| Message::Tick));
         }
@@ -553,6 +578,26 @@ impl App {
                 }
             }
             Message::DragRelease => self.finish_drag(),
+            Message::LibCursor(p) => self.lib_cursor = p,
+            Message::WindowSize(s) => self.window_size = s,
+            Message::LibContext(key) => {
+                // Right-click selects the entry, like a file browser.
+                match key {
+                    LibKey::Doc(id) => {
+                        self.library_selected = Some(id);
+                        self.folder_selected = None;
+                    }
+                    LibKey::Folder(id) => {
+                        self.folder_selected = Some(id);
+                        self.library_selected = None;
+                    }
+                }
+                self.drag = None;
+                self.menu = None;
+                let pos = iced::Point::new(self.lib_cursor.x, self.lib_cursor.y + menu::BAR_H);
+                self.context = Some(ContextMenu { target: key, pos });
+            }
+            Message::CloseContext => self.context = None,
             Message::DragZone(z) => {
                 if let Some(d) = self.drag.as_mut() {
                     d.zone = z;
@@ -605,13 +650,17 @@ impl App {
             }
             Message::AskDeleteFolder(id) => {
                 if let Some(f) = self.folders.iter().find(|f| f.id == id) {
-                    self.modal = Some(Modal::ConfirmDeleteFolder { id, name: f.name.clone() });
+                    let n = self.folder_subtree(id).len() - 1;
+                    let docs = self.library.iter().filter(|d| d.folder == Some(id)).count();
+                    self.modal = Some(Modal::ConfirmDeleteFolder { id, name: f.name.clone(), documents: docs, subfolders: n });
                 }
             }
             Message::ConfirmDeleteFolder(id) => {
                 self.modal = None;
-                if let Err(e) = self.db.delete_folder(id) {
-                    self.error = Some(e);
+                let name = self.lib_name(LibKey::Folder(id));
+                match self.db.delete_folder(id) {
+                    Ok(()) => self.status = format!("Deleted folder “{name}”"),
+                    Err(e) => self.error = Some(e),
                 }
                 self.folder_selected = None;
                 self.reload_library();
@@ -733,13 +782,19 @@ impl App {
             }
             Message::AskDelete(id) => {
                 if let Some(d) = self.library.iter().find(|d| d.id == id) {
-                    self.modal = Some(Modal::ConfirmDelete { id, name: d.name.clone() });
+                    let mut detail = format!("{} · {} sequences · {} bp", d.kind.label(), canvas::group_digits(d.n_rows), canvas::group_digits(d.width));
+                    if self.open.as_ref().is_some_and(|o| o.info.id == id) {
+                        detail.push_str("\nThe document is open and will be closed.");
+                    }
+                    self.modal = Some(Modal::ConfirmDelete { id, name: d.name.clone(), detail });
                 }
             }
             Message::ConfirmDelete(id) => {
                 self.modal = None;
-                if let Err(e) = self.db.delete_document(id) {
-                    self.error = Some(e);
+                let name = self.lib_name(LibKey::Doc(id));
+                match self.db.delete_document(id) {
+                    Ok(()) => self.status = format!("Deleted “{name}”"),
+                    Err(e) => self.error = Some(e),
                 }
                 if self.open.as_ref().is_some_and(|o| o.info.id == id) {
                     self.open = None;
@@ -984,6 +1039,7 @@ impl App {
             Message::CloseMenu => self.menu = None,
             Message::MenuAction(m) => {
                 self.menu = None;
+                self.context = None;
                 return self.update(*m);
             }
             Message::CloseDocument => {
@@ -1112,6 +1168,12 @@ impl App {
             && self.menu.is_some()
         {
             self.menu = None;
+            return Task::none();
+        }
+        if let Key::Named(Named::Escape) = key
+            && self.context.is_some()
+        {
+            self.context = None;
             return Task::none();
         }
         if let Key::Named(Named::Escape) = key

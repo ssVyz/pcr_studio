@@ -46,10 +46,43 @@ impl App {
             ];
             let panel = iced::widget::pin(opaque(menu::panel(self.menu_entries(id)))).x(menu::title_x(id)).y(menu::BAR_H);
             stack![base, dismiss, panel].into()
+        } else if let Some(c) = self.context {
+            let entries = self.context_entries(c.target);
+            let h = menu::panel_height(&entries);
+            // Keep the menu inside the window.
+            let x = c.pos.x.min(self.window_size.width - menu::CONTEXT_W - 6.0).max(0.0);
+            let y = if c.pos.y + h > self.window_size.height - 6.0 { (c.pos.y - h).max(0.0) } else { c.pos.y };
+            let dismiss = opaque(mouse_area(Space::new().width(Fill).height(Fill)).on_press(Message::CloseContext).on_right_press(Message::CloseContext));
+            let panel = iced::widget::pin(opaque(menu::panel_with_width(entries, menu::CONTEXT_W))).x(x).y(y);
+            stack![base, dismiss, panel].into()
         } else if let Some(ghost) = self.drag_ghost() {
             stack![base, ghost].into()
         } else {
             base
+        }
+    }
+
+    /// Right-click menu of a library entry.
+    fn context_entries(&self, key: LibKey) -> Vec<menu::Entry> {
+        use menu::Entry;
+        let idle = !self.busy();
+        match key {
+            LibKey::Doc(id) => vec![
+                Entry::item("Open", "", idle.then_some(Message::OpenDocument(id))),
+                Entry::item("Rename…", "", Some(Message::AskRename(id))),
+                Entry::Separator,
+                Entry::danger("Delete…", idle.then_some(Message::AskDelete(id))),
+            ],
+            LibKey::Folder(id) => {
+                let collapsed = self.folders.iter().find(|f| f.id == id).is_some_and(|f| f.collapsed);
+                vec![
+                    Entry::item(if collapsed { "Expand" } else { "Collapse" }, "", Some(Message::ToggleFolder(id))),
+                    Entry::item("New subfolder", "", Some(Message::NewFolder)),
+                    Entry::item("Rename…", "", Some(Message::AskRenameFolder(id))),
+                    Entry::Separator,
+                    Entry::danger("Delete folder…", Some(Message::AskDeleteFolder(id))),
+                ]
+            }
         }
     }
 
@@ -217,7 +250,7 @@ impl App {
         let mut col = column![
             row![text("Library").size(15), Space::new().width(Fill), text(format!("{}", self.library.len())).size(12).style(style::muted)],
             list,
-            text("Drag entries onto folders to organize them; double-click to open.").size(10).style(style::muted),
+            text("Drag entries onto folders; double-click to open; right-click for more.").size(10).style(style::muted),
             actions,
             organize,
         ]
@@ -225,7 +258,8 @@ impl App {
         if let Some(info) = info {
             col = col.push(info);
         }
-        container(col).padding(10).width(LIBRARY_W).height(Fill).style(style::panel).into()
+        // Cursor tracking positions the right-click menu.
+        mouse_area(container(col).padding(10).width(LIBRARY_W).height(Fill).style(style::panel)).on_move(Message::LibCursor).into()
     }
 
     /// Row state for styling a library entry.
@@ -254,6 +288,7 @@ impl App {
         mouse_area(container(content).width(Fill).padding([4, 6]).style(move |t: &Theme| entry_style(t, st)))
             .on_press(Message::LibPress(key))
             .on_double_click(Message::LibActivate(key))
+            .on_right_press(Message::LibContext(key))
             .on_enter(Message::LibHover(key))
             .on_exit(Message::LibUnhover(key))
             .interaction(interaction)

@@ -7,6 +7,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.0.6] - 2026-09-28
+
+### Added
+
+- Right-click menu on library entries (selects the entry, opens at the cursor and stays
+  inside the window; click outside or Escape closes it): documents — Open, Rename…, Delete…;
+  folders — Expand/Collapse, New subfolder, Rename…, Delete folder…. Destructive entries are
+  shown in red (`menu::Entry::danger`).
+- Delete confirmations show what is deleted (type, sequences, length; folder contents that
+  are kept), a highlighted "This cannot be undone" notice, and whether an open document will
+  be closed. After deleting, the status bar reports what was deleted.
+- The window size is tracked (for placing context menus).
+
 ## [0.0.5] - 2026-09-28
 
 ### Added
