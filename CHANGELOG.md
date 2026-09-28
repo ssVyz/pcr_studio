@@ -7,6 +7,43 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.0.5] - 2026-09-28
+
+### Added
+
+- Library icons (inline SVG, `ui/icons.rs`; enables iced's `svg` feature): open/closed
+  folders, sequence lists, alignments and contigs, plus SVG expand/collapse chevrons.
+- Drag and drop in the library: drag documents or folders onto a folder to move them, or
+  onto the free space below the entries to move them to the top level. A floating label shows
+  the item and the destination; the target folder is outlined (red and "cannot move here" for
+  invalid moves such as a folder into its own subfolder). Hovering a collapsed folder while
+  dragging expands it, the list auto-scrolls at its edges, Escape cancels. Drags start after
+  a few pixels of movement, so clicking still selects.
+
+### Changed
+
+- Library entries: double-click opens a document or expands/collapses a folder (replaces
+  "click the selected entry again"); folder names are bold; hover highlighting.
+- Library panel widened from 260 to 290 px.
+
+## [0.0.4] - 2026-09-28
+
+### Added
+
+- Menu bar with drop-down menus (`ui/menu.rs`) replacing the flat toolbar buttons:
+  - **File**: Import FASTA…, Import metadata table…, Generate demo data, Export FASTA…,
+    Extract selection to library, New folder, Close document, Exit.
+  - **Edit**: Copy oligo, Copy oligo report, Add annotation from selection, Clear selection,
+    Set selected row as reference, Clear reference, Settings….
+  - **Tools**: Map to reference…, Metadata from sequence names…, Oligo report for selection,
+    Find sequence…, Go to position….
+  Entries show their shortcuts and are disabled when they do not apply; clicking outside or
+  Escape closes a menu, hovering another title while one is open switches to it.
+- Commands and shortcuts: Close document (Ctrl+W), Find sequence (Ctrl+F, focuses the search
+  field), Go to position (Ctrl+G, focuses the position field), Settings (Ctrl+,), Exit.
+- The name of the open document is shown at the right of the menu bar.
+- Expanded empty library folders show "(empty)".
+
 ## [0.0.3] - 2026-09-25
 
 ### Added

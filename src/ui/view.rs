@@ -3,9 +3,9 @@
 use super::canvas::{AlignmentView, group_digits};
 use super::dialogs::{self, ModalMsg};
 use super::state::{BASE_COL_W, GraphMode, Highlight, OpenDoc};
-use super::{App, FolderChoice, GroupChoice, Message, style};
+use super::{App, DropTarget, FolderChoice, GroupChoice, JUMP_INPUT, LIB_SCROLL, LibKey, Message, SEARCH_INPUT, icons, menu, style};
 use crate::display::{Item, SortKey};
-use crate::model::{AnnotationKind, ConsensusThreshold, DocKind};
+use crate::model::{AnnotationKind, ConsensusThreshold};
 use crate::primer::{self, OligoSource, Orientation, PrimerReport};
 use crate::search::Scope;
 use iced::widget::canvas::{self as cv, Frame, Geometry};
@@ -16,7 +16,7 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Fill, Font, Length, Point, Rectangle, Renderer, Size, Theme, mouse};
 use std::collections::HashSet;
 
-const LIBRARY_W: f32 = 260.0;
+pub(super) const LIBRARY_W: f32 = 290.0;
 const OPTIONS_W: f32 = 300.0;
 
 fn tool<'a>(label: &'a str, msg: Option<Message>, tip: &'a str) -> Element<'a, Message> {
@@ -37,42 +37,140 @@ impl App {
         if let Some(m) = &self.modal {
             let overlay = opaque(mouse_area(center(opaque(dialogs::view_modal(m))).style(style::backdrop)).on_press(Message::Noop));
             stack![base, overlay].into()
+        } else if let Some(id) = self.menu {
+            // Clicking anywhere below the menu bar closes the menu; the bar
+            // itself stays live so hovering another title switches menus.
+            let dismiss = column![
+                Space::new().height(menu::BAR_H),
+                opaque(mouse_area(Space::new().width(Fill).height(Fill)).on_press(Message::CloseMenu).on_right_press(Message::CloseMenu)),
+            ];
+            let panel = iced::widget::pin(opaque(menu::panel(self.menu_entries(id)))).x(menu::title_x(id)).y(menu::BAR_H);
+            stack![base, dismiss, panel].into()
+        } else if let Some(ghost) = self.drag_ghost() {
+            stack![base, ghost].into()
         } else {
             base
         }
     }
 
+    /// Floating label following the cursor while a library entry is dragged.
+    fn drag_ghost(&self) -> Option<Element<'_, Message>> {
+        let d = self.drag.as_ref().filter(|d| d.active)?;
+        let pos = d.pos?;
+        let dark = self.settings.dark;
+        let icon = match d.item {
+            LibKey::Doc(id) => icons::document(self.library.iter().find(|x| x.id == id)?.kind, dark),
+            LibKey::Folder(_) => icons::folder(false, dark),
+        };
+        let target = self.drop_target();
+        let (hint, ok) = match target {
+            Some(t) if self.drop_allowed(d.item, t) => {
+                let place = match t {
+                    DropTarget::Folder(f) => self.lib_name(LibKey::Folder(f)),
+                    DropTarget::Root => "top level".into(),
+                };
+                (format!("→ {place}"), true)
+            }
+            Some(_) => ("cannot move here".to_string(), false),
+            None => ("drop in the library".to_string(), false),
+        };
+        let hint = text(hint).size(11).style(move |t: &Theme| {
+            let p = t.extended_palette();
+            text::Style { color: Some(if ok { p.primary.base.color } else { p.danger.base.color }) }
+        });
+        let label = container(row![icon, text(ellipsize_middle(&self.lib_name(d.item), 40)).size(12), hint].spacing(6).align_y(Alignment::Center))
+            .padding([4, 8])
+            .style(|t: &Theme| {
+                let mut st = style::card(t);
+                st.background = Some(Color { a: 0.92, ..t.extended_palette().background.base.color }.into());
+                st.border.radius = 5.0.into();
+                st
+            });
+        Some(iced::widget::pin(label).x(pos.x + 14.0).y(pos.y + 10.0).into())
+    }
+
     fn toolbar(&self) -> Element<'_, Message> {
+        menu::bar(self.menu, self.open.as_ref().map(|o| o.info.name.as_str()))
+    }
+
+    /// Entries of a drop-down menu, enabled according to the current state.
+    fn menu_entries(&self, id: menu::MenuId) -> Vec<menu::Entry> {
+        use menu::Entry;
         let idle = !self.busy();
-        let has_doc = self.open.is_some();
-        let bar = row![
-            text("PCR Studio").size(17).font(Font { weight: iced::font::Weight::Bold, ..Font::DEFAULT }),
-            Space::new().width(18),
-            tool("Import FASTA", idle.then_some(Message::ImportFasta), "Import one or more FASTA files into the library (Ctrl+O)"),
-            tool("Export", (idle && has_doc).then_some(Message::OpenExport), "Export sequences, selection or consensus as FASTA (Ctrl+E)"),
-            rule::vertical(1),
-            tool("Map to Reference", (idle && has_doc).then_some(Message::OpenMapDialog), "Map the sequences of this document to a reference (Ctrl+M)"),
-            rule::vertical(1),
-            tool("Metadata table", (idle && has_doc).then_some(Message::ImportMetadata), "Import a CSV/TSV table: first column = sequence name"),
-            tool("Names → fields", (idle && has_doc).then_some(Message::OpenNameFields), "Split sequence names into metadata fields"),
-            Space::new().width(Fill),
-            tool("Demo data", idle.then_some(Message::DemoData), "Add a synthetic 35 kb × 2,000 genome data set to the library"),
-            tool("Settings", Some(Message::OpenSettings), "Tm conditions, 3' window, theme"),
-        ]
-        .spacing(4)
-        .height(36)
-        .align_y(Alignment::Center);
-        container(bar).padding([4, 12]).width(Fill).style(style::toolbar).into()
+        let od = self.open.as_ref();
+        let doc = od.is_some();
+        let selection = od.is_some_and(|o| o.selection.is_some());
+        let report = od.is_some_and(|o| o.report.is_some());
+        let when = |ok: bool, m: Message| ok.then_some(m);
+        match id {
+            menu::MenuId::File => vec![
+                Entry::item("Import FASTA…", "Ctrl+O", when(idle, Message::ImportFasta)),
+                Entry::item("Import metadata table…", "", when(idle && doc, Message::ImportMetadata)),
+                Entry::item("Generate demo data", "", when(idle, Message::DemoData)),
+                Entry::Separator,
+                Entry::item("Export FASTA…", "Ctrl+E", when(idle && doc, Message::OpenExport)),
+                Entry::item("Extract selection to library", "", when(idle && selection, Message::ExtractSlice)),
+                Entry::Separator,
+                Entry::item("New folder", "", Some(Message::NewFolder)),
+                Entry::item("Close document", "Ctrl+W", when(doc, Message::CloseDocument)),
+                Entry::Separator,
+                Entry::item("Exit", "", Some(Message::Exit)),
+            ],
+            menu::MenuId::Edit => vec![
+                Entry::item("Copy oligo", "Ctrl+C", when(report, Message::CopyOligo)),
+                Entry::item("Copy oligo report", "", when(report, Message::CopyReport)),
+                Entry::item("Add annotation from selection", "", when(selection, Message::AddAnnotation)),
+                Entry::item("Clear selection", "Esc", when(selection, Message::ClearSelection)),
+                Entry::Separator,
+                Entry::item(
+                    "Set selected row as reference",
+                    "",
+                    when(od.is_some_and(|o| o.selected_rows.len() == 1), Message::SetReferenceFromSelection),
+                ),
+                Entry::item("Clear reference", "", when(od.is_some_and(|o| o.reference.is_some()), Message::ClearReference)),
+                Entry::Separator,
+                Entry::item("Settings…", "Ctrl+,", Some(Message::OpenSettings)),
+            ],
+            menu::MenuId::Tools => vec![
+                Entry::item("Map to reference…", "Ctrl+M", when(idle && doc, Message::OpenMapDialog)),
+                Entry::item("Metadata from sequence names…", "", when(doc, Message::OpenNameFields)),
+                Entry::Separator,
+                Entry::item("Oligo report for selection", "", when(report, Message::ShowPopup)),
+                Entry::item("Find sequence…", "Ctrl+F", when(doc, Message::FocusSearch)),
+                Entry::item("Go to position…", "Ctrl+G", when(doc, Message::FocusJump)),
+            ],
+        }
     }
 
     fn library_panel(&self) -> Element<'_, Message> {
         let known: HashSet<i64> = self.folders.iter().map(|f| f.id).collect();
         let mut entries: Vec<Element<Message>> = Vec::new();
         self.push_tree(&mut entries, None, 0, &known);
-        let mut list = column(entries).spacing(2);
+        let dragging = self.drag.as_ref().is_some_and(|d| d.active);
         if self.library.is_empty() && self.folders.is_empty() {
-            list = list.push(text("No documents yet. Import FASTA files or generate demo data.").size(12).style(style::muted));
+            entries.push(text("No documents yet. Import FASTA files or generate demo data.").size(12).style(style::muted).into());
         }
+        // Free space below the entries: the top-level drop zone.
+        let root_target = dragging && self.drop_target() == Some(DropTarget::Root);
+        let root_ok = root_target && self.drag.as_ref().is_some_and(|d| self.drop_allowed(d.item, DropTarget::Root));
+        let hint: Element<Message> = if dragging {
+            container(text("Drop here to move to the top level").size(11).style(style::muted))
+                .padding([10, 8])
+                .width(Fill)
+                .style(move |t: &Theme| drop_zone_style(t, root_target, root_ok))
+                .into()
+        } else {
+            Space::new().height(8).into()
+        };
+        entries.push(hint);
+        let list = scrollable(column(entries).spacing(1).padding(iced::Padding { right: 10.0, ..Default::default() })).id(LIB_SCROLL).height(Fill);
+        let list: Element<Message> = if dragging {
+            // Invisible strips at the edges scroll the list while dragging.
+            let zone = |z: i8| mouse_area(Space::new().width(Fill).height(28)).on_enter(Message::DragZone(z)).on_exit(Message::DragZone(0));
+            stack![list, column![zone(-1), Space::new().height(Fill), zone(1)]].into()
+        } else {
+            list.into()
+        };
         let idle = !self.busy();
         let (open, rename, delete) = match (self.library_selected, self.folder_selected) {
             (Some(d), _) => (idle.then_some(Message::OpenDocument(d)), Some(Message::AskRename(d)), idle.then_some(Message::AskDelete(d))),
@@ -113,12 +211,13 @@ impl App {
         } else {
             self.folder_selected.map(|id| {
                 let n = self.folder_doc_count(id);
-                text(format!("Folder · {n} document(s) · click again to expand/collapse")).size(11).style(style::muted).into()
+                text(format!("Folder · {n} document(s) · double-click to expand/collapse")).size(11).style(style::muted).into()
             })
         };
         let mut col = column![
             row![text("Library").size(15), Space::new().width(Fill), text(format!("{}", self.library.len())).size(12).style(style::muted)],
-            scrollable(list).height(Fill),
+            list,
+            text("Drag entries onto folders to organize them; double-click to open.").size(10).style(style::muted),
             actions,
             organize,
         ]
@@ -129,55 +228,85 @@ impl App {
         container(col).padding(10).width(LIBRARY_W).height(Fill).style(style::panel).into()
     }
 
+    /// Row state for styling a library entry.
+    fn entry_state(&self, key: LibKey) -> EntryState {
+        let selected = match key {
+            LibKey::Doc(id) => self.library_selected == Some(id),
+            LibKey::Folder(id) => self.folder_selected == Some(id),
+        };
+        let drag = self.drag.as_ref().filter(|d| d.active);
+        let dragged = drag.is_some_and(|d| d.item == key);
+        let drop = match (drag, key) {
+            (Some(d), LibKey::Folder(f)) if self.drop_target() == Some(DropTarget::Folder(f)) => Some(self.drop_allowed(d.item, DropTarget::Folder(f))),
+            _ => None,
+        };
+        EntryState { selected, hovered: self.lib_hover == Some(key) && drag.is_none(), dragged, drop }
+    }
+
+    /// Wraps a library row: press selects (and may start a drag), double-click activates.
+    fn entry<'a>(&self, key: LibKey, content: Element<'a, Message>) -> Element<'a, Message> {
+        let st = self.entry_state(key);
+        let interaction = match (self.drag.as_ref().filter(|d| d.active), st.drop) {
+            (Some(_), Some(false)) => mouse::Interaction::NotAllowed,
+            (Some(_), _) => mouse::Interaction::Grabbing,
+            _ => mouse::Interaction::Pointer,
+        };
+        mouse_area(container(content).width(Fill).padding([4, 6]).style(move |t: &Theme| entry_style(t, st)))
+            .on_press(Message::LibPress(key))
+            .on_double_click(Message::LibActivate(key))
+            .on_enter(Message::LibHover(key))
+            .on_exit(Message::LibUnhover(key))
+            .interaction(interaction)
+            .into()
+    }
+
     /// Adds the folders and documents below `parent` (depth-first) to `out`.
     fn push_tree<'a>(&'a self, out: &mut Vec<Element<'a, Message>>, parent: Option<i64>, depth: usize, known: &HashSet<i64>) {
-        let indent = depth as f32 * 14.0;
+        let indent = depth as f32 * 16.0;
+        let dark = self.settings.dark;
         // Unknown parents (should not happen) fall back to the top level.
         let parent_of = |p: Option<i64>| p.filter(|id| known.contains(id));
         for f in self.folders.iter().filter(|f| parent_of(f.parent) == parent) {
-            let selected = self.folder_selected == Some(f.id);
-            let arrow = button(text(if f.collapsed { "▸" } else { "▾" }).size(18).line_height(1.0))
-                .padding([2, 4])
+            let arrow = button(icons::chevron(!f.collapsed))
+                .padding([4, 4])
+                .width(20)
                 .style(button::text)
                 .on_press(Message::ToggleFolder(f.id));
-            let label = row![
+            let content = row![
+                arrow,
+                icons::folder(!f.collapsed, dark),
                 text(f.name.as_str()).size(13).font(Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT }).width(Fill),
                 text(format!("{}", self.folder_doc_count(f.id))).size(11).style(style::muted),
             ]
+            .spacing(5)
             .align_y(Alignment::Center);
-            out.push(
-                row![
-                    Space::new().width(indent),
-                    arrow,
-                    button(label).width(Fill).padding([5, 6]).style(style::list_item(selected)).on_press(Message::SelectFolder(f.id)),
-                ]
-                .align_y(Alignment::Center)
-                .into(),
-            );
+            out.push(row![Space::new().width(indent), self.entry(LibKey::Folder(f.id), content.into())].into());
             if !f.collapsed {
+                let before = out.len();
                 self.push_tree(out, Some(f.id), depth + 1, known);
+                if out.len() == before {
+                    // Keeps an empty folder from looking like it owns the entries below it.
+                    out.push(row![Space::new().width(indent + 50.0), text("(empty)").size(11).style(style::muted)].into());
+                }
             }
         }
         for d in self.library.iter().filter(|d| parent_of(d.folder) == parent) {
-            let selected = self.library_selected == Some(d.id);
             let open = self.open.as_ref().is_some_and(|o| o.info.id == d.id);
-            let kind = match d.kind {
-                DocKind::Contig => "Contig",
-                DocKind::Alignment => "Alignment",
-                DocKind::Sequences => "Sequences",
-            };
+            let kind = d.kind.label();
             let subtitle = format!("{kind} · {} seqs · {} bp", group_digits(d.n_rows), group_digits(d.width));
-            let name = if open { format!("● {}", d.name) } else { d.name.clone() };
-            let entry = column![text(name).size(13), text(subtitle).size(11).style(style::muted)].spacing(1);
-            // Documents line up with folder names (past the arrow button).
-            let pad = if depth > 0 || !self.folders.is_empty() { indent + 20.0 } else { indent };
-            out.push(
-                row![
-                    Space::new().width(pad),
-                    button(entry).width(Fill).padding([5, 8]).style(style::list_item(selected)).on_press(Message::SelectLibraryDoc(d.id)),
-                ]
-                .into(),
-            );
+            let name = text(d.name.as_str()).size(13).font(if open {
+                Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT }
+            } else {
+                Font::DEFAULT
+            });
+            let content = row![
+                Space::new().width(20),
+                icons::document(d.kind, dark),
+                column![name, text(subtitle).size(11).style(style::muted)].spacing(1).width(Fill),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center);
+            out.push(row![Space::new().width(indent), self.entry(LibKey::Doc(d.id), content.into())].into());
         }
     }
 
@@ -229,7 +358,7 @@ impl App {
             text("Sequence alignment viewer for PCR design and inclusivity evaluation").size(15).style(style::muted),
             Space::new().height(12),
             text("1. Import FASTA files (aligned or unaligned) — they are stored in the library.").size(14),
-            text("2. Open a document from the library (click twice or press Open).").size(14),
+            text("2. Open a document from the library (double-click it or press Open).").size(14),
             text("3. Map sequences to a reference, or view an existing alignment.").size(14),
             text("4. Drag across columns to evaluate a primer or probe against all sequences.").size(14),
             Space::new().height(12),
@@ -274,10 +403,11 @@ impl App {
                 tooltip::Position::Bottom,
             ),
             rule::vertical(1),
-            text_input(jump_hint, &od.jump_text).on_input(Message::JumpInput).on_submit(Message::JumpSubmit).padding(5).size(13).width(130),
+            text_input(jump_hint, &od.jump_text).id(JUMP_INPUT).on_input(Message::JumpInput).on_submit(Message::JumpSubmit).padding(5).size(13).width(130),
             tool("Go", Some(Message::JumpSubmit), "Jump to position; a range (e.g. 100-120) is selected"),
             rule::vertical(1),
             text_input("Search (IUPAC)…", &od.search.query)
+                .id(SEARCH_INPUT)
                 .on_input(Message::SearchInput)
                 .on_submit(Message::SearchSubmit)
                 .padding(5)
@@ -746,5 +876,56 @@ impl cv::Program<Message> for ProfileChart<'_> {
                 }
         }
         vec![f.into_geometry()]
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EntryState {
+    selected: bool,
+    hovered: bool,
+    /// The entry being dragged.
+    dragged: bool,
+    /// Drop target under the cursor: allowed or not.
+    drop: Option<bool>,
+}
+
+fn entry_style(theme: &Theme, st: EntryState) -> container::Style {
+    let p = theme.extended_palette();
+    let (background, border) = match st.drop {
+        Some(true) => (Some(p.primary.weak.color), iced::Border { color: p.primary.base.color, width: 2.0, radius: 5.0.into() }),
+        Some(false) => (None, iced::Border { color: p.danger.base.color, width: 2.0, radius: 5.0.into() }),
+        None => {
+            let bg = if st.selected {
+                Some(p.primary.weak.color)
+            } else if st.hovered {
+                Some(p.background.strong.color)
+            } else {
+                None
+            };
+            (bg, iced::Border { radius: 5.0.into(), ..Default::default() })
+        }
+    };
+    let text = if st.selected && st.drop.is_none() { p.primary.weak.text } else { p.background.base.text };
+    container::Style {
+        background: background.map(|c| Color { a: if st.dragged { c.a * 0.5 } else { c.a }, ..c }.into()),
+        border,
+        text_color: Some(if st.dragged { Color { a: 0.5, ..text } } else { text }),
+        ..Default::default()
+    }
+}
+
+fn drop_zone_style(theme: &Theme, active: bool, ok: bool) -> container::Style {
+    let p = theme.extended_palette();
+    let color = if !active {
+        p.background.strong.color
+    } else if ok {
+        p.primary.base.color
+    } else {
+        p.danger.base.color
+    };
+    container::Style {
+        background: (active && ok).then(|| p.primary.weak.color.into()),
+        border: iced::Border { color, width: 1.0, radius: 5.0.into() },
+        ..Default::default()
     }
 }

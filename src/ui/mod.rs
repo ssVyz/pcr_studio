@@ -1,6 +1,8 @@
 //! The iced application: state, messages and update logic.
 
 pub mod canvas;
+mod icons;
+mod menu;
 mod dialogs;
 mod job;
 pub mod state;
@@ -53,6 +55,10 @@ impl Default for AppSettings {
 
 const SETTINGS_KEY: &str = "app_settings";
 
+/// Ids of the viewer's text fields (focused from the menus / shortcuts).
+pub const JUMP_INPUT: &str = "jump-input";
+pub const SEARCH_INPUT: &str = "search-input";
+
 /// "Group by" choice for the pick list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupChoice {
@@ -68,6 +74,37 @@ impl std::fmt::Display for GroupChoice {
         }
     }
 }
+
+/// A library entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibKey {
+    Doc(i64),
+    Folder(i64),
+}
+
+/// Where a dragged library entry would land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropTarget {
+    Folder(i64),
+    Root,
+}
+
+/// A press on a library entry; it becomes a drag once the cursor moves a few pixels.
+#[derive(Debug, Clone)]
+pub struct LibDrag {
+    pub item: LibKey,
+    origin: Option<iced::Point>,
+    pub pos: Option<iced::Point>,
+    pub active: bool,
+    /// Collapsed folder being hovered during the drag, and since when (auto-expand).
+    hover_since: Option<(i64, std::time::Instant)>,
+    /// -1 / +1 while the cursor is in the top / bottom auto-scroll zone of the list.
+    zone: i8,
+}
+
+const DRAG_THRESHOLD: f32 = 6.0;
+const AUTO_EXPAND: std::time::Duration = std::time::Duration::from_millis(650);
+pub const LIB_SCROLL: &str = "library-scroll";
 
 /// Destination folder in the "Move to" pick list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +128,6 @@ pub enum Message {
     Tick,
     Key(keyboard::Event),
     // Library
-    SelectLibraryDoc(i64),
     OpenDocument(i64),
     DocLoaded(Payload<Result<LoadedDoc, String>>),
     ImportFasta,
@@ -100,8 +136,17 @@ pub enum Message {
     AskRename(i64),
     AskDelete(i64),
     ConfirmDelete(i64),
-    SelectFolder(i64),
     ToggleFolder(i64),
+    /// Press on a library entry: select it; may start a drag.
+    LibPress(LibKey),
+    /// Double-click: open a document / expand or collapse a folder.
+    LibActivate(LibKey),
+    LibHover(LibKey),
+    LibUnhover(LibKey),
+    DragMove(iced::Point),
+    DragRelease,
+    DragTick,
+    DragZone(i8),
     NewFolder,
     AskRenameFolder(i64),
     AskDeleteFolder(i64),
@@ -178,6 +223,16 @@ pub enum Message {
     CloseModal,
     CancelJob,
     DemoData,
+    // Menu bar
+    ToggleMenu(menu::MenuId),
+    HoverMenu(menu::MenuId),
+    CloseMenu,
+    /// A menu entry was chosen: close the menu, then run the action.
+    MenuAction(Box<Message>),
+    CloseDocument,
+    FocusJump,
+    FocusSearch,
+    Exit,
     Noop,
 }
 
@@ -189,6 +244,12 @@ pub struct App {
     folders: Vec<Folder>,
     /// Selected folder (mutually exclusive with `library_selected`).
     folder_selected: Option<i64>,
+    /// Open drop-down menu.
+    menu: Option<menu::MenuId>,
+    /// Pending or active drag of a library entry.
+    drag: Option<LibDrag>,
+    /// Library entry under the cursor.
+    lib_hover: Option<LibKey>,
     open: Option<OpenDoc>,
     settings: AppSettings,
     job: Option<Job>,
@@ -222,6 +283,9 @@ impl App {
             library_selected: None,
             folders,
             folder_selected: None,
+            menu: None,
+            drag: None,
+            lib_hover: None,
             open: None,
             settings,
             job: None,
@@ -244,11 +308,89 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let keys = keyboard::listen().map(Message::Key);
+        let mut subs = vec![keyboard::listen().map(Message::Key)];
         if self.job.is_some() {
-            Subscription::batch([keys, iced::time::every(std::time::Duration::from_millis(120)).map(|_| Message::Tick)])
-        } else {
-            keys
+            subs.push(iced::time::every(std::time::Duration::from_millis(120)).map(|_| Message::Tick));
+        }
+        if let Some(d) = &self.drag {
+            // Follow the cursor anywhere in the window until the button is released.
+            subs.push(iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => Some(Message::DragMove(position)),
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => Some(Message::DragRelease),
+                _ => None,
+            }));
+            if d.active {
+                subs.push(iced::time::every(std::time::Duration::from_millis(60)).map(|_| Message::DragTick));
+            }
+        }
+        Subscription::batch(subs)
+    }
+
+    /// Target under the cursor for the active drag (`None`: outside the library).
+    fn drop_target(&self) -> Option<DropTarget> {
+        let d = self.drag.as_ref().filter(|d| d.active)?;
+        match self.lib_hover {
+            Some(LibKey::Folder(f)) => Some(DropTarget::Folder(f)),
+            Some(LibKey::Doc(id)) => {
+                let folder = self.library.iter().find(|x| x.id == id).and_then(|x| x.folder);
+                Some(folder.map_or(DropTarget::Root, DropTarget::Folder))
+            }
+            None => {
+                let p = d.pos?;
+                (p.x < view::LIBRARY_W && p.y > menu::BAR_H).then_some(DropTarget::Root)
+            }
+        }
+    }
+
+    /// Whether dropping `item` on `target` would move it.
+    fn drop_allowed(&self, item: LibKey, target: DropTarget) -> bool {
+        let dest = match target {
+            DropTarget::Folder(f) => Some(f),
+            DropTarget::Root => None,
+        };
+        match item {
+            LibKey::Doc(id) => self.library.iter().find(|x| x.id == id).is_some_and(|x| x.folder != dest),
+            LibKey::Folder(id) => {
+                let parent = self.folders.iter().find(|f| f.id == id).and_then(|f| f.parent);
+                parent != dest && dest.is_none_or(|f| !self.folder_subtree(id).contains(&f))
+            }
+        }
+    }
+
+    fn lib_name(&self, key: LibKey) -> String {
+        match key {
+            LibKey::Doc(id) => self.library.iter().find(|d| d.id == id).map(|d| d.name.clone()),
+            LibKey::Folder(id) => self.folders.iter().find(|f| f.id == id).map(|f| f.name.clone()),
+        }
+        .unwrap_or_default()
+    }
+
+    fn finish_drag(&mut self) {
+        let target = self.drop_target();
+        let Some(d) = self.drag.take() else { return };
+        if !d.active {
+            return;
+        }
+        let Some(target) = target.filter(|&t| self.drop_allowed(d.item, t)) else {
+            return;
+        };
+        let dest = match target {
+            DropTarget::Folder(f) => Some(f),
+            DropTarget::Root => None,
+        };
+        let result = match d.item {
+            LibKey::Doc(id) => self.db.move_document(id, dest),
+            LibKey::Folder(id) => self.db.move_folder(id, dest),
+        };
+        match result {
+            Ok(()) => {
+                let name = self.lib_name(d.item);
+                let place = dest.map(|f| self.lib_name(LibKey::Folder(f))).unwrap_or_else(|| "the top level".into());
+                self.reload_library();
+                self.reveal_folder(dest);
+                self.status = format!("Moved “{name}” to {place}");
+            }
+            Err(e) => self.error = Some(e),
         }
     }
 
@@ -365,20 +507,73 @@ impl App {
         match message {
             Message::Tick | Message::Noop => {}
             Message::Key(e) => return self.on_key(e),
-            Message::SelectLibraryDoc(id) => {
-                self.folder_selected = None;
-                if self.library_selected == Some(id) {
-                    return self.open_document(id);
+            Message::LibPress(key) => {
+                match key {
+                    LibKey::Doc(id) => {
+                        self.library_selected = Some(id);
+                        self.folder_selected = None;
+                    }
+                    LibKey::Folder(id) => {
+                        self.folder_selected = Some(id);
+                        self.library_selected = None;
+                    }
                 }
-                self.library_selected = Some(id);
+                self.drag = Some(LibDrag { item: key, origin: None, pos: None, active: false, hover_since: None, zone: 0 });
             }
-            Message::SelectFolder(id) => {
-                // A second click on the selected folder expands/collapses it.
-                if self.folder_selected == Some(id) {
-                    return self.update(Message::ToggleFolder(id));
+            Message::LibActivate(key) => {
+                self.drag = None;
+                match key {
+                    LibKey::Doc(id) => return self.open_document(id),
+                    LibKey::Folder(id) => return self.update(Message::ToggleFolder(id)),
                 }
-                self.folder_selected = Some(id);
-                self.library_selected = None;
+            }
+            Message::LibHover(key) => {
+                self.lib_hover = Some(key);
+                if let (Some(d), LibKey::Folder(f)) = (self.drag.as_mut(), key) {
+                    d.hover_since = Some((f, std::time::Instant::now()));
+                }
+            }
+            Message::LibUnhover(key) => {
+                if self.lib_hover == Some(key) {
+                    self.lib_hover = None;
+                }
+                if let (Some(d), LibKey::Folder(f)) = (self.drag.as_mut(), key)
+                    && d.hover_since.is_some_and(|(h, _)| h == f)
+                {
+                    d.hover_since = None;
+                }
+            }
+            Message::DragMove(p) => {
+                if let Some(d) = self.drag.as_mut() {
+                    let origin = *d.origin.get_or_insert(p);
+                    d.pos = Some(p);
+                    if !d.active && ((p.x - origin.x).powi(2) + (p.y - origin.y).powi(2)).sqrt() > DRAG_THRESHOLD {
+                        d.active = true;
+                    }
+                }
+            }
+            Message::DragRelease => self.finish_drag(),
+            Message::DragZone(z) => {
+                if let Some(d) = self.drag.as_mut() {
+                    d.zone = z;
+                }
+            }
+            Message::DragTick => {
+                let Some(d) = self.drag.as_mut().filter(|d| d.active) else { return Task::none() };
+                // Hovering a collapsed folder expands it, so items can be dropped deeper.
+                if let Some((f, since)) = d.hover_since
+                    && since.elapsed() >= AUTO_EXPAND
+                {
+                    d.hover_since = None;
+                    if let Some(folder) = self.folders.iter_mut().find(|x| x.id == f && x.collapsed) {
+                        folder.collapsed = false;
+                        let _ = self.db.set_folder_collapsed(f, false);
+                    }
+                }
+                let zone = self.drag.as_ref().map(|d| d.zone).unwrap_or(0);
+                if zone != 0 {
+                    return iced::widget::operation::scroll_by(LIB_SCROLL, iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: zone as f32 * 18.0 });
+                }
             }
             Message::ToggleFolder(id) => {
                 if let Some(f) = self.folders.iter_mut().find(|f| f.id == id) {
@@ -780,6 +975,33 @@ impl App {
                 }
             }
             Message::DemoData => return self.demo_data(),
+            Message::ToggleMenu(id) => self.menu = if self.menu == Some(id) { None } else { Some(id) },
+            Message::HoverMenu(id) => {
+                if self.menu.is_some() {
+                    self.menu = Some(id);
+                }
+            }
+            Message::CloseMenu => self.menu = None,
+            Message::MenuAction(m) => {
+                self.menu = None;
+                return self.update(*m);
+            }
+            Message::CloseDocument => {
+                if self.open.take().is_some() {
+                    self.status = "Document closed".into();
+                }
+            }
+            Message::FocusJump => {
+                if self.open.is_some() {
+                    return Task::batch([iced::widget::operation::focus(JUMP_INPUT), iced::widget::operation::select_all(JUMP_INPUT)]);
+                }
+            }
+            Message::FocusSearch => {
+                if self.open.is_some() {
+                    return Task::batch([iced::widget::operation::focus(SEARCH_INPUT), iced::widget::operation::select_all(SEARCH_INPUT)]);
+                }
+            }
+            Message::Exit => return iced::exit(),
         }
         Task::none()
     }
@@ -886,6 +1108,19 @@ impl App {
 
     fn on_key(&mut self, e: keyboard::Event) -> Task<Message> {
         let keyboard::Event::KeyPressed { key, modifiers, .. } = e else { return Task::none() };
+        if let Key::Named(Named::Escape) = key
+            && self.menu.is_some()
+        {
+            self.menu = None;
+            return Task::none();
+        }
+        if let Key::Named(Named::Escape) = key
+            && self.drag.is_some()
+        {
+            self.drag = None;
+            self.status = "Move cancelled".into();
+            return Task::none();
+        }
         if let Key::Named(Named::Escape) = key {
             if self.modal.is_some() {
                 self.modal = None;
@@ -906,6 +1141,10 @@ impl App {
                     "o" => return self.update(Message::ImportFasta),
                     "e" => return self.update(Message::OpenExport),
                     "m" => return self.update(Message::OpenMapDialog),
+                    "w" => return self.update(Message::CloseDocument),
+                    "g" => return self.update(Message::FocusJump),
+                    "f" => return self.update(Message::FocusSearch),
+                    "," => return self.update(Message::OpenSettings),
                     "=" | "+" => self.zoom_by(1.5),
                     "-" => self.zoom_by(1.0 / 1.5),
                     "0" => return self.update(Message::ZoomFit),

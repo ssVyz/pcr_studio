@@ -259,23 +259,3 @@ pub fn tool_button(theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-/// Library list entry.
-pub fn list_item(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |theme, status| {
-        let p = theme.extended_palette();
-        let bg = if selected {
-            Some(Background::Color(p.primary.weak.color))
-        } else {
-            match status {
-                button::Status::Hovered => Some(Background::Color(p.background.strong.color)),
-                _ => None,
-            }
-        };
-        button::Style {
-            background: bg,
-            text_color: if selected { p.primary.weak.text } else { p.background.base.text },
-            border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 4.0.into() },
-            ..Default::default()
-        }
-    }
-}

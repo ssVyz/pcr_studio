@@ -24,17 +24,30 @@ FASTA files given on the command line are imported at startup.
 
 ## Workflow
 
-1. **Import FASTA** (toolbar or Ctrl+O). Aligned FASTA (gapped, or all sequences the
+The menu bar holds all application commands:
+
+| Menu | Entries |
+|---|---|
+| File | Import FASTA… (Ctrl+O), Import metadata table…, Generate demo data, Export FASTA… (Ctrl+E), Extract selection to library, New folder, Close document (Ctrl+W), Exit |
+| Edit | Copy oligo (Ctrl+C), Copy oligo report, Add annotation from selection, Clear selection (Esc), Set selected row as reference, Clear reference, Settings… (Ctrl+,) |
+| Tools | Map to reference… (Ctrl+M), Metadata from sequence names…, Oligo report for selection, Find sequence… (Ctrl+F), Go to position… (Ctrl+G) |
+
+Entries that do not apply (e.g. without an open document or selection) are disabled.
+
+1. **Import FASTA** (File menu or Ctrl+O). Aligned FASTA (gapped, or all sequences the
    same length) becomes an alignment; anything else a sequence list. Leading/trailing
    gaps are treated as missing data, not deletions. `key=value` and `[key=value]`
    tokens in FASTA descriptions become metadata. **Demo data** adds a synthetic
    35 kb × 2,000 genome set.
-2. **Open** a document from the library (click it twice). Organize the library in folders:
-   **New folder** creates one inside the selected folder (or next to the selected document),
-   **Move to…** moves the selected document or folder, the arrow or a second click on a folder
-   expands/collapses it (remembered). Deleting a folder keeps its contents (they move up one
+2. **Open** a document from the library (double-click it). Icons distinguish folders,
+   sequence lists, alignments and contigs. Organize the library in folders: **New folder**
+   creates one inside the selected folder (or next to the selected document); **drag** a
+   document or folder onto a folder to move it there, or onto the free space below the
+   entries to move it to the top level (hovering a collapsed folder expands it, the list
+   scrolls at its edges, Escape cancels, invalid targets are marked red). **Move to…** does
+   the same from a list. The chevron or a double-click expands/collapses a folder (remembered). Deleting a folder keeps its contents (they move up one
    level). New documents (imports, mapping results, slices) go to the current folder.
-3. **Map to Reference** (Ctrl+M): pick the reference from this or another document,
+3. **Map to Reference** (Tools menu or Ctrl+M): pick the reference from this or another document,
    choose a sensitivity preset or custom values, optional fine tuning. The result is
    a new contig document with the reference pinned on top.
 4. **Evaluate an oligo**: drag across columns (or type a range like `19160-19180` into
@@ -47,7 +60,7 @@ FASTA files given on the command line are imported at startup.
 5. **Extract slice** (selection panel or oligo report): saves the selected columns of all
    sequences, without the reference and with the original names, as a new library document
    next to the source. Sequences without bases in the range and empty columns are dropped.
-6. **Export** (Ctrl+E) all, shown or selected sequences, optionally only the selected
+6. **Export** (File menu or Ctrl+E) all, shown or selected sequences, optionally only the selected
    columns, gapped or ungapped, with reference and/or consensus.
 
 ### Viewer
@@ -89,7 +102,7 @@ split from sequence names at a delimiter.
 | `search.rs` | Motif search |
 | `db.rs` | SQLite library (documents, rows, annotations, folders, settings) |
 | `demo.rs` | Synthetic data |
-| `ui/` | iced application: `mod.rs` state/messages/update, `view.rs` layout and panels, `canvas.rs` alignment renderer, `dialogs.rs`, `state.rs` viewer state, `style.rs`, `job.rs` background jobs |
+| `ui/` | iced application: `mod.rs` state/messages/update, `menu.rs` menu bar and drop-downs, `view.rs` layout and panels, `canvas.rs` alignment renderer, `dialogs.rs`, `state.rs` viewer state, `style.rs`, `job.rs` background jobs |
 
 ### Map to reference
 
