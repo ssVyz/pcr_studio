@@ -7,6 +7,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.0.9] - 2026-09-28
+
+### Added
+
+- Library multi-selection: Ctrl+click adds or removes entries; dragging any selected entry
+  moves the whole selection (the floating label shows "N items"), and **Move to…** moves all
+  selected entries too. Entries whose folder is also selected move with that folder; the drop
+  is refused if a selected folder would go into itself. A plain click inside the selection
+  keeps it for dragging and selects just that entry on release; clicking free space clears
+  the selection.
+- Right-click on free space in the library: New folder (top level) and Import FASTA….
+  Folders keep "New subfolder" in their right-click menu.
+
+### Changed
+
+- The app tracks keyboard modifier state (for Ctrl+click in the library).
+
 ## [0.0.8] - 2026-09-28
 
 ### Added

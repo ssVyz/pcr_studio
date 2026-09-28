@@ -48,8 +48,11 @@ Entries that do not apply (e.g. without an open document or selection) are disab
    scrolls at its edges, Escape cancels, invalid targets are marked red). **Move to…** does
    the same from a list. The chevron or a double-click expands/collapses a folder (remembered).
    **Right-click** an entry for Open / Rename… / Delete… (documents) or Expand/Collapse /
-   New subfolder / Rename… / Delete folder… (folders); deleting always asks for confirmation
-   and warns that it cannot be undone. Deleting a folder keeps its contents (they move up one
+   New subfolder / Rename… / Delete folder… (folders), or free space for New folder /
+   Import FASTA…; deleting always asks for confirmation and warns that it cannot be undone.
+   **Ctrl+click** selects several entries; dragging one of them (or **Move to…**) moves all
+   of them. Entries inside a selected folder move with it; a click on free space clears the
+   selection. Deleting a folder keeps its contents (they move up one
    level). New documents (imports, mapping results, slices) go to the current folder.
 3. **Map to Reference** (Tools menu or Ctrl+M): pick the reference from this or another document,
    choose a sensitivity preset or custom values, optional fine tuning. The result is

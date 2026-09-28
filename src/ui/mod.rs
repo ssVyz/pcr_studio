@@ -115,8 +115,16 @@ pub enum LibKey {
 /// Right-click menu of a library entry, opened at `pos` (window coordinates).
 #[derive(Debug, Clone, Copy)]
 pub struct ContextMenu {
-    pub target: LibKey,
+    pub target: ContextTarget,
     pub pos: iced::Point,
+}
+
+/// What was right-clicked in the library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextTarget {
+    Entry(LibKey),
+    /// Free space in the library list.
+    Empty,
 }
 
 /// Where a dragged library entry would land.
@@ -129,7 +137,13 @@ pub enum DropTarget {
 /// A press on a library entry; it becomes a drag once the cursor moves a few pixels.
 #[derive(Debug, Clone)]
 pub struct LibDrag {
+    /// The pressed entry.
     pub item: LibKey,
+    /// Everything that moves: the whole selection if `item` is part of it.
+    pub items: Vec<LibKey>,
+    /// Plain click inside a multi-selection: reduce the selection to this entry
+    /// on release unless the press turned into a drag.
+    collapse_to: Option<LibKey>,
     origin: Option<iced::Point>,
     pub pos: Option<iced::Point>,
     pub active: bool,
@@ -174,6 +188,10 @@ pub enum Message {
     AskDelete(i64),
     ConfirmDelete(i64),
     ToggleFolder(i64),
+    /// Right-click on free space in the library list.
+    LibContextEmpty,
+    /// Click on free space in the library list: clear the selection.
+    LibClearSelection,
     /// Press on a library entry: select it; may start a drag.
     LibPress(LibKey),
     /// Double-click: open a document / expand or collapse a folder.
@@ -306,6 +324,10 @@ pub struct App {
     window_size: iced::Size,
     /// Panel edge being dragged.
     split_drag: Option<Split>,
+    /// Multi-selection in the library (Ctrl+click); only valid while it
+    /// contains the primary selection (`library_selected` / `folder_selected`).
+    lib_multi: Vec<LibKey>,
+    modifiers: keyboard::Modifiers,
     open: Option<OpenDoc>,
     settings: AppSettings,
     job: Option<Job>,
@@ -348,6 +370,8 @@ impl App {
             lib_cursor: iced::Point::ORIGIN,
             window_size: iced::Size::new(1500.0, 920.0),
             split_drag: None,
+            lib_multi: Vec::new(),
+            modifiers: keyboard::Modifiers::default(),
             open: None,
             settings,
             job: None,
@@ -433,18 +457,116 @@ impl App {
     }
 
     /// Whether dropping `item` on `target` would move it.
-    fn drop_allowed(&self, item: LibKey, target: DropTarget) -> bool {
+    /// Whether dropping `items` on `target` moves anything and is valid
+    /// (no folder may go into itself or one of its subfolders).
+    fn drop_allowed(&self, items: &[LibKey], target: DropTarget) -> bool {
+        let moves = self.planned_moves(items, target);
+        moves.is_some_and(|m| !m.is_empty())
+    }
+
+    /// Entries that actually move when `items` are dropped on `target`:
+    /// entries already there, and entries inside a moved folder, stay put.
+    /// `None` if the drop is invalid.
+    fn planned_moves(&self, items: &[LibKey], target: DropTarget) -> Option<Vec<LibKey>> {
         let dest = match target {
             DropTarget::Folder(f) => Some(f),
             DropTarget::Root => None,
         };
-        match item {
-            LibKey::Doc(id) => self.library.iter().find(|x| x.id == id).is_some_and(|x| x.folder != dest),
-            LibKey::Folder(id) => {
-                let parent = self.folders.iter().find(|f| f.id == id).and_then(|f| f.parent);
-                parent != dest && dest.is_none_or(|f| !self.folder_subtree(id).contains(&f))
+        let moved_folders: Vec<i64> = items.iter().filter_map(|k| if let LibKey::Folder(f) = k { Some(*f) } else { None }).collect();
+        let inside_moved = |folder: Option<i64>| -> bool {
+            // True if `folder` or one of its ancestors is being moved.
+            let mut cur = folder;
+            while let Some(f) = cur {
+                if moved_folders.contains(&f) {
+                    return true;
+                }
+                cur = self.folders.iter().find(|x| x.id == f).and_then(|x| x.parent);
+            }
+            false
+        };
+        let mut out = Vec::new();
+        for &k in items {
+            match k {
+                LibKey::Doc(id) => {
+                    let Some(d) = self.library.iter().find(|x| x.id == id) else { continue };
+                    if d.folder != dest && !inside_moved(d.folder) {
+                        out.push(k);
+                    }
+                }
+                LibKey::Folder(id) => {
+                    if dest.is_some_and(|f| self.folder_subtree(id).contains(&f)) {
+                        return None;
+                    }
+                    let parent = self.folders.iter().find(|f| f.id == id).and_then(|f| f.parent);
+                    if parent != dest && !inside_moved(parent) {
+                        out.push(k);
+                    }
+                }
             }
         }
+        Some(out)
+    }
+
+    /// Current library selection (Ctrl+click adds entries).
+    fn selection(&self) -> Vec<LibKey> {
+        let primary = match (self.library_selected, self.folder_selected) {
+            (Some(d), _) => Some(LibKey::Doc(d)),
+            (None, Some(f)) => Some(LibKey::Folder(f)),
+            _ => None,
+        };
+        match primary {
+            Some(p) if self.lib_multi.len() > 1 && self.lib_multi.contains(&p) => self.lib_multi.clone(),
+            Some(p) => vec![p],
+            None => Vec::new(),
+        }
+    }
+
+    fn set_primary(&mut self, key: Option<LibKey>) {
+        match key {
+            Some(LibKey::Doc(id)) => {
+                self.library_selected = Some(id);
+                self.folder_selected = None;
+            }
+            Some(LibKey::Folder(id)) => {
+                self.folder_selected = Some(id);
+                self.library_selected = None;
+            }
+            None => {
+                self.library_selected = None;
+                self.folder_selected = None;
+            }
+        }
+    }
+
+    /// Moves several entries to `dest`; returns (moved, status text).
+    fn move_entries(&mut self, items: &[LibKey], target: DropTarget) {
+        let dest = match target {
+            DropTarget::Folder(f) => Some(f),
+            DropTarget::Root => None,
+        };
+        let Some(moves) = self.planned_moves(items, target) else {
+            self.error = Some("A folder cannot be moved into itself or one of its subfolders".into());
+            return;
+        };
+        let mut moved = 0;
+        for &k in &moves {
+            let r = match k {
+                LibKey::Doc(id) => self.db.move_document(id, dest),
+                LibKey::Folder(id) => self.db.move_folder(id, dest),
+            };
+            match r {
+                Ok(()) => moved += 1,
+                Err(e) => self.error = Some(e),
+            }
+        }
+        let place = dest.map(|f| self.lib_name(LibKey::Folder(f))).unwrap_or_else(|| "the top level".into());
+        self.status = match (moved, moves.first()) {
+            (0, _) => "Nothing to move".into(),
+            (1, Some(&k)) => format!("Moved “{}” to {place}", self.lib_name(k)),
+            (n, _) => format!("Moved {n} items to {place}"),
+        };
+        self.reload_library();
+        self.reveal_folder(dest);
     }
 
     fn lib_name(&self, key: LibKey) -> String {
@@ -459,28 +581,14 @@ impl App {
         let target = self.drop_target();
         let Some(d) = self.drag.take() else { return };
         if !d.active {
+            // A plain click inside a multi-selection selects just that entry.
+            if let Some(k) = d.collapse_to {
+                self.lib_multi = vec![k];
+            }
             return;
         }
-        let Some(target) = target.filter(|&t| self.drop_allowed(d.item, t)) else {
-            return;
-        };
-        let dest = match target {
-            DropTarget::Folder(f) => Some(f),
-            DropTarget::Root => None,
-        };
-        let result = match d.item {
-            LibKey::Doc(id) => self.db.move_document(id, dest),
-            LibKey::Folder(id) => self.db.move_folder(id, dest),
-        };
-        match result {
-            Ok(()) => {
-                let name = self.lib_name(d.item);
-                let place = dest.map(|f| self.lib_name(LibKey::Folder(f))).unwrap_or_else(|| "the top level".into());
-                self.reload_library();
-                self.reveal_folder(dest);
-                self.status = format!("Moved “{name}” to {place}");
-            }
-            Err(e) => self.error = Some(e),
+        if let Some(target) = target.filter(|&t| self.drop_allowed(&d.items, t)) {
+            self.move_entries(&d.items, target);
         }
     }
 
@@ -598,17 +706,52 @@ impl App {
             Message::Tick | Message::Noop => {}
             Message::Key(e) => return self.on_key(e),
             Message::LibPress(key) => {
-                match key {
-                    LibKey::Doc(id) => {
-                        self.library_selected = Some(id);
-                        self.folder_selected = None;
+                let mut selection = self.selection();
+                let mut collapse_to = None;
+                if self.modifiers.control() {
+                    // Ctrl+click toggles the entry in the selection.
+                    if let Some(i) = selection.iter().position(|&k| k == key) {
+                        selection.remove(i);
+                        let primary = selection.last().copied();
+                        self.set_primary(primary);
+                        self.lib_multi = selection;
+                        self.drag = None;
+                        return Task::none();
                     }
-                    LibKey::Folder(id) => {
-                        self.folder_selected = Some(id);
-                        self.library_selected = None;
-                    }
+                    selection.push(key);
+                } else if selection.len() > 1 && selection.contains(&key) {
+                    // Keep the selection so it can be dragged as a whole.
+                    collapse_to = Some(key);
+                } else {
+                    selection = vec![key];
                 }
-                self.drag = Some(LibDrag { item: key, origin: None, pos: None, active: false, hover_since: None, zone: 0 });
+                self.set_primary(Some(key));
+                self.lib_multi = selection.clone();
+                self.drag = Some(LibDrag {
+                    item: key,
+                    items: selection,
+                    collapse_to,
+                    origin: None,
+                    pos: None,
+                    active: false,
+                    hover_since: None,
+                    zone: 0,
+                });
+            }
+            Message::LibClearSelection => {
+                if !self.modifiers.control() {
+                    self.set_primary(None);
+                    self.lib_multi.clear();
+                }
+            }
+            Message::LibContextEmpty => {
+                // Right-click on free space: folder commands at the top level.
+                self.set_primary(None);
+                self.lib_multi.clear();
+                self.drag = None;
+                self.menu = None;
+                let pos = iced::Point::new(self.lib_cursor.x, self.lib_cursor.y + menu::BAR_H);
+                self.context = Some(ContextMenu { target: ContextTarget::Empty, pos });
             }
             Message::LibActivate(key) => {
                 self.drag = None;
@@ -647,20 +790,12 @@ impl App {
             Message::WindowSize(s) => self.window_size = s,
             Message::LibContext(key) => {
                 // Right-click selects the entry, like a file browser.
-                match key {
-                    LibKey::Doc(id) => {
-                        self.library_selected = Some(id);
-                        self.folder_selected = None;
-                    }
-                    LibKey::Folder(id) => {
-                        self.folder_selected = Some(id);
-                        self.library_selected = None;
-                    }
-                }
+                self.set_primary(Some(key));
+                self.lib_multi = vec![key];
                 self.drag = None;
                 self.menu = None;
                 let pos = iced::Point::new(self.lib_cursor.x, self.lib_cursor.y + menu::BAR_H);
-                self.context = Some(ContextMenu { target: key, pos });
+                self.context = Some(ContextMenu { target: ContextTarget::Entry(key), pos });
             }
             Message::CloseContext => self.context = None,
             Message::SplitPress(s) => {
@@ -780,19 +915,8 @@ impl App {
                 self.reload_library();
             }
             Message::MoveTo(choice) => {
-                let result = match (self.library_selected, self.folder_selected) {
-                    (Some(doc), _) => self.db.move_document(doc, choice.id),
-                    (None, Some(folder)) => self.db.move_folder(folder, choice.id),
-                    _ => Ok(()),
-                };
-                match result {
-                    Ok(()) => {
-                        self.reload_library();
-                        self.reveal_folder(choice.id);
-                        self.status = format!("Moved to {}", choice.label.trim_start_matches(['·', ' ']));
-                    }
-                    Err(e) => self.error = Some(e),
-                }
+                let items = self.selection();
+                self.move_entries(&items, choice.id.map_or(DropTarget::Root, DropTarget::Folder));
             }
             Message::ExtractSlice => return self.extract_slice(),
             Message::SliceDone(p) => {
@@ -1285,7 +1409,12 @@ impl App {
     }
 
     fn on_key(&mut self, e: keyboard::Event) -> Task<Message> {
+        if let keyboard::Event::ModifiersChanged(m) = e {
+            self.modifiers = m;
+            return Task::none();
+        }
         let keyboard::Event::KeyPressed { key, modifiers, .. } = e else { return Task::none() };
+        self.modifiers = modifiers;
         if let Key::Named(Named::Escape) = key
             && self.menu.is_some()
         {

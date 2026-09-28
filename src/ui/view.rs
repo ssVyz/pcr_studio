@@ -3,7 +3,7 @@
 use super::canvas::{AlignmentView, group_digits};
 use super::dialogs::{self, ModalMsg};
 use super::state::{BASE_COL_W, GraphMode, Highlight, OpenDoc};
-use super::{App, DropTarget, FolderChoice, GroupChoice, JUMP_INPUT, LIB_SCROLL, LibKey, Message, SEARCH_INPUT, Split, icons, menu, style};
+use super::{App, ContextTarget, DropTarget, FolderChoice, GroupChoice, JUMP_INPUT, LIB_SCROLL, LibKey, Message, SEARCH_INPUT, Split, icons, menu, style};
 use crate::display::{Item, SortKey};
 use crate::model::{AnnotationKind, ConsensusThreshold};
 use crate::primer::{self, OligoSource, Orientation, PrimerReport};
@@ -81,9 +81,19 @@ impl App {
     }
 
     /// Right-click menu of a library entry.
-    fn context_entries(&self, key: LibKey) -> Vec<menu::Entry> {
+    fn context_entries(&self, target: ContextTarget) -> Vec<menu::Entry> {
         use menu::Entry;
         let idle = !self.busy();
+        let key = match target {
+            ContextTarget::Entry(k) => k,
+            ContextTarget::Empty => {
+                return vec![
+                    Entry::item("New folder", "", Some(Message::NewFolder)),
+                    Entry::Separator,
+                    Entry::item("Import FASTA…", "Ctrl+O", idle.then_some(Message::ImportFasta)),
+                ];
+            }
+        };
         match key {
             LibKey::Doc(id) => vec![
                 Entry::item("Open", "", idle.then_some(Message::OpenDocument(id))),
@@ -109,13 +119,13 @@ impl App {
         let d = self.drag.as_ref().filter(|d| d.active)?;
         let pos = d.pos?;
         let dark = self.settings.dark;
-        let icon = match d.item {
+        let icon = match d.items.first().copied().unwrap_or(d.item) {
             LibKey::Doc(id) => icons::document(self.library.iter().find(|x| x.id == id)?.kind, dark),
             LibKey::Folder(_) => icons::folder(false, dark),
         };
         let target = self.drop_target();
         let (hint, ok) = match target {
-            Some(t) if self.drop_allowed(d.item, t) => {
+            Some(t) if self.drop_allowed(&d.items, t) => {
                 let place = match t {
                     DropTarget::Folder(f) => self.lib_name(LibKey::Folder(f)),
                     DropTarget::Root => "top level".into(),
@@ -129,7 +139,8 @@ impl App {
             let p = t.extended_palette();
             text::Style { color: Some(if ok { p.primary.base.color } else { p.danger.base.color }) }
         });
-        let label = container(row![icon, text(ellipsize_middle(&self.lib_name(d.item), 40)).size(12), hint].spacing(6).align_y(Alignment::Center))
+        let what = if d.items.len() > 1 { format!("{} items", d.items.len()) } else { ellipsize_middle(&self.lib_name(d.item), 40) };
+        let label = container(row![icon, text(what).size(12), hint].spacing(6).align_y(Alignment::Center))
             .padding([4, 8])
             .style(|t: &Theme| {
                 let mut st = style::card(t);
@@ -201,14 +212,15 @@ impl App {
     fn library_panel(&self, width: f32) -> Element<'_, Message> {
         let known: HashSet<i64> = self.folders.iter().map(|f| f.id).collect();
         let mut entries: Vec<Element<Message>> = Vec::new();
-        self.push_tree(&mut entries, None, 0, &known);
+        let selection = self.selection();
+        self.push_tree(&mut entries, None, 0, &known, &selection);
         let dragging = self.drag.as_ref().is_some_and(|d| d.active);
         if self.library.is_empty() && self.folders.is_empty() {
             entries.push(text("No documents yet. Import FASTA files or generate demo data.").size(12).style(style::muted).into());
         }
         // Free space below the entries: the top-level drop zone.
         let root_target = dragging && self.drop_target() == Some(DropTarget::Root);
-        let root_ok = root_target && self.drag.as_ref().is_some_and(|d| self.drop_allowed(d.item, DropTarget::Root));
+        let root_ok = root_target && self.drag.as_ref().is_some_and(|d| self.drop_allowed(&d.items, DropTarget::Root));
         let hint: Element<Message> = if dragging {
             container(text("Drop here to move to the top level").size(11).style(style::muted))
                 .padding([10, 8])
@@ -220,6 +232,9 @@ impl App {
         };
         entries.push(hint);
         let list = scrollable(column(entries).spacing(1).padding(iced::Padding { right: 10.0, ..Default::default() })).id(LIB_SCROLL).height(Fill);
+        // Clicks on free space (entries capture their own clicks) clear the
+        // selection; right-clicks open the library menu.
+        let list = mouse_area(list).on_press(Message::LibClearSelection).on_right_press(Message::LibContextEmpty);
         let list: Element<Message> = if dragging {
             // Invisible strips at the edges scroll the list while dragging.
             let zone = |z: i8| mouse_area(Space::new().width(Fill).height(28)).on_enter(Message::DragZone(z)).on_exit(Message::DragZone(0));
@@ -255,7 +270,9 @@ impl App {
                 pick_list(self.move_targets(), None::<FolderChoice>, Message::MoveTo).placeholder("Move to…").text_size(12).padding(4).width(Fill),
             );
         }
-        let info: Option<Element<Message>> = if let Some(d) = self.library_selected.and_then(|id| self.library.iter().find(|d| d.id == id)) {
+        let info: Option<Element<Message>> = if selection.len() > 1 {
+            Some(text(format!("{} items selected · drag one of them to move all", selection.len())).size(11).style(style::muted).into())
+        } else if let Some(d) = self.library_selected.and_then(|id| self.library.iter().find(|d| d.id == id)) {
             Some(
                 column![
                     text(d.description.as_str()).size(11).style(style::muted).wrapping(text::Wrapping::WordOrGlyph),
@@ -273,7 +290,7 @@ impl App {
         let mut col = column![
             row![text("Library").size(15), Space::new().width(Fill), text(format!("{}", self.library.len())).size(12).style(style::muted)],
             list,
-            text("Drag entries onto folders; double-click to open; right-click for more.").size(10).style(style::muted),
+            text("Drag entries onto folders; Ctrl+click selects several; double-click opens; right-click for more.").size(10).style(style::muted),
             actions,
             organize,
         ]
@@ -286,23 +303,20 @@ impl App {
     }
 
     /// Row state for styling a library entry.
-    fn entry_state(&self, key: LibKey) -> EntryState {
-        let selected = match key {
-            LibKey::Doc(id) => self.library_selected == Some(id),
-            LibKey::Folder(id) => self.folder_selected == Some(id),
-        };
+    fn entry_state(&self, key: LibKey, selection: &[LibKey]) -> EntryState {
+        let selected = selection.contains(&key);
         let drag = self.drag.as_ref().filter(|d| d.active);
-        let dragged = drag.is_some_and(|d| d.item == key);
+        let dragged = drag.is_some_and(|d| d.items.contains(&key));
         let drop = match (drag, key) {
-            (Some(d), LibKey::Folder(f)) if self.drop_target() == Some(DropTarget::Folder(f)) => Some(self.drop_allowed(d.item, DropTarget::Folder(f))),
+            (Some(d), LibKey::Folder(f)) if self.drop_target() == Some(DropTarget::Folder(f)) => Some(self.drop_allowed(&d.items, DropTarget::Folder(f))),
             _ => None,
         };
         EntryState { selected, hovered: self.lib_hover == Some(key) && drag.is_none(), dragged, drop }
     }
 
     /// Wraps a library row: press selects (and may start a drag), double-click activates.
-    fn entry<'a>(&self, key: LibKey, content: Element<'a, Message>) -> Element<'a, Message> {
-        let st = self.entry_state(key);
+    fn entry<'a>(&self, key: LibKey, selection: &[LibKey], content: Element<'a, Message>) -> Element<'a, Message> {
+        let st = self.entry_state(key, selection);
         let interaction = match (self.drag.as_ref().filter(|d| d.active), st.drop) {
             (Some(_), Some(false)) => mouse::Interaction::NotAllowed,
             (Some(_), _) => mouse::Interaction::Grabbing,
@@ -319,7 +333,14 @@ impl App {
     }
 
     /// Adds the folders and documents below `parent` (depth-first) to `out`.
-    fn push_tree<'a>(&'a self, out: &mut Vec<Element<'a, Message>>, parent: Option<i64>, depth: usize, known: &HashSet<i64>) {
+    fn push_tree<'a>(
+        &'a self,
+        out: &mut Vec<Element<'a, Message>>,
+        parent: Option<i64>,
+        depth: usize,
+        known: &HashSet<i64>,
+        selection: &[LibKey],
+    ) {
         let indent = depth as f32 * 16.0;
         let dark = self.settings.dark;
         // Unknown parents (should not happen) fall back to the top level.
@@ -338,10 +359,10 @@ impl App {
             ]
             .spacing(5)
             .align_y(Alignment::Center);
-            out.push(row![Space::new().width(indent), self.entry(LibKey::Folder(f.id), content.into())].into());
+            out.push(row![Space::new().width(indent), self.entry(LibKey::Folder(f.id), selection, content.into())].into());
             if !f.collapsed {
                 let before = out.len();
-                self.push_tree(out, Some(f.id), depth + 1, known);
+                self.push_tree(out, Some(f.id), depth + 1, known, selection);
                 if out.len() == before {
                     // Keeps an empty folder from looking like it owns the entries below it.
                     out.push(row![Space::new().width(indent + 50.0), text("(empty)").size(11).style(style::muted)].into());
@@ -364,7 +385,7 @@ impl App {
             ]
             .spacing(5)
             .align_y(Alignment::Center);
-            out.push(row![Space::new().width(indent), self.entry(LibKey::Doc(d.id), content.into())].into());
+            out.push(row![Space::new().width(indent), self.entry(LibKey::Doc(d.id), selection, content.into())].into());
         }
     }
 
