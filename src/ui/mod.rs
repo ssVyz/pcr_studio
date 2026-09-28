@@ -31,7 +31,8 @@ pub fn run() -> iced::Result {
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
-        .window_size((1500.0, 920.0))
+        // Start maximized; restoring the window returns to 1500 × 920.
+        .window(iced::window::Settings { size: iced::Size::new(1500.0, 920.0), maximized: true, ..Default::default() })
         .antialiasing(false)
         .run()
 }
@@ -45,12 +46,41 @@ pub struct AppSettings {
     pub map: MapParams,
     pub dark: bool,
     pub row_height: f32,
+    /// Panel widths (logical pixels) and visibility of the display options panel.
+    pub library_w: f32,
+    pub options_w: f32,
+    pub show_options: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
-        AppSettings { view: ViewPrefs::default(), primer: PrimerOptions::default(), map: MapParams::default(), dark: false, row_height: 16.0 }
+        AppSettings {
+            view: ViewPrefs::default(),
+            primer: PrimerOptions::default(),
+            map: MapParams::default(),
+            dark: false,
+            row_height: 16.0,
+            library_w: LIBRARY_W_DEFAULT,
+            options_w: OPTIONS_W_DEFAULT,
+            show_options: true,
+        }
     }
+}
+
+pub const LIBRARY_W_DEFAULT: f32 = 290.0;
+pub const OPTIONS_W_DEFAULT: f32 = 300.0;
+const LIBRARY_W_MIN: f32 = 200.0;
+const LIBRARY_W_MAX: f32 = 600.0;
+const OPTIONS_W_MIN: f32 = 260.0;
+const OPTIONS_W_MAX: f32 = 520.0;
+/// The sequence view never gets narrower than this through panel resizing.
+const CENTER_W_MIN: f32 = 420.0;
+
+/// A draggable panel edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Split {
+    Library,
+    Options,
 }
 
 const SETTINGS_KEY: &str = "app_settings";
@@ -160,6 +190,13 @@ pub enum Message {
     LibContext(LibKey),
     CloseContext,
     WindowSize(iced::Size),
+    SplitPress(Split),
+    SplitMove(iced::Point),
+    SplitRelease,
+    /// Double-click on a panel edge: default width.
+    SplitReset(Split),
+    ToggleOptionsPanel,
+    ResetPanels,
     NewFolder,
     AskRenameFolder(i64),
     AskDeleteFolder(i64),
@@ -267,6 +304,8 @@ pub struct App {
     context: Option<ContextMenu>,
     lib_cursor: iced::Point,
     window_size: iced::Size,
+    /// Panel edge being dragged.
+    split_drag: Option<Split>,
     open: Option<OpenDoc>,
     settings: AppSettings,
     job: Option<Job>,
@@ -308,6 +347,7 @@ impl App {
             context: None,
             lib_cursor: iced::Point::ORIGIN,
             window_size: iced::Size::new(1500.0, 920.0),
+            split_drag: None,
             open: None,
             settings,
             job: None,
@@ -348,7 +388,32 @@ impl App {
                 subs.push(iced::time::every(std::time::Duration::from_millis(60)).map(|_| Message::DragTick));
             }
         }
+        if self.split_drag.is_some() {
+            subs.push(iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => Some(Message::SplitMove(position)),
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => Some(Message::SplitRelease),
+                _ => None,
+            }));
+        }
         Subscription::batch(subs)
+    }
+
+    /// Whether the display options panel is on screen.
+    fn options_visible(&self) -> bool {
+        self.open.is_some() && self.settings.show_options
+    }
+
+    /// Effective (library, options) widths: the stored widths, reduced if the
+    /// window is too narrow to keep the minimum sequence view width.
+    fn panel_widths(&self) -> (f32, f32) {
+        let win = self.window_size.width;
+        let opt = if self.options_visible() {
+            self.settings.options_w.clamp(OPTIONS_W_MIN, OPTIONS_W_MAX).min((win - LIBRARY_W_MIN - CENTER_W_MIN).max(OPTIONS_W_MIN))
+        } else {
+            0.0
+        };
+        let lib = self.settings.library_w.clamp(LIBRARY_W_MIN, LIBRARY_W_MAX).min((win - opt - CENTER_W_MIN).max(LIBRARY_W_MIN));
+        (lib, opt)
     }
 
     /// Target under the cursor for the active drag (`None`: outside the library).
@@ -362,7 +427,7 @@ impl App {
             }
             None => {
                 let p = d.pos?;
-                (p.x < view::LIBRARY_W && p.y > menu::BAR_H).then_some(DropTarget::Root)
+                (p.x < self.panel_widths().0 && p.y > menu::BAR_H).then_some(DropTarget::Root)
             }
         }
     }
@@ -598,6 +663,55 @@ impl App {
                 self.context = Some(ContextMenu { target: key, pos });
             }
             Message::CloseContext => self.context = None,
+            Message::SplitPress(s) => {
+                self.split_drag = Some(s);
+                self.menu = None;
+                self.context = None;
+            }
+            Message::SplitMove(p) => {
+                let win = self.window_size.width;
+                let (lib, opt) = self.panel_widths();
+                match self.split_drag {
+                    Some(Split::Library) => {
+                        let max = LIBRARY_W_MAX.min(win - opt - CENTER_W_MIN).max(LIBRARY_W_MIN);
+                        self.settings.library_w = p.x.clamp(LIBRARY_W_MIN, max);
+                    }
+                    Some(Split::Options) => {
+                        let max = OPTIONS_W_MAX.min(win - lib - CENTER_W_MIN).max(OPTIONS_W_MIN);
+                        self.settings.options_w = (win - p.x).clamp(OPTIONS_W_MIN, max);
+                    }
+                    None => {}
+                }
+            }
+            Message::SplitRelease => {
+                if self.split_drag.take().is_some() {
+                    self.save_settings();
+                }
+            }
+            Message::SplitReset(s) => {
+                self.split_drag = None;
+                match s {
+                    Split::Library => self.settings.library_w = LIBRARY_W_DEFAULT,
+                    Split::Options => self.settings.options_w = OPTIONS_W_DEFAULT,
+                }
+                self.save_settings();
+            }
+            Message::ToggleOptionsPanel => {
+                self.settings.show_options = !self.settings.show_options;
+                if self.settings.show_options {
+                    // Showing the panel again restores its default size.
+                    self.settings.options_w = OPTIONS_W_DEFAULT;
+                }
+                self.save_settings();
+            }
+            Message::ResetPanels => {
+                self.settings.library_w = LIBRARY_W_DEFAULT;
+                self.settings.options_w = OPTIONS_W_DEFAULT;
+                self.settings.show_options = true;
+                self.settings.view.name_w = state::NAME_W_DEFAULT;
+                self.save_settings();
+                self.status = "Panel sizes reset".into();
+            }
             Message::DragZone(z) => {
                 if let Some(d) = self.drag.as_mut() {
                     d.zone = z;
@@ -1078,6 +1192,13 @@ impl App {
     }
 
     fn on_view(&mut self, m: ViewMsg) {
+        if let ViewMsg::NameWidth { w, done } = m {
+            self.settings.view.name_w = w.clamp(state::NAME_W_MIN, state::NAME_W_MAX);
+            if done {
+                self.save_settings();
+            }
+            return;
+        }
         let Some(od) = self.open.as_mut() else { return };
         let width = od.width();
         match m {
@@ -1159,6 +1280,7 @@ impl App {
             }
             ViewMsg::Hover(h) => od.hover = h,
             ViewMsg::ClickAnnotation(i) => self.goto_annotation(i),
+            ViewMsg::NameWidth { .. } => {}
         }
     }
 
@@ -1203,6 +1325,7 @@ impl App {
                     "o" => return self.update(Message::ImportFasta),
                     "e" => return self.update(Message::OpenExport),
                     "m" => return self.update(Message::OpenMapDialog),
+                    "d" | "D" if modifiers.shift() => return self.update(Message::ToggleOptionsPanel),
                     "w" => return self.update(Message::CloseDocument),
                     "g" => return self.update(Message::FocusJump),
                     "f" => return self.update(Message::FocusSearch),

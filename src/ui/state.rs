@@ -57,6 +57,8 @@ pub struct ViewPrefs {
     pub show_identity: bool,
     pub show_annotations: bool,
     pub show_overview: bool,
+    /// Width of the sequence-name column in the alignment view.
+    pub name_w: f32,
     pub threshold: ConsensusThreshold,
     pub color_bases: bool,
     pub graph: GraphMode,
@@ -72,12 +74,17 @@ impl Default for ViewPrefs {
             show_identity: true,
             show_annotations: true,
             show_overview: true,
+            name_w: NAME_W_DEFAULT,
             threshold: ConsensusThreshold::Majority,
             color_bases: true,
             graph: GraphMode::Conservation,
         }
     }
 }
+
+pub const NAME_W_DEFAULT: f32 = 250.0;
+pub const NAME_W_MIN: f32 = 120.0;
+pub const NAME_W_MAX: f32 = 600.0;
 
 /// Zoom level where letters are comfortable; shown as 100%.
 pub const BASE_COL_W: f32 = 12.0;

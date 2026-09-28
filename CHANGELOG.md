@@ -7,6 +7,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.0.8] - 2026-09-28
+
+### Added
+
+- Resizable panels: drag the edges between the library, the sequence view and the display
+  options panel (library 200–600 px, options 260–520 px; the sequence view always keeps at
+  least 420 px and panels shrink if the window gets too narrow). Double-click an edge to
+  reset that panel. The right edge of the sequence-name column in the alignment view can be
+  dragged too (120–600 px). All widths are saved in the settings.
+- **View** menu: "Display options panel" (check mark, Ctrl+Shift+D) hides/shows the panel on
+  the right — showing it again restores its default width — and "Reset panel sizes".
+- "Hide" button at the top of the display options panel.
+- Menu entries can carry check marks (`menu::Entry::check`).
+
+## [0.0.7] - 2026-09-28
+
+### Changed
+
+- The main window starts maximized (restoring it returns to 1500 × 920).
+
 ## [0.0.6] - 2026-09-28
 
 ### Added

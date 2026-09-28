@@ -30,6 +30,7 @@ The menu bar holds all application commands:
 |---|---|
 | File | Import FASTA… (Ctrl+O), Import metadata table…, Generate demo data, Export FASTA… (Ctrl+E), Extract selection to library, New folder, Close document (Ctrl+W), Exit |
 | Edit | Copy oligo (Ctrl+C), Copy oligo report, Add annotation from selection, Clear selection (Esc), Set selected row as reference, Clear reference, Settings… (Ctrl+,) |
+| View | Display options panel (show/hide, Ctrl+Shift+D; showing restores the default width), Reset panel sizes |
 | Tools | Map to reference… (Ctrl+M), Metadata from sequence names…, Oligo report for selection, Find sequence… (Ctrl+F), Go to position… (Ctrl+G) |
 
 Entries that do not apply (e.g. without an open document or selection) are disabled.
@@ -73,6 +74,7 @@ Entries that do not apply (e.g. without an open document or selection) are disab
 | Scroll | Mouse wheel (vertical), Shift+wheel (horizontal), scrollbars, middle-button drag, arrow keys, Page Up/Down, Home/End |
 | Zoom | Ctrl+wheel at the cursor, −/+ buttons, Ctrl+=/Ctrl+−, **Fit** (Ctrl+0), **1:1** (readable bases) |
 | Row height | *Rows* slider: 2 px rows show hundreds of sequences at once |
+| Panel widths | Drag the edges between the library, the sequence view and the display options (library 200–600 px, options 260–520 px, the sequence view keeps at least 420 px); drag the right edge of the name column (120–600 px). Double-click an edge to reset it. Widths are remembered. |
 | Jump | Position box: reference position (or column when there is no reference); a range selects it |
 | Search | IUPAC motif with 0–3 mismatches, both strands, in reference, consensus or all sequences; Enter or ‹ › cycles through hits |
 | Overview | Top strip: conservation of the whole alignment; click or drag to navigate |

@@ -19,16 +19,18 @@ const PANEL_W: f32 = 290.0;
 pub enum MenuId {
     File,
     Edit,
+    View,
     Tools,
 }
 
 impl MenuId {
-    pub const ALL: [MenuId; 3] = [MenuId::File, MenuId::Edit, MenuId::Tools];
+    pub const ALL: [MenuId; 4] = [MenuId::File, MenuId::Edit, MenuId::View, MenuId::Tools];
 
     fn label(self) -> &'static str {
         match self {
             MenuId::File => "File",
             MenuId::Edit => "Edit",
+            MenuId::View => "View",
             MenuId::Tools => "Tools",
         }
     }
@@ -45,18 +47,23 @@ pub fn title_x(id: MenuId) -> f32 {
 
 pub enum Entry {
     /// `action == None` shows the entry disabled.
-    Item { label: &'static str, shortcut: &'static str, action: Option<Message>, danger: bool },
+    Item { label: &'static str, shortcut: &'static str, action: Option<Message>, danger: bool, check: Option<bool> },
     Separator,
 }
 
 impl Entry {
     pub fn item(label: &'static str, shortcut: &'static str, action: Option<Message>) -> Entry {
-        Entry::Item { label, shortcut, action, danger: false }
+        Entry::Item { label, shortcut, action, danger: false, check: None }
+    }
+
+    /// A toggle shown with a check mark when on.
+    pub fn check(label: &'static str, shortcut: &'static str, on: bool, action: Option<Message>) -> Entry {
+        Entry::Item { label, shortcut, action, danger: false, check: Some(on) }
     }
 
     /// A destructive entry (shown in red).
     pub fn danger(label: &'static str, action: Option<Message>) -> Entry {
-        Entry::Item { label, shortcut: "", action, danger: true }
+        Entry::Item { label, shortcut: "", action, danger: true, check: None }
     }
 
     fn height(&self) -> f32 {
@@ -106,12 +113,20 @@ pub const CONTEXT_W: f32 = 210.0;
 
 pub fn panel_with_width<'a>(entries: Vec<Entry>, width: f32) -> Element<'a, Message> {
     let mut col = column![].spacing(0);
+    // With any check mark in the menu, all labels share the mark column.
+    let has_checks = entries.iter().any(|e| matches!(e, Entry::Item { check: Some(_), .. }));
     for e in entries {
         match e {
             Entry::Separator => col = col.push(container(rule::horizontal(1)).padding([4, 6])),
-            Entry::Item { label, shortcut, action, danger } => {
+            Entry::Item { label, shortcut, action, danger, check } => {
                 let enabled = action.is_some();
+                let mark: Element<Message> = match check {
+                    Some(true) => text("✓").size(13).width(20).into(),
+                    Some(false) => Space::new().width(20).into(),
+                    None => Space::new().width(if has_checks { 20 } else { 0 }).into(),
+                };
                 let content = row![
+                    mark,
                     text(label).size(13).width(Fill),
                     text(shortcut).size(12).style(move |t: &Theme| {
                         let c = t.extended_palette().background.base.text;

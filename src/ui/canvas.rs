@@ -14,7 +14,6 @@ use iced::mouse::{self, Cursor, ScrollDelta};
 use iced::widget::canvas::{self, Action, Event, Frame, Geometry, Path, Stroke, Text};
 use iced::{Color, Font, Pixels, Point, Rectangle, Renderer, Size, Theme, keyboard};
 
-pub const NAME_W: f32 = 250.0;
 pub const SB: f32 = 12.0;
 const OVERVIEW_H: f32 = 22.0;
 const RULER_H: f32 = 24.0;
@@ -34,6 +33,8 @@ pub enum ViewMsg {
     ToggleGroup(String),
     Hover(Option<Hover>),
     ClickAnnotation(usize),
+    /// Dragging the right edge of the name column; `done` on release.
+    NameWidth { w: f32, done: bool },
 }
 
 /// Vertical layout of the canvas for a given size.
@@ -77,8 +78,8 @@ pub fn annotation_lanes(anns: &[Annotation]) -> Vec<usize> {
 }
 
 pub fn layout(od: &OpenDoc, prefs: &ViewPrefs, size: Size) -> Lay {
-    let seq_x0 = NAME_W;
-    let seq_w = (size.width - NAME_W - SB).max(10.0);
+    let seq_x0 = prefs.name_w.clamp(super::state::NAME_W_MIN, super::state::NAME_W_MAX).min(size.width * 0.6);
+    let seq_w = (size.width - seq_x0 - SB).max(10.0);
     let mut y = 0.0;
     let mut take = |h: f32| {
         let r = (y, h);
@@ -113,6 +114,7 @@ enum Drag {
         grab: f32,
     },
     Overview,
+    NameColumn,
     Pan {
         x: f32,
         y: f32,
@@ -183,6 +185,11 @@ impl AlignmentView<'_> {
     }
 }
 
+/// Within a few pixels of the name column's right edge (above the scrollbar).
+fn near_name_edge(lay: &Lay, p: Point) -> bool {
+    (p.x - lay.seq_x0).abs() <= 4.0 && p.y < lay.h - SB
+}
+
 fn in_band(y: f32, band: Option<(f32, f32)>) -> bool {
     band.is_some_and(|(y0, h)| y >= y0 && y < y0 + h)
 }
@@ -234,6 +241,11 @@ impl canvas::Program<Message> for AlignmentView<'_> {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let p = pos?;
                 let width = self.od.width();
+                // Right edge of the name column: resize it.
+                if near_name_edge(&lay, p) {
+                    state.drag = Drag::NameColumn;
+                    return Some(Action::capture());
+                }
                 // Vertical scrollbar.
                 if p.x >= lay.w - SB && p.y >= lay.rows_y0 {
                     let (ty, th) = self.vthumb(&lay);
@@ -312,6 +324,9 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                         let frac = ((p.x - grab - lay.seq_x0) / span).clamp(0.0, 1.0);
                         return msg(ViewMsg::SetScroll { x: Some(frac * (total - vis).max(0.0)), y: None });
                     }
+                    Drag::NameColumn => {
+                        return msg(ViewMsg::NameWidth { w: p.x, done: false });
+                    }
                     Drag::Overview => {
                         let col = (p.x - lay.seq_x0) / lay.seq_w * self.od.width() as f32;
                         return msg(ViewMsg::SetScroll { x: Some(col - lay.seq_w / vp.col_w / 2.0), y: None });
@@ -333,6 +348,10 @@ impl canvas::Program<Message> for AlignmentView<'_> {
             }
             Event::Mouse(mouse::Event::ButtonReleased(_)) => {
                 let drag = std::mem::take(&mut state.drag);
+                if drag == Drag::NameColumn {
+                    let p = cursor.position().map(|q| Point::new(q.x - bounds.x, q.y - bounds.y)).unwrap_or(Point::ORIGIN);
+                    return msg(ViewMsg::NameWidth { w: p.x, done: true });
+                }
                 if let Drag::Select { anchor } = drag {
                     let p = cursor.position().map(|q| Point::new(q.x - bounds.x, q.y - bounds.y)).unwrap_or(Point::ORIGIN);
                     let col = self.col_index(&lay, p.x.clamp(lay.seq_x0, lay.seq_x0 + lay.seq_w - 1.0));
@@ -377,12 +396,16 @@ impl canvas::Program<Message> for AlignmentView<'_> {
 
     fn mouse_interaction(&self, state: &CanvasState, bounds: Rectangle, cursor: Cursor) -> mouse::Interaction {
         match state.drag {
+            Drag::NameColumn => return mouse::Interaction::ResizingHorizontally,
             Drag::Pan { .. } => return mouse::Interaction::Grabbing,
             Drag::Select { .. } => return mouse::Interaction::Text,
             _ => {}
         }
         let Some(p) = cursor.position_in(bounds) else { return mouse::Interaction::default() };
         let lay = layout(self.od, self.prefs, bounds.size());
+        if near_name_edge(&lay, p) {
+            return mouse::Interaction::ResizingHorizontally;
+        }
         if p.x < lay.seq_x0 {
             if self.item_at(&lay, p.y).is_some() {
                 return mouse::Interaction::Pointer;

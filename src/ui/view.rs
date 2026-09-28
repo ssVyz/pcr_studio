@@ -3,7 +3,7 @@
 use super::canvas::{AlignmentView, group_digits};
 use super::dialogs::{self, ModalMsg};
 use super::state::{BASE_COL_W, GraphMode, Highlight, OpenDoc};
-use super::{App, DropTarget, FolderChoice, GroupChoice, JUMP_INPUT, LIB_SCROLL, LibKey, Message, SEARCH_INPUT, icons, menu, style};
+use super::{App, DropTarget, FolderChoice, GroupChoice, JUMP_INPUT, LIB_SCROLL, LibKey, Message, SEARCH_INPUT, Split, icons, menu, style};
 use crate::display::{Item, SortKey};
 use crate::model::{AnnotationKind, ConsensusThreshold};
 use crate::primer::{self, OligoSource, Orientation, PrimerReport};
@@ -16,8 +16,6 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Fill, Font, Length, Point, Rectangle, Renderer, Size, Theme, mouse};
 use std::collections::HashSet;
 
-pub(super) const LIBRARY_W: f32 = 290.0;
-const OPTIONS_W: f32 = 300.0;
 
 fn tool<'a>(label: &'a str, msg: Option<Message>, tip: &'a str) -> Element<'a, Message> {
     let b = button(text(label).size(13)).padding([6, 10]).style(style::tool_button).on_press_maybe(msg);
@@ -30,8 +28,10 @@ fn section<'a>(title: &'a str) -> Element<'a, Message> {
 
 impl App {
     pub(super) fn view(&self) -> Element<'_, Message> {
-        let body = row![self.library_panel(), rule::vertical(1), self.center_panel()];
-        let body: Element<Message> = if self.open.is_some() { row![body, rule::vertical(1), self.options_panel()].into() } else { body.into() };
+        let (lib_w, opt_w) = self.panel_widths();
+        let body = row![self.library_panel(lib_w), self.splitter(Split::Library), self.center_panel()];
+        let body: Element<Message> =
+            if self.options_visible() { row![body, self.splitter(Split::Options), self.options_panel(opt_w)].into() } else { body.into() };
         let main = column![self.toolbar(), container(body).height(Fill), self.status_bar()];
         let base: Element<Message> = container(main).width(Fill).height(Fill).into();
         if let Some(m) = &self.modal {
@@ -57,9 +57,27 @@ impl App {
             stack![base, dismiss, panel].into()
         } else if let Some(ghost) = self.drag_ghost() {
             stack![base, ghost].into()
+        } else if self.split_drag.is_some() {
+            // Keep the resize cursor while the edge is dragged across other widgets.
+            let cover = mouse_area(Space::new().width(Fill).height(Fill)).interaction(mouse::Interaction::ResizingHorizontally);
+            stack![base, cover].into()
         } else {
             base
         }
+    }
+
+    /// Draggable edge between two panels (double-click resets the panel width).
+    fn splitter(&self, s: Split) -> Element<'_, Message> {
+        let active = self.split_drag == Some(s);
+        let line = container(Space::new().width(if active { 3 } else { 1 }).height(Fill)).style(move |t: &Theme| {
+            let p = t.extended_palette();
+            container::Style { background: Some((if active { p.primary.base.color } else { p.background.strong.color }).into()), ..Default::default() }
+        });
+        mouse_area(container(line).width(9).height(Fill).center_x(9))
+            .interaction(mouse::Interaction::ResizingHorizontally)
+            .on_press(Message::SplitPress(s))
+            .on_double_click(Message::SplitReset(s))
+            .into()
     }
 
     /// Right-click menu of a library entry.
@@ -164,6 +182,11 @@ impl App {
                 Entry::Separator,
                 Entry::item("Settings…", "Ctrl+,", Some(Message::OpenSettings)),
             ],
+            menu::MenuId::View => vec![
+                Entry::check("Display options panel", "Ctrl+Shift+D", self.settings.show_options, Some(Message::ToggleOptionsPanel)),
+                Entry::Separator,
+                Entry::item("Reset panel sizes", "", Some(Message::ResetPanels)),
+            ],
             menu::MenuId::Tools => vec![
                 Entry::item("Map to reference…", "Ctrl+M", when(idle && doc, Message::OpenMapDialog)),
                 Entry::item("Metadata from sequence names…", "", when(doc, Message::OpenNameFields)),
@@ -175,7 +198,7 @@ impl App {
         }
     }
 
-    fn library_panel(&self) -> Element<'_, Message> {
+    fn library_panel(&self, width: f32) -> Element<'_, Message> {
         let known: HashSet<i64> = self.folders.iter().map(|f| f.id).collect();
         let mut entries: Vec<Element<Message>> = Vec::new();
         self.push_tree(&mut entries, None, 0, &known);
@@ -259,7 +282,7 @@ impl App {
             col = col.push(info);
         }
         // Cursor tracking positions the right-click menu.
-        mouse_area(container(col).padding(10).width(LIBRARY_W).height(Fill).style(style::panel)).on_move(Message::LibCursor).into()
+        mouse_area(container(col).padding(10).width(width).height(Fill).style(style::panel)).on_move(Message::LibCursor).into()
     }
 
     /// Row state for styling a library entry.
@@ -468,7 +491,7 @@ impl App {
         container(bar).padding([2, 10]).width(Fill).style(style::toolbar).into()
     }
 
-    fn options_panel(&self) -> Element<'_, Message> {
+    fn options_panel(&self, width: f32) -> Element<'_, Message> {
         let od = self.open.as_ref().unwrap();
         let prefs = &self.settings.view;
         let doc = &od.doc;
@@ -621,7 +644,17 @@ impl App {
         };
 
         let content = column![doc_info, selection, display, highlighting, rows, anns].spacing(18).padding(12);
-        container(scrollable(content).height(Fill)).width(OPTIONS_W).height(Fill).style(style::panel).into()
+        let header = row![
+            Space::new().width(Fill),
+            tooltip(
+                button(text("Hide").size(11)).padding([2, 8]).style(button::text).on_press(Message::ToggleOptionsPanel),
+                container(text("Hide the display options (View menu or Ctrl+Shift+D shows them again)").size(12))
+                    .padding(6)
+                    .style(container::rounded_box),
+                tooltip::Position::Left,
+            ),
+        ];
+        container(column![header, scrollable(content).height(Fill)]).width(width).height(Fill).style(style::panel).into()
     }
 
     fn primer_popup<'a>(&'a self, od: &'a OpenDoc, r: &'a PrimerReport) -> Element<'a, Message> {
