@@ -1,8 +1,8 @@
 # PCR Studio
 
 Desktop application for working with large sequence alignments, with a focus on
-PCR design and inclusivity evaluation. Inspired by Geneious Prime's contig viewer
-and Map to Reference.
+PCR design and inclusivity evaluation: map sequences to a reference, browse the
+alignment, and check primers and probes against every sequence.
 
 - Rust (edition 2024), UI in [iced](https://iced.rs) 0.14, alignment code from
   [rust-bio](https://rust-bio.github.io), library stored in SQLite.
@@ -65,10 +65,11 @@ Entries that do not apply (e.g. without an open document or selection) are disab
    a new contig document with the reference pinned on top.
 4. **Evaluate an oligo**: drag across columns (or type a range like `19160-19180` into
    the position box). The oligo report shows 5'→3' sequence, length, Tm, GC, perfect /
-   1 / 2 / ≥3 mismatch counts, 3' end mismatches, sequences without coverage,
-   mismatches per position, the most common target variants, and, when rows are
-   grouped, inclusivity per group. Switch between consensus/reference as the source
-   and forward/reverse orientation. The report opens on every selection while
+   1 / 2 / ≥3 mismatch counts, 3' end mismatches, sequences without coverage or with
+   N/ambiguity codes, mismatches per position, the most common target variants, and, when
+   rows are grouped, inclusivity per group. Switch between consensus/reference as the source
+   and forward/reverse orientation; copy the oligo or the whole report. Tm conditions and
+   the 3' end window are set in **Settings** (Ctrl+,). The report opens on every selection while
    **Open automatically** (next to the Oligo report button in the right panel) is checked.
    **Right-click** the viewer for Add annotation…, Oligo report, Copy oligo, Extract selection
    and Clear selection.
@@ -104,22 +105,24 @@ Entries that do not apply (e.g. without an open document or selection) are disab
 | Right-click | Viewer menu: annotation properties/delete (on an annotation), add annotation, oligo report, copy, extract, clear selection |
 | Escape | Close dialog/report, then clear the selection |
 
-Display options (right panel): consensus threshold (majority or 50–100 %), graph mode
-(**conservation** = share of sequences identical to the comparison residue, on a log scale,
-colored ≥99.99 / 99 / 95 / 90 / 75 %; or Geneious-style **pairwise identity**). The comparison
+Display options (right panel): consensus row and its threshold (majority or 50–100 %), graph
+and its mode (**conservation** = share of sequences identical to the comparison residue, on a
+log scale, colored ≥99.99 / 99 / 95 / 90 / 75 %; or **pairwise identity** = mean identity over
+all pairs of sequences in the column). The comparison
 residue is the reference when highlighting disagreements to the reference, otherwise the
 column's most common state. Gaps never count as identical: a column that is a gap in the
 consensus or reference scores 0, and gap/gap pairs do not count as identical pairs.
-Further options: highlighting of disagreements to the reference or the consensus, dots for
-identical bases, gap highlighting, base colors, sorting, grouping, collapsing identical sequences and a name
-filter. Metadata can be imported from a CSV/TSV table (first column = sequence name) or
-split from sequence names at a delimiter.
+Further options: overview strip, annotations, base colors, collapse gaps, highlighting of
+disagreements to the reference or the consensus, dots for identical bases, gap highlighting,
+sorting, grouping, collapsing identical sequences and a name filter. Metadata can be
+imported from a CSV/TSV table (first column = sequence name) or split from sequence names at
+a delimiter.
 
 ## Architecture
 
 | Module | Content |
 |---|---|
-| `model.rs` | Rows (start column + gapped data; outside = no coverage), documents, annotations, column statistics, consensus, identity/conservation, reference coordinates |
+| `model.rs` | Rows (start column + gapped data; outside = no coverage), documents, annotations, column statistics, consensus, identity/conservation, reference coordinates, shown-column map (collapsed gaps) |
 | `seq.rs` | Normalization, IUPAC masks, reverse complement, GC, ambiguity expansion |
 | `fasta.rs` | FASTA I/O (rust-bio), pasted sequence/FASTA text, description metadata, CSV/TSV tables |
 | `thermo.rs` | SantaLucia 1998 nearest-neighbor Tm, salt and Mg²⁺ correction (primer3 defaults, validated against primer3) |
@@ -129,12 +132,12 @@ split from sequence names at a delimiter.
 | `search.rs` | Motif search |
 | `db.rs` | SQLite library (documents, rows, annotations, folders, settings) |
 | `demo.rs` | Synthetic data |
-| `ui/` | iced application: `mod.rs` state/messages/update, `menu.rs` menu bar and drop-downs, `view.rs` layout and panels, `canvas.rs` alignment renderer, `dialogs.rs` (incl. new/edit sequence), `state.rs` viewer state, `style.rs`, `job.rs` background jobs |
+| `ui/` | iced application: `mod.rs` state/messages/update, `menu.rs` menu bar and drop-downs, `view.rs` layout and panels, `canvas.rs` alignment renderer, `dialogs.rs` (incl. new/edit sequence), `state.rs` viewer state, `style.rs`, `icons.rs` library icons, `job.rs` background jobs |
 
 ### Map to reference
 
-Follows the documented behavior of the Geneious mapper (`context/geneious_map_to_reference_context.md`),
-simplified to one reference and non-NGS inputs:
+A seed-and-extend mapper for one reference and full-length sequences (genomes, amplicons,
+Sanger reads; not short NGS reads):
 
 1. Index all k-mers of the reference ("index word length"); drop words occurring more
    often than the repeat limit.

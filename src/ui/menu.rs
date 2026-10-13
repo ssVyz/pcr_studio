@@ -1,4 +1,4 @@
-//! Menu bar with drop-down menus (File, Edit, Tools).
+//! Menu bar with drop-down menus (File, Edit, View, Tools).
 //!
 //! The bar has fixed geometry so the open menu's panel can be pinned right
 //! below its title; the panel is drawn as an overlay layer by `view.rs`.

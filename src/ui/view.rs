@@ -602,7 +602,8 @@ impl App {
                     .text_size(13),
                 container(
                     text(
-                        "Hide the columns where the reference has a gap (insertions in other sequences).                          Extract slice leaves them out too, and so does Export FASTA by default."
+                        "Hide the columns where the reference has a gap (insertions in other sequences). \
+                         Extract slice leaves them out too, and so does Export FASTA by default."
                     )
                     .size(12)
                 )
@@ -655,7 +656,7 @@ impl App {
             checkbox(od.display.collapse_identical).label("Collapse identical sequences").on_toggle(Message::Collapse).text_size(13),
             text(format!("{} rows shown", group_digits(shown))).size(11).style(style::muted),
             if od.meta_keys.is_empty() {
-                Element::from(text("No metadata yet: import a table or split names into fields (toolbar).").size(11).style(style::muted))
+                Element::from(text("No metadata yet: import a table (File menu) or split names into fields (Tools menu).").size(11).style(style::muted))
             } else {
                 text(format!("Metadata: {}", od.meta_keys.join(", "))).size(11).style(style::muted).into()
             },
@@ -736,7 +737,8 @@ impl App {
                     n => format!(", {n} hidden"),
                 };
                 let slice_tip = if od.cols.is_subset() {
-                    "Save these columns of all sequences (without the reference) as a new library document;                      columns with gaps in the reference are left out (Collapse gaps)"
+                    "Save these columns of all sequences (without the reference) as a new library document; \
+                     columns with gaps in the reference are left out (Collapse gaps)"
                 } else {
                     "Save these columns of all sequences (without the reference) as a new library document"
                 };

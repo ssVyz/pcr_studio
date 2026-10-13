@@ -7,6 +7,22 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.0.13] - 2026-10-13
+
+### Fixed
+
+- The tooltips of **Collapse gaps** and of **Extract slice** (while gaps are collapsed) showed
+  a wide run of spaces in the middle of the sentence.
+- The "No metadata yet" hint in the right panel pointed to the toolbar; it now names the File
+  and Tools menus.
+
+### Changed
+
+- README: no longer refers to Geneious Prime; describes the mapper on its own terms and the
+  pairwise identity graph as the mean identity over all pairs of sequences in a column.
+  Added the oligo report's N/ambiguity count, report copying, the Settings dialog, the
+  display toggles and `ui/icons.rs`.
+
 ## [0.0.12] - 2026-10-13
 
 ### Added
