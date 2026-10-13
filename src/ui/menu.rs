@@ -6,6 +6,7 @@
 use super::{Message, style};
 use iced::widget::{Space, button, column, container, mouse_area, row, rule, text};
 use iced::{Alignment, Background, Border, Color, Element, Fill, Font, Length, Shadow, Theme, Vector};
+use std::borrow::Cow;
 
 /// Height of the menu bar (also where drop-down panels start).
 pub const BAR_H: f32 = 44.0;
@@ -47,23 +48,23 @@ pub fn title_x(id: MenuId) -> f32 {
 
 pub enum Entry {
     /// `action == None` shows the entry disabled.
-    Item { label: &'static str, shortcut: &'static str, action: Option<Message>, danger: bool, check: Option<bool> },
+    Item { label: Cow<'static, str>, shortcut: &'static str, action: Option<Message>, danger: bool, check: Option<bool> },
     Separator,
 }
 
 impl Entry {
-    pub fn item(label: &'static str, shortcut: &'static str, action: Option<Message>) -> Entry {
-        Entry::Item { label, shortcut, action, danger: false, check: None }
+    pub fn item(label: impl Into<Cow<'static, str>>, shortcut: &'static str, action: Option<Message>) -> Entry {
+        Entry::Item { label: label.into(), shortcut, action, danger: false, check: None }
     }
 
     /// A toggle shown with a check mark when on.
     pub fn check(label: &'static str, shortcut: &'static str, on: bool, action: Option<Message>) -> Entry {
-        Entry::Item { label, shortcut, action, danger: false, check: Some(on) }
+        Entry::Item { label: label.into(), shortcut, action, danger: false, check: Some(on) }
     }
 
     /// A destructive entry (shown in red).
     pub fn danger(label: &'static str, action: Option<Message>) -> Entry {
-        Entry::Item { label, shortcut: "", action, danger: true, check: None }
+        Entry::Item { label: label.into(), shortcut: "", action, danger: true, check: None }
     }
 
     fn height(&self) -> f32 {

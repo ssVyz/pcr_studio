@@ -4,7 +4,7 @@ use super::canvas::{AlignmentView, group_digits};
 use super::dialogs::{self, ModalMsg};
 use super::state::{BASE_COL_W, GraphMode, Highlight, OpenDoc};
 use super::{App, ContextTarget, DropTarget, FolderChoice, GroupChoice, JUMP_INPUT, LIB_SCROLL, LibKey, Message, SEARCH_INPUT, Split, icons, menu, style};
-use crate::display::{Item, SortKey};
+use crate::display::{Item, RowSort, SortKey};
 use crate::model::ConsensusThreshold;
 use crate::primer::{self, OligoSource, Orientation, PrimerReport};
 use crate::search::Scope;
@@ -49,7 +49,7 @@ impl App {
         } else if let Some(c) = self.context {
             let entries = self.context_entries(c.target);
             let h = menu::panel_height(&entries);
-            let w = if matches!(c.target, ContextTarget::Viewer(_)) { menu::CONTEXT_W + 50.0 } else { menu::CONTEXT_W };
+            let w = if matches!(c.target, ContextTarget::Viewer { .. }) { menu::CONTEXT_W + 80.0 } else { menu::CONTEXT_W };
             // Keep the menu inside the window.
             let x = c.pos.x.min(self.window_size.width - w - 6.0).max(0.0);
             let y = if c.pos.y + h > self.window_size.height - 6.0 { (c.pos.y - h).max(0.0) } else { c.pos.y };
@@ -87,7 +87,7 @@ impl App {
         let idle = !self.busy();
         let key = match target {
             ContextTarget::Entry(k) => k,
-            ContextTarget::Viewer(annotation) => {
+            ContextTarget::Viewer { annotation, col } => {
                 let od = self.open.as_ref();
                 let selection = od.is_some_and(|o| o.selection.is_some());
                 let report = od.is_some_and(|o| o.report.is_some());
@@ -104,7 +104,9 @@ impl App {
                     Entry::item("Extract selection to library", "", (idle && selection).then_some(Message::ExtractSlice)),
                     Entry::Separator,
                     Entry::item("Clear selection", "Esc", selection.then_some(Message::ClearSelection)),
+                    Entry::Separator,
                 ]);
+                entries.extend(self.sort_entries(col, false));
                 return entries;
             }
             ContextTarget::Empty => {
@@ -139,6 +141,42 @@ impl App {
                 ]
             }
         }
+    }
+
+    /// Entries that sort all sequences of the open document: by name, length,
+    /// the base in column `col` (under the cursor) and the bases in the
+    /// selection. Labels show the direction; repeating a sort reverses it.
+    fn sort_entries(&self, col: Option<usize>, menu_bar: bool) -> Vec<menu::Entry> {
+        use menu::Entry;
+        let Some(od) = self.open.as_ref() else {
+            return ["Sort by name", "Sort by length", "Sort by bases in selection"].map(|l| Entry::item(l, "", None)).into();
+        };
+        let ok = !self.busy() && od.doc.rows.len() >= 2 + od.reference.is_some() as usize;
+        let entry = |key: RowSort, in_selection: bool| {
+            let descending = od.next_sort_descending(&key);
+            let label = match &key {
+                RowSort::Bases(c) if in_selection && c.len() > 1 => {
+                    format!("Sort by bases in selection{}", if descending { " (reversed)" } else { "" })
+                }
+                _ => format!("Sort {}", super::sort_phrase(od, &key, descending)),
+            };
+            Entry::item(label, "", ok.then_some(Message::SortRows(key)))
+        };
+        let mut entries = vec![entry(RowSort::Name, false), entry(RowSort::Length, false)];
+        if let Some(c) = col {
+            entries.push(entry(RowSort::Bases(vec![c]), false));
+        }
+        match od.selection {
+            Some(sel) => {
+                let cols = od.shown_columns(sel.c0, sel.c1);
+                if col.is_none_or(|c| cols != [c]) {
+                    entries.push(entry(RowSort::Bases(cols), true));
+                }
+            }
+            None if menu_bar => entries.push(Entry::item("Sort by bases in selection", "", None)),
+            None => {}
+        }
+        entries
     }
 
     /// Floating label following the cursor while a library entry is dragged.
@@ -225,8 +263,11 @@ impl App {
                 ),
                 Entry::item("Clear reference", "", when(od.is_some_and(|o| o.reference.is_some()), Message::ClearReference)),
                 Entry::Separator,
-                Entry::item("Settings…", "Ctrl+,", Some(Message::OpenSettings)),
-            ],
+            ]
+            .into_iter()
+            .chain(self.sort_entries(None, true))
+            .chain([Entry::Separator, Entry::item("Settings…", "Ctrl+,", Some(Message::OpenSettings))])
+            .collect(),
             menu::MenuId::View => vec![
                 Entry::check("Display options panel", "Ctrl+Shift+D", self.settings.show_options, Some(Message::ToggleOptionsPanel)),
                 Entry::Separator,

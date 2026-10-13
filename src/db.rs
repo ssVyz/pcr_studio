@@ -212,6 +212,50 @@ impl Db {
         Ok(dropped)
     }
 
+    /// Stores a new row order: row `order[i]` becomes row `i`; `reference` is
+    /// the reference's new index. Rows move cycle by cycle through one free
+    /// slot, so each row is rewritten once (plus one extra move per cycle).
+    pub fn reorder_rows(&mut self, id: i64, order: &[usize], reference: Option<usize>) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let n_rows: i64 = tx
+            .query_row("SELECT n_rows FROM documents WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Document {id} not found"))?;
+        let mut seen = vec![false; order.len()];
+        if n_rows as usize != order.len() || order.iter().any(|&o| o >= order.len() || std::mem::replace(&mut seen[o], true)) {
+            return Err("The new row order does not match the document".into());
+        }
+        {
+            let mut mv = tx.prepare("UPDATE rows SET idx = ?3 WHERE doc_id = ?1 AND idx = ?2").map_err(|e| e.to_string())?;
+            let mut mv = |from: i64, to: i64| mv.execute(params![id, from, to]).map(|_| ()).map_err(|e| e.to_string());
+            const FREE: i64 = -1;
+            let mut done = vec![false; order.len()];
+            for s in 0..order.len() {
+                if done[s] || order[s] == s {
+                    continue;
+                }
+                // Park the row of slot `s`, then fill each emptied slot with
+                // the row that belongs there until the cycle closes.
+                mv(s as i64, FREE)?;
+                let mut slot = s;
+                loop {
+                    done[slot] = true;
+                    let from = order[slot];
+                    if from == s {
+                        mv(FREE, slot as i64)?;
+                        break;
+                    }
+                    mv(from as i64, slot as i64)?;
+                    slot = from;
+                }
+            }
+        }
+        tx.execute("UPDATE documents SET reference = ?2 WHERE id = ?1", params![id, reference.map(|r| r as i64)])
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     pub fn set_reference(&self, id: i64, reference: Option<usize>) -> Result<(), String> {
         self.conn
             .execute("UPDATE documents SET reference = ?2 WHERE id = ?1", params![id, reference.map(|r| r as i64)])
@@ -414,6 +458,23 @@ mod tests {
         assert_eq!(loaded.rows[0].meta_value("k"), Some("v"));
         assert_eq!(anns.len(), 1);
         db.delete_document(single).unwrap();
+        // Reordering rows: two cycles and a fixed row; metadata moves along.
+        let names = ["a", "b", "c", "d", "e", "f"];
+        let rows = names.iter().map(|n| {
+            let mut r = Row::from_gapped(n.to_string(), String::new(), b"ACGT".to_vec());
+            r.set_meta("n", n.to_string());
+            r
+        });
+        let six = db.insert_document("six", DocKind::Sequences, &Document::new(rows.collect()), Some(2), "", None, &|_| {}).unwrap();
+        db.reorder_rows(six, &[2, 0, 1, 3, 5, 4], Some(0)).unwrap();
+        let (info, loaded, _) = db.load_document(six, &|_| {}).unwrap();
+        let order: Vec<&str> = loaded.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(order, ["c", "a", "b", "d", "f", "e"]);
+        assert!(loaded.rows.iter().all(|r| r.meta_value("n") == Some(r.name.as_str())));
+        assert_eq!(info.reference, Some(0));
+        assert!(db.reorder_rows(six, &[0, 1, 2], None).is_err());
+        assert!(db.reorder_rows(six, &[0, 0, 1, 2, 3, 4], None).is_err());
+        db.delete_document(six).unwrap();
         db.delete_document(id).unwrap();
         assert!(db.list_documents().unwrap().is_empty());
         assert!(db.annotations(id).unwrap().is_empty());

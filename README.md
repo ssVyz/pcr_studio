@@ -29,7 +29,7 @@ The menu bar holds all application commands:
 | Menu | Entries |
 |---|---|
 | File | New sequence… (Ctrl+N), Import FASTA… (Ctrl+O), Import metadata table…, Generate demo data, Export FASTA… (Ctrl+E), Extract selection to library, New folder, Close document (Ctrl+W), Exit |
-| Edit | Edit sequence… (single-sequence documents), Add annotation from selection…, Annotation properties…, Delete annotation… (Del), Copy oligo (Ctrl+C), Copy oligo report, Clear selection (Esc), Set selected row as reference, Clear reference, Settings… (Ctrl+,) |
+| Edit | Edit sequence… (single-sequence documents), Add annotation from selection…, Annotation properties…, Delete annotation… (Del), Copy oligo (Ctrl+C), Copy oligo report, Clear selection (Esc), Set selected row as reference, Clear reference, Sort by name / length / bases in selection, Settings… (Ctrl+,) |
 | View | Display options panel (show/hide, Ctrl+Shift+D; showing restores the default width), Reset panel sizes |
 | Tools | Map to reference… (Ctrl+M), Metadata from sequence names…, Oligo report for selection, Find sequence… (Ctrl+F), Go to position… (Ctrl+G) |
 
@@ -71,8 +71,8 @@ Entries that do not apply (e.g. without an open document or selection) are disab
    and forward/reverse orientation; copy the oligo or the whole report. Tm conditions and
    the 3' end window are set in **Settings** (Ctrl+,). The report opens on every selection while
    **Open automatically** (next to the Oligo report button in the right panel) is checked.
-   **Right-click** the viewer for Add annotation…, Oligo report, Copy oligo, Extract selection
-   and Clear selection.
+   **Right-click** the viewer for Add annotation…, Oligo report, Copy oligo, Extract selection,
+   Clear selection and sorting (see below).
 5. **Annotations** (forward primer, reverse primer, probe, region): right-click → Add
    annotation… (or the Edit menu) opens the properties dialog for the selected columns. Click
    an annotation to select it (its columns become the selection); drag its edges to resize
@@ -99,6 +99,7 @@ Entries that do not apply (e.g. without an open document or selection) are disab
 | Search | IUPAC motif with 0–3 mismatches, both strands, in reference, consensus or all sequences; Enter or ‹ › cycles through hits |
 | Overview | Top strip: conservation of the whole alignment; click or drag to navigate |
 | Collapse gaps | Right panel (needs a reference): hides the columns where the reference has a gap, i.e. insertions in the other sequences, so the view follows reference coordinates. A ▼ on the ruler marks where columns are hidden; selections and annotations snap to the shown columns. Off by default. |
+| Sort sequences | Right-click the viewer (or the Edit menu): **by name** (A→Z, runs of digits by value, so seq_9 comes before seq_10), **by length** (longest first), **by the base** in the right-clicked column, or **by the bases in the selection** (only the shown columns while gaps are collapsed). Bases sort as A, C, G, T, other IUPAC codes, gap, no coverage. Always sorts all sequences (also those hidden by the filter or folded groups); the reference stays on top. The new order is saved in the library, so export, slices and reopening keep it; the order from the import is not kept. The menu shows the direction; choosing the same sort again reverses it. Ties keep their previous order, so sorts can be combined (e.g. by name, then by base). |
 | Select rows | Click names; Ctrl/Shift for several. Used for "Set selected row as reference", export and mapping subsets |
 | Groups | Group by any metadata field; click a group header to fold it |
 | Annotations | Click to select, drag an edge to resize, double-click for properties, Delete key to delete (with confirmation) |
@@ -114,7 +115,8 @@ column's most common state. Gaps never count as identical: a column that is a ga
 consensus or reference scores 0, and gap/gap pairs do not count as identical pairs.
 Further options: overview strip, annotations, base colors, collapse gaps, highlighting of
 disagreements to the reference or the consensus, dots for identical bases, gap highlighting,
-sorting, grouping, collapsing identical sequences and a name filter. Metadata can be
+a view sort (shown order only, reset on reopening; the saved order is **Document order**),
+grouping, collapsing identical sequences and a name filter. Metadata can be
 imported from a CSV/TSV table (first column = sequence name) or split from sequence names at
 a delimiter.
 
@@ -128,9 +130,9 @@ a delimiter.
 | `thermo.rs` | SantaLucia 1998 nearest-neighbor Tm, salt and Mg²⁺ correction (primer3 defaults, validated against primer3) |
 | `mapper/` | `index.rs` k-mer index, `align.rs` seed chaining (rust-bio `sdpkpp`) + DP gap filling (rust-bio pairwise), `contig.rs` insertion-aware merge and consensus target, `mod.rs` orchestration and fine tuning |
 | `primer.rs` | Oligo/selection evaluation |
-| `display.rs` | Sorting, grouping, collapsing, filtering |
+| `display.rs` | View sort, grouping, collapsing, filtering; sorting documents (name, length, bases) |
 | `search.rs` | Motif search |
-| `db.rs` | SQLite library (documents, rows, annotations, folders, settings) |
+| `db.rs` | SQLite library (documents, rows and their order, annotations, folders, settings) |
 | `demo.rs` | Synthetic data |
 | `ui/` | iced application: `mod.rs` state/messages/update, `menu.rs` menu bar and drop-downs, `view.rs` layout and panels, `canvas.rs` alignment renderer, `dialogs.rs` (incl. new/edit sequence), `state.rs` viewer state, `style.rs`, `icons.rs` library icons, `job.rs` background jobs |
 

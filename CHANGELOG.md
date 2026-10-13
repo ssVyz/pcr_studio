@@ -7,6 +7,34 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.0.14] - 2026-10-13
+
+### Added
+
+- **Sorting sequences** from the viewer's right-click menu and the Edit menu: by name, by
+  length (longest first), by the base in the right-clicked column, and by the bases in the
+  selected columns (only the shown ones while gaps are collapsed). Bases sort as A, C, G, T,
+  other IUPAC codes, gap, no coverage. Sequence lists and alignments/contigs alike.
+  - Always sorts all sequences of the document, including those hidden by the name filter
+    or folded groups; the reference stays first.
+  - The order is saved in the library: reopening, Export FASTA (all sequences) and Extract
+    slice keep it. The order from the import is not kept separately.
+  - The menu labels show the direction (e.g. "Sort by name (A→Z)"); choosing the same sort
+    again right away reverses it. The sort is stable, so ties keep their previous order and
+    sorts can be combined.
+  - Selected rows and search hits stay with their sequences. A view sort set in the panel is
+    reset to "Document order" so the new order is visible (the status bar says so).
+- `display::RowSort`, `display::sort_order`, `display::base_rank`, `Db::reorder_rows` (moves
+  rows cycle by cycle, about 0.25 s for 2,000 × 35 kb), `OpenDoc::apply_order`, with tests.
+
+### Changed
+
+- Name and metadata comparisons compare runs of digits by value ("seq_9" before "seq_10"),
+  also in the panel's Sort and the group order.
+- The panel's first Sort option is called "Document order" (was "Original order"), since
+  the stored order can now change.
+- The viewer's right-click menu is slightly wider to fit the sort entries.
+
 ## [0.0.13] - 2026-10-13
 
 ### Fixed

@@ -1,6 +1,6 @@
 //! State of the open document and the viewer.
 
-use crate::display::{self, DisplayOptions, Item};
+use crate::display::{self, DisplayOptions, Item, RowSort};
 use crate::model::{Annotation, ColumnMap, ColumnStats, ConsensusThreshold, DocInfo, Document, RefCoords};
 use crate::primer::{OligoSource, PrimerOptions, PrimerReport};
 use crate::search::{Hit, Scope};
@@ -215,6 +215,8 @@ pub struct OpenDoc {
     pub selected_annotation: Option<i64>,
     /// Type of the last annotation added (default for the next one).
     pub annotation_kind: crate::model::AnnotationKind,
+    /// Last permanent sort and whether it was descending (repeating it reverses).
+    pub last_sort: Option<(RowSort, bool)>,
 }
 
 impl OpenDoc {
@@ -248,6 +250,7 @@ impl OpenDoc {
             hover: None,
             selected_annotation: None,
             annotation_kind: crate::model::AnnotationKind::ForwardPrimer,
+            last_sort: None,
         };
         od.recompute_stats(prefs);
         od.rebuild_items();
@@ -261,6 +264,43 @@ impl OpenDoc {
         self.doc.width
     }
 
+    /// Direction of the next sort by `key`: the opposite of the last one when
+    /// it is repeated, otherwise the key's default.
+    pub fn next_sort_descending(&self, key: &RowSort) -> bool {
+        match &self.last_sort {
+            Some((k, d)) if k == key => !d,
+            _ => key.default_descending(),
+        }
+    }
+
+    /// Reorders the sequences: row `order[i]` becomes row `i`. Row indices held
+    /// by the viewer (reference, selected rows, search hits) follow their rows.
+    pub fn apply_order(&mut self, order: &[usize]) {
+        let mut new_of = vec![0; order.len()];
+        for (new, &old) in order.iter().enumerate() {
+            new_of[old] = new;
+        }
+        let doc = Arc::make_mut(&mut self.doc);
+        let mut rows: Vec<Option<crate::model::Row>> = std::mem::take(&mut doc.rows).into_iter().map(Some).collect();
+        doc.rows = order.iter().map(|&o| rows[o].take().expect("order is a permutation")).collect();
+        self.reference = self.reference.map(|r| new_of[r]);
+        self.info.reference = self.reference;
+        self.selected_rows = self.selected_rows.iter().map(|&r| new_of[r]).collect();
+        if let Some(ids) = &mut self.row_identity {
+            *ids = order.iter().map(|&o| ids[o]).collect();
+        }
+        let remap = |h: Hit| Hit { row: h.row.map(|r| new_of[r]), ..h };
+        let current = self.search.current.and_then(|i| self.search.hits.get(i).copied()).map(remap);
+        for h in &mut self.search.hits {
+            *h = remap(*h);
+        }
+        self.search.hits.sort_by_key(|h| (h.c0, h.row, h.reverse));
+        self.search.current = current.and_then(|c| self.search.hits.iter().position(|h| *h == c));
+        self.last_clicked_item = None;
+        self.hover = None;
+        self.rebuild_items();
+    }
+
     /// Number of columns in the viewer (fewer than `width` with gaps collapsed).
     pub fn view_width(&self) -> usize {
         self.cols.len()
@@ -270,6 +310,12 @@ impl OpenDoc {
     /// while gaps are collapsed, otherwise `None` (all columns).
     pub fn kept_columns(&self) -> Option<&[bool]> {
         self.ref_coords.as_ref().filter(|_| self.cols.is_subset()).map(|rc| rc.is_base.as_slice())
+    }
+
+    /// The shown columns of `[c0, c1)` (all of them when none is shown).
+    pub fn shown_columns(&self, c0: usize, c1: usize) -> Vec<usize> {
+        let shown: Vec<usize> = (self.cols.disp(c0)..self.cols.disp(c1)).map(|d| self.cols.col(d)).collect();
+        if shown.is_empty() { (c0..c1).collect() } else { shown }
     }
 
     /// Shows all columns, or (`collapse` with a reference) only those where

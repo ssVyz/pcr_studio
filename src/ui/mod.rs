@@ -10,7 +10,7 @@ pub mod style;
 mod view;
 
 use crate::db::{self, Db};
-use crate::display::SortKey;
+use crate::display::{self, RowSort, SortKey};
 use crate::fasta;
 use crate::mapper::{self, MapParams};
 use crate::model::{Annotation, AnnotationKind, ConsensusThreshold, DocInfo, DocKind, Document, Folder, Row};
@@ -125,8 +125,9 @@ pub enum ContextTarget {
     Entry(LibKey),
     /// Free space in the library list.
     Empty,
-    /// The sequence viewer, on an annotation (id) or not.
-    Viewer(Option<i64>),
+    /// The sequence viewer, on an annotation (id) or not; `col` is the
+    /// alignment column under the cursor.
+    Viewer { annotation: Option<i64>, col: Option<usize> },
 }
 
 /// Where a dragged library entry would land.
@@ -258,6 +259,8 @@ pub enum Message {
     SetThreshold(ConsensusThreshold),
     // Rows
     SortBy(SortKey),
+    /// Sorts all sequences of the document and saves the order.
+    SortRows(RowSort),
     SortDescending(bool),
     GroupBy(GroupChoice),
     Collapse(bool),
@@ -1162,6 +1165,7 @@ impl App {
                 od.display.descending = b;
                 od.rebuild_items();
             }),
+            Message::SortRows(key) => self.sort_rows(key),
             Message::GroupBy(g) => {
                 self.with_doc(|od, _| {
                     od.display.group_by = match g {
@@ -1433,7 +1437,7 @@ impl App {
                 self.resize_annotation(id, start, end, done);
                 return Task::none();
             }
-            ViewMsg::Context { pos, annotation } => {
+            ViewMsg::Context { pos, annotation, col } => {
                 // Right-click selects the annotation, like the library entries;
                 // the oligo report stays as it is.
                 if let Some(id) = annotation {
@@ -1441,7 +1445,7 @@ impl App {
                     self.select_annotation(id, false, popup);
                 }
                 self.menu = None;
-                self.context = Some(ContextMenu { target: ContextTarget::Viewer(annotation), pos });
+                self.context = Some(ContextMenu { target: ContextTarget::Viewer { annotation, col }, pos });
                 return Task::none();
             }
             _ => {}
@@ -1696,6 +1700,33 @@ impl App {
         od.selection = Some(Selection { anchor: h.c0, c0: h.c0, c1: h.c1 });
         od.selected_annotation = None;
         od.evaluate_selection(&opts);
+    }
+
+    /// Sorts all sequences of the open document (the reference goes first)
+    /// and saves the order. Repeating the last sort reverses it.
+    fn sort_rows(&mut self, key: RowSort) {
+        if self.busy() {
+            return;
+        }
+        let Some(od) = self.open.as_mut() else { return };
+        let descending = od.next_sort_descending(&key);
+        let order = display::sort_order(&od.doc, od.reference, &key, descending);
+        let reference = od.reference.and_then(|r| order.iter().position(|&o| o == r));
+        if let Err(e) = self.db.reorder_rows(od.info.id, &order, reference) {
+            self.error = Some(e);
+            return;
+        }
+        let phrase = sort_phrase(od, &key, descending);
+        // The panel's view sort would hide the new order.
+        let view_sorted = od.display.sort != SortKey::Original || od.display.descending;
+        od.display.sort = SortKey::Original;
+        od.display.descending = false;
+        od.apply_order(&order);
+        od.last_sort = Some((key, descending));
+        let n = order.len() - reference.is_some() as usize;
+        let note = if view_sorted { "; the panel's Sort is back to document order" } else { "" };
+        self.status = format!("Sorted {} sequences {phrase}{note}", canvas::group_digits(n));
+        self.reload_library();
     }
 
     fn set_reference(&mut self, reference: Option<usize>) {
@@ -2198,6 +2229,25 @@ impl App {
 }
 
 /// Range of columns `[c0, c1)` for messages: reference positions or columns.
+/// How a sort is described in menus and the status bar ("by name (A→Z)").
+fn sort_phrase(od: &OpenDoc, key: &RowSort, descending: bool) -> String {
+    match key {
+        RowSort::Name => format!("by name ({})", if descending { "Z→A" } else { "A→Z" }),
+        RowSort::Length => format!("by length ({})", if descending { "longest first" } else { "shortest first" }),
+        RowSort::Bases(cols) => {
+            let place = match cols.as_slice() {
+                [] => "bases".to_string(),
+                [c] => match &od.ref_coords {
+                    Some(rc) if rc.is_base[*c] => format!("base at ref {}", canvas::group_digits(rc.pos_at[*c] as usize)),
+                    _ => format!("base at column {}", canvas::group_digits(c + 1)),
+                },
+                [c0, .., c1] => format!("bases at {}", annotation_range_label(od, *c0, c1 + 1)),
+            };
+            format!("by {place}{}", if descending { " (reversed)" } else { "" })
+        }
+    }
+}
+
 fn annotation_range_label(od: &OpenDoc, c0: usize, c1: usize) -> String {
     match od.ref_range(c0, c1) {
         Some((a, b)) => format!("ref {}–{}", canvas::group_digits(a as usize), canvas::group_digits(b as usize)),

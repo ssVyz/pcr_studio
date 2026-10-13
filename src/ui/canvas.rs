@@ -38,8 +38,9 @@ pub enum ViewMsg {
     OpenAnnotation(i64),
     /// Dragging an annotation edge; `done` on release.
     ResizeAnnotation { id: i64, start: usize, end: usize, done: bool },
-    /// Right-click at `pos` (window coordinates), on an annotation or not.
-    Context { pos: Point, annotation: Option<i64> },
+    /// Right-click at `pos` (window coordinates), on an annotation or not;
+    /// `col` is the alignment column under the cursor.
+    Context { pos: Point, annotation: Option<i64>, col: Option<usize> },
     /// Dragging the right edge of the name column; `done` on release.
     NameWidth { w: f32, done: bool },
 }
@@ -386,7 +387,9 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                     return None;
                 }
                 let annotation = self.annotation_at(&lay, p).map(|(i, _)| self.od.annotations[i].id);
-                return msg(ViewMsg::Context { pos: cursor.position()?, annotation });
+                let d = self.col_at(&lay, p.x);
+                let col = (p.x >= lay.seq_x0 && d >= 0.0 && (d as usize) < self.od.view_width()).then(|| self.col_index(&lay, p.x));
+                return msg(ViewMsg::Context { pos: cursor.position()?, annotation, col });
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let Some(p) = cursor.position_in(bounds).or_else(|| cursor.position().map(|q| Point::new(q.x - bounds.x, q.y - bounds.y)))
