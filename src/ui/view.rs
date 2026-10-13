@@ -5,7 +5,7 @@ use super::dialogs::{self, ModalMsg};
 use super::state::{BASE_COL_W, GraphMode, Highlight, OpenDoc};
 use super::{App, ContextTarget, DropTarget, FolderChoice, GroupChoice, JUMP_INPUT, LIB_SCROLL, LibKey, Message, SEARCH_INPUT, Split, icons, menu, style};
 use crate::display::{Item, SortKey};
-use crate::model::{AnnotationKind, ConsensusThreshold};
+use crate::model::ConsensusThreshold;
 use crate::primer::{self, OligoSource, Orientation, PrimerReport};
 use crate::search::Scope;
 use iced::widget::canvas::{self as cv, Frame, Geometry};
@@ -49,11 +49,12 @@ impl App {
         } else if let Some(c) = self.context {
             let entries = self.context_entries(c.target);
             let h = menu::panel_height(&entries);
+            let w = if matches!(c.target, ContextTarget::Viewer(_)) { menu::CONTEXT_W + 50.0 } else { menu::CONTEXT_W };
             // Keep the menu inside the window.
-            let x = c.pos.x.min(self.window_size.width - menu::CONTEXT_W - 6.0).max(0.0);
+            let x = c.pos.x.min(self.window_size.width - w - 6.0).max(0.0);
             let y = if c.pos.y + h > self.window_size.height - 6.0 { (c.pos.y - h).max(0.0) } else { c.pos.y };
             let dismiss = opaque(mouse_area(Space::new().width(Fill).height(Fill)).on_press(Message::CloseContext).on_right_press(Message::CloseContext));
-            let panel = iced::widget::pin(opaque(menu::panel_with_width(entries, menu::CONTEXT_W))).x(x).y(y);
+            let panel = iced::widget::pin(opaque(menu::panel_with_width(entries, w))).x(x).y(y);
             stack![base, dismiss, panel].into()
         } else if let Some(ghost) = self.drag_ghost() {
             stack![base, ghost].into()
@@ -80,14 +81,35 @@ impl App {
             .into()
     }
 
-    /// Right-click menu of a library entry.
+    /// Right-click menu of a library entry or the sequence viewer.
     fn context_entries(&self, target: ContextTarget) -> Vec<menu::Entry> {
         use menu::Entry;
         let idle = !self.busy();
         let key = match target {
             ContextTarget::Entry(k) => k,
+            ContextTarget::Viewer(annotation) => {
+                let od = self.open.as_ref();
+                let selection = od.is_some_and(|o| o.selection.is_some());
+                let report = od.is_some_and(|o| o.report.is_some());
+                let mut entries = Vec::new();
+                if let Some(id) = annotation {
+                    entries.push(Entry::item("Annotation properties…", "", Some(Message::AnnotationProperties(id))));
+                    entries.push(Entry::danger("Delete annotation…", Some(Message::AskDeleteAnnotation(id))));
+                    entries.push(Entry::Separator);
+                }
+                entries.extend([
+                    Entry::item("Add annotation…", "", selection.then_some(Message::NewAnnotation)),
+                    Entry::item("Oligo report", "", report.then_some(Message::ShowPopup)),
+                    Entry::item("Copy oligo", "Ctrl+C", report.then_some(Message::CopyOligo)),
+                    Entry::item("Extract selection to library", "", (idle && selection).then_some(Message::ExtractSlice)),
+                    Entry::Separator,
+                    Entry::item("Clear selection", "Esc", selection.then_some(Message::ClearSelection)),
+                ]);
+                return entries;
+            }
             ContextTarget::Empty => {
                 return vec![
+                    Entry::item("New sequence…", "Ctrl+N", idle.then_some(Message::NewSequence)),
                     Entry::item("New folder", "", Some(Message::NewFolder)),
                     Entry::Separator,
                     Entry::item("Import FASTA…", "Ctrl+O", idle.then_some(Message::ImportFasta)),
@@ -95,16 +117,21 @@ impl App {
             }
         };
         match key {
-            LibKey::Doc(id) => vec![
-                Entry::item("Open", "", idle.then_some(Message::OpenDocument(id))),
-                Entry::item("Rename…", "", Some(Message::AskRename(id))),
-                Entry::Separator,
-                Entry::danger("Delete…", idle.then_some(Message::AskDelete(id))),
-            ],
+            LibKey::Doc(id) => {
+                let single = self.library.iter().any(|d| d.id == id && d.n_rows == 1);
+                vec![
+                    Entry::item("Open", "", idle.then_some(Message::OpenDocument(id))),
+                    Entry::item("Edit sequence…", "", (idle && single).then_some(Message::EditSequence(id))),
+                    Entry::item("Rename…", "", Some(Message::AskRename(id))),
+                    Entry::Separator,
+                    Entry::danger("Delete…", idle.then_some(Message::AskDelete(id))),
+                ]
+            }
             LibKey::Folder(id) => {
                 let collapsed = self.folders.iter().find(|f| f.id == id).is_some_and(|f| f.collapsed);
                 vec![
                     Entry::item(if collapsed { "Expand" } else { "Collapse" }, "", Some(Message::ToggleFolder(id))),
+                    Entry::item("New sequence…", "", idle.then_some(Message::NewSequence)),
                     Entry::item("New subfolder", "", Some(Message::NewFolder)),
                     Entry::item("Rename…", "", Some(Message::AskRenameFolder(id))),
                     Entry::Separator,
@@ -163,9 +190,11 @@ impl App {
         let doc = od.is_some();
         let selection = od.is_some_and(|o| o.selection.is_some());
         let report = od.is_some_and(|o| o.report.is_some());
+        let annotation = od.and_then(|o| o.selected_annotation);
         let when = |ok: bool, m: Message| ok.then_some(m);
         match id {
             menu::MenuId::File => vec![
+                Entry::item("New sequence…", "Ctrl+N", when(idle, Message::NewSequence)),
                 Entry::item("Import FASTA…", "Ctrl+O", when(idle, Message::ImportFasta)),
                 Entry::item("Import metadata table…", "", when(idle && doc, Message::ImportMetadata)),
                 Entry::item("Generate demo data", "", when(idle, Message::DemoData)),
@@ -179,9 +208,14 @@ impl App {
                 Entry::item("Exit", "", Some(Message::Exit)),
             ],
             menu::MenuId::Edit => vec![
+                Entry::item("Edit sequence…", "", self.editable_sequence().filter(|_| idle).map(Message::EditSequence)),
+                Entry::Separator,
+                Entry::item("Add annotation from selection…", "", when(selection, Message::NewAnnotation)),
+                Entry::item("Annotation properties…", "", annotation.map(Message::AnnotationProperties)),
+                Entry::item("Delete annotation…", "Del", annotation.map(Message::AskDeleteAnnotation)),
+                Entry::Separator,
                 Entry::item("Copy oligo", "Ctrl+C", when(report, Message::CopyOligo)),
                 Entry::item("Copy oligo report", "", when(report, Message::CopyReport)),
-                Entry::item("Add annotation from selection", "", when(selection, Message::AddAnnotation)),
                 Entry::item("Clear selection", "Esc", when(selection, Message::ClearSelection)),
                 Entry::Separator,
                 Entry::item(
@@ -216,7 +250,7 @@ impl App {
         self.push_tree(&mut entries, None, 0, &known, &selection);
         let dragging = self.drag.as_ref().is_some_and(|d| d.active);
         if self.library.is_empty() && self.folders.is_empty() {
-            entries.push(text("No documents yet. Import FASTA files or generate demo data.").size(12).style(style::muted).into());
+            entries.push(text("No documents yet. Import FASTA files, create a sequence (Ctrl+N) or generate demo data.").size(12).style(style::muted).into());
         }
         // Free space below the entries: the top-level drop zone.
         let root_target = dragging && self.drop_target() == Some(DropTarget::Root);
@@ -436,13 +470,14 @@ impl App {
             text("PCR Studio").size(28),
             text("Sequence alignment viewer for PCR design and inclusivity evaluation").size(15).style(style::muted),
             Space::new().height(12),
-            text("1. Import FASTA files (aligned or unaligned) — they are stored in the library.").size(14),
+            text("1. Import FASTA files (aligned or unaligned) or paste a sequence — they are stored in the library.").size(14),
             text("2. Open a document from the library (double-click it or press Open).").size(14),
             text("3. Map sequences to a reference, or view an existing alignment.").size(14),
             text("4. Drag across columns to evaluate a primer or probe against all sequences.").size(14),
             Space::new().height(12),
             row![
                 button("Import FASTA…").on_press_maybe((!self.busy()).then_some(Message::ImportFasta)).style(button::primary),
+                button("New sequence…").on_press_maybe((!self.busy()).then_some(Message::NewSequence)).style(button::secondary),
                 button("Generate demo data").on_press_maybe((!self.busy()).then_some(Message::DemoData)).style(button::secondary),
             ]
             .spacing(10),
@@ -607,10 +642,17 @@ impl App {
         .spacing(6);
 
         let mut anns = column![section("Annotations")].spacing(4);
-        if od.annotations.is_empty() {
-            anns = anns.push(text("Select columns and use “Add annotation” in the oligo report.").size(11).style(style::muted));
-        }
-        for (i, a) in od.annotations.iter().enumerate() {
+        anns = anns.push(
+            text(if od.annotations.is_empty() {
+                "Select columns, then right-click → Add annotation… (or the Edit menu)."
+            } else {
+                "Click to select; drag the edges in the viewer to resize; double-click or right-click for properties."
+            })
+            .size(11)
+            .style(style::muted),
+        );
+        for a in &od.annotations {
+            let selected = od.selected_annotation == Some(a.id);
             let range = match od.ref_range(a.start, a.end) {
                 Some((x, y)) => format!("{}–{}", group_digits(x as usize), group_digits(y as usize)),
                 None => format!("col {}–{}", a.start + 1, a.end),
@@ -626,24 +668,53 @@ impl App {
                     swatch,
                     button(column![text(a.name.as_str()).size(12), text(format!("{} · {range}", a.kind)).size(10).style(style::muted)])
                         .padding([2, 4])
-                        .style(button::text)
+                        .style(move |t: &Theme, s| {
+                            let mut st = button::text(t, s);
+                            if selected {
+                                let p = t.extended_palette();
+                                st.background = Some(p.primary.weak.color.into());
+                                st.text_color = p.primary.weak.text;
+                                st.border.radius = 4.0.into();
+                            }
+                            st
+                        })
                         .width(Fill)
-                        .on_press(Message::GotoAnnotation(i)),
-                    button(text("✕").size(11)).padding([2, 6]).style(button::text).on_press(Message::DeleteAnnotation(a.id)),
+                        .on_press(Message::SelectAnnotation(a.id)),
+                    tooltip(
+                        button(text("✎").size(11)).padding([2, 6]).style(button::text).on_press(Message::AnnotationProperties(a.id)),
+                        container(text("Properties").size(12)).padding(6).style(container::rounded_box),
+                        tooltip::Position::Left,
+                    ),
+                    tooltip(
+                        button(text("✕").size(11)).padding([2, 6]).style(button::text).on_press(Message::AskDeleteAnnotation(a.id)),
+                        container(text("Delete").size(12)).padding(6).style(container::rounded_box),
+                        tooltip::Position::Left,
+                    ),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
             );
         }
 
+        // The report button and its auto-open option are shown with or without a selection.
+        let report_row = row![
+            button(text("Oligo report").size(12)).padding([4, 8]).on_press_maybe(od.report.as_ref().map(|_| Message::ShowPopup)),
+            tooltip(
+                checkbox(self.settings.view.auto_report).label("Open automatically").on_toggle(Message::ToggleAutoReport).text_size(12),
+                container(text("Open the oligo report whenever columns are selected").size(12)).padding(6).style(container::rounded_box),
+                tooltip::Position::Bottom,
+            ),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
         let selection: Element<Message> = match od.selection {
             Some(sel) => {
                 let rr = od.ref_range(sel.c0, sel.c1).map(|(a, b)| format!(" · ref {}–{}", group_digits(a as usize), group_digits(b as usize))).unwrap_or_default();
                 column![
                     section("Selection"),
                     text(format!("{} columns ({}–{}){rr}", sel.len(), group_digits(sel.c0 + 1), group_digits(sel.c1))).size(12),
+                    report_row,
                     row![
-                        button(text("Oligo report").size(12)).padding([4, 8]).on_press(Message::ShowPopup),
                         tooltip(
                             button(text("Extract slice").size(12))
                                 .padding([4, 8])
@@ -661,7 +732,9 @@ impl App {
                 .spacing(6)
                 .into()
             }
-            None => column![section("Selection"), text("Drag across the alignment to select columns.").size(11).style(style::muted)].spacing(6).into(),
+            None => column![section("Selection"), text("Drag across the alignment to select columns.").size(11).style(style::muted), report_row]
+                .spacing(6)
+                .into(),
         };
 
         let content = column![doc_info, selection, display, highlighting, rows, anns].spacing(18).padding(12);
@@ -790,14 +863,6 @@ impl App {
         body = body.push(rule::horizontal(1));
         body = body.push(
             row![
-                text_input("Annotation name", &od.annotation_name).on_input(Message::AnnotationName).on_submit(Message::AddAnnotation).padding(4).size(12),
-                pick_list(&AnnotationKind::ALL[..], Some(od.annotation_kind), Message::AnnotationKind).text_size(12).padding(4),
-            ]
-            .spacing(6),
-        );
-        body = body.push(
-            row![
-                button(text("Add annotation").size(12)).padding([4, 8]).on_press(Message::AddAnnotation),
                 button(text("Extract slice").size(12))
                     .padding([4, 8])
                     .style(button::secondary)

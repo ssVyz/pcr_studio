@@ -32,7 +32,14 @@ pub enum ViewMsg {
     ClickItem { item: usize, ctrl: bool, shift: bool },
     ToggleGroup(String),
     Hover(Option<Hover>),
-    ClickAnnotation(usize),
+    /// Click on an annotation (selects it).
+    ClickAnnotation(i64),
+    /// Double-click on an annotation (properties).
+    OpenAnnotation(i64),
+    /// Dragging an annotation edge; `done` on release.
+    ResizeAnnotation { id: i64, start: usize, end: usize, done: bool },
+    /// Right-click at `pos` (window coordinates), on an annotation or not.
+    Context { pos: Point, annotation: Option<i64> },
     /// Dragging the right edge of the name column; `done` on release.
     NameWidth { w: f32, done: bool },
 }
@@ -115,6 +122,13 @@ enum Drag {
     },
     Overview,
     NameColumn,
+    /// Moving the start (`left`) or end edge of an annotation; the other end stays at `fixed`.
+    AnnotationEdge {
+        id: i64,
+        fixed: usize,
+        left: bool,
+        moved: bool,
+    },
     Pan {
         x: f32,
         y: f32,
@@ -128,6 +142,38 @@ pub struct CanvasState {
     drag: Drag,
     modifiers: keyboard::Modifiers,
     last_hover: Option<Hover>,
+    /// Last click on an annotation body (double-click detection).
+    last_click: Option<(std::time::Instant, i64)>,
+}
+
+/// Part of an annotation under the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Start,
+    End,
+    Body,
+}
+
+/// Pixels around an annotation edge that grab the edge.
+const EDGE_GRAB: f32 = 5.0;
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Which part of an annotation drawn from `x0` to `x1` is at `x`, with the
+/// distance to it. Edges win within a few pixels (the nearer one; on a
+/// zero-width annotation the side of the cursor decides).
+fn annotation_part(x0: f32, x1: f32, x: f32) -> Option<(Part, f32)> {
+    let (d0, d1) = ((x - x0).abs(), (x - x1).abs());
+    if d0.min(d1) <= EDGE_GRAB {
+        let start = d0 < d1 || (d0 == d1 && x <= x0);
+        return Some(if start { (Part::Start, d0) } else { (Part::End, d1) });
+    }
+    (x > x0 && x < x1).then_some((Part::Body, EDGE_GRAB + 1.0))
+}
+
+/// Range of an annotation whose start (`left`) or end edge is dragged to
+/// column boundary `b` while the other end stays at `fixed`; at least one column.
+fn resize_range(fixed: usize, left: bool, b: usize) -> (usize, usize) {
+    if left { (b.min(fixed.saturating_sub(1)), fixed) } else { (fixed, b.max(fixed + 1)) }
 }
 
 pub struct AlignmentView<'a> {
@@ -173,6 +219,30 @@ impl AlignmentView<'_> {
         let max_scroll = (total - vis).max(0.0);
         let frac = if max_scroll > 0.0 { self.od.vp.scroll_x / max_scroll } else { 0.0 };
         (lay.seq_x0 + (lay.seq_w - tw) * frac.clamp(0.0, 1.0), tw)
+    }
+
+    /// Annotation (index) and part under `p` in the annotation lanes. The
+    /// selected annotation wins over its neighbors, edges over bodies.
+    fn annotation_at(&self, lay: &Lay, p: Point) -> Option<(usize, Part)> {
+        let (y0, _) = lay.annotations.filter(|_| in_band(p.y, lay.annotations) && p.x >= lay.seq_x0)?;
+        let lane = ((p.y - y0 - 2.0) / LANE_H).floor().max(0.0) as usize;
+        let mut best: Option<(usize, Part, f32)> = None;
+        for (i, a) in self.od.annotations.iter().enumerate() {
+            if lay.lanes[i] != lane {
+                continue;
+            }
+            let Some((part, dist)) = annotation_part(self.x_of(lay, a.start as f32), self.x_of(lay, a.end as f32), p.x) else { continue };
+            let score = if self.od.selected_annotation == Some(a.id) { dist - 100.0 } else { dist };
+            if best.is_none_or(|b| score < b.2) {
+                best = Some((i, part, score));
+            }
+        }
+        best.map(|(i, part, _)| (i, part))
+    }
+
+    /// Column boundary nearest to `x`.
+    fn boundary_at(&self, lay: &Lay, x: f32) -> usize {
+        self.col_at(lay, x).round().clamp(0.0, self.od.width() as f32) as usize
     }
 
     fn hover_at(&self, lay: &Lay, p: Point) -> Option<Hover> {
@@ -284,12 +354,18 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                 if p.x > lay.seq_x0 + lay.seq_w || width == 0 {
                     return None;
                 }
-                if let Some((y0, _)) = lay.annotations.filter(|_| in_band(p.y, lay.annotations)) {
-                    let lane = ((p.y - y0 - 2.0) / LANE_H).floor().max(0.0) as usize;
-                    let col = self.col_index(&lay, p.x);
-                    if let Some(i) = self.od.annotations.iter().enumerate().position(|(i, a)| lay.lanes[i] == lane && col >= a.start && col < a.end) {
-                        return msg(ViewMsg::ClickAnnotation(i));
+                if let Some((i, part)) = self.annotation_at(&lay, p) {
+                    let a = &self.od.annotations[i];
+                    if part == Part::Body {
+                        let now = std::time::Instant::now();
+                        let double = state.last_click.is_some_and(|(t, id)| id == a.id && now - t <= DOUBLE_CLICK);
+                        state.last_click = (!double).then_some((now, a.id));
+                        return msg(if double { ViewMsg::OpenAnnotation(a.id) } else { ViewMsg::ClickAnnotation(a.id) });
                     }
+                    // Grabbing an edge selects the annotation and starts resizing it.
+                    let left = part == Part::Start;
+                    state.drag = Drag::AnnotationEdge { id: a.id, fixed: if left { a.end } else { a.start }, left, moved: false };
+                    return msg(ViewMsg::ClickAnnotation(a.id));
                 }
                 let col = self.col_index(&lay, p.x);
                 let anchor = match (state.modifiers.shift(), self.od.selection) {
@@ -298,6 +374,14 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                 };
                 state.drag = Drag::Select { anchor };
                 return msg(ViewMsg::Select { anchor, to: col, finished: false });
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                let p = pos?;
+                if p.x >= lay.w - SB || p.y >= lay.h - SB || self.od.width() == 0 {
+                    return None;
+                }
+                let annotation = self.annotation_at(&lay, p).map(|(i, _)| self.od.annotations[i].id);
+                return msg(ViewMsg::Context { pos: cursor.position()?, annotation });
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let Some(p) = cursor.position_in(bounds).or_else(|| cursor.position().map(|q| Point::new(q.x - bounds.x, q.y - bounds.y)))
@@ -327,6 +411,14 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                     Drag::NameColumn => {
                         return msg(ViewMsg::NameWidth { w: p.x, done: false });
                     }
+                    Drag::AnnotationEdge { id, fixed, left, .. } => {
+                        let (start, end) = resize_range(fixed, left, self.boundary_at(&lay, p.x));
+                        if self.od.annotations.iter().any(|a| a.id == id && (a.start, a.end) == (start, end)) {
+                            return Some(Action::capture());
+                        }
+                        state.drag = Drag::AnnotationEdge { id, fixed, left, moved: true };
+                        return msg(ViewMsg::ResizeAnnotation { id, start, end, done: false });
+                    }
                     Drag::Overview => {
                         let col = (p.x - lay.seq_x0) / lay.seq_w * self.od.width() as f32;
                         return msg(ViewMsg::SetScroll { x: Some(col - lay.seq_w / vp.col_w / 2.0), y: None });
@@ -351,6 +443,14 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                 if drag == Drag::NameColumn {
                     let p = cursor.position().map(|q| Point::new(q.x - bounds.x, q.y - bounds.y)).unwrap_or(Point::ORIGIN);
                     return msg(ViewMsg::NameWidth { w: p.x, done: true });
+                }
+                if let Drag::AnnotationEdge { id, fixed, left, moved } = drag {
+                    if !moved {
+                        return Some(Action::capture());
+                    }
+                    let p = cursor.position().map(|q| Point::new(q.x - bounds.x, q.y - bounds.y)).unwrap_or(Point::ORIGIN);
+                    let (start, end) = resize_range(fixed, left, self.boundary_at(&lay, p.x));
+                    return msg(ViewMsg::ResizeAnnotation { id, start, end, done: true });
                 }
                 if let Drag::Select { anchor } = drag {
                     let p = cursor.position().map(|q| Point::new(q.x - bounds.x, q.y - bounds.y)).unwrap_or(Point::ORIGIN);
@@ -396,7 +496,7 @@ impl canvas::Program<Message> for AlignmentView<'_> {
 
     fn mouse_interaction(&self, state: &CanvasState, bounds: Rectangle, cursor: Cursor) -> mouse::Interaction {
         match state.drag {
-            Drag::NameColumn => return mouse::Interaction::ResizingHorizontally,
+            Drag::NameColumn | Drag::AnnotationEdge { .. } => return mouse::Interaction::ResizingHorizontally,
             Drag::Pan { .. } => return mouse::Interaction::Grabbing,
             Drag::Select { .. } => return mouse::Interaction::Text,
             _ => {}
@@ -411,7 +511,12 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                 return mouse::Interaction::Pointer;
             }
         } else if p.x < lay.seq_x0 + lay.seq_w && p.y < lay.h - SB {
-            if in_band(p.y, lay.overview) || in_band(p.y, lay.annotations) {
+            match self.annotation_at(&lay, p) {
+                Some((_, Part::Body)) => return mouse::Interaction::Pointer,
+                Some(_) => return mouse::Interaction::ResizingHorizontally,
+                None => {}
+            }
+            if in_band(p.y, lay.overview) {
                 return mouse::Interaction::Pointer;
             }
             return mouse::Interaction::Crosshair;
@@ -865,6 +970,17 @@ impl Drawer<'_, '_> {
                 let x0 = self.v.x_of(lay, a.start as f32).max(lay.seq_x0 - 20.0);
                 let x1 = self.v.x_of(lay, a.end as f32).min(lay.seq_x0 + lay.seq_w + 20.0);
                 self.arrow(f, x0, x1, y + 1.0, LANE_H - 3.0, a);
+                if od.selected_annotation == Some(a.id) {
+                    // Outline plus grips on both edges (they can be dragged).
+                    let (ya, ha) = (y + 1.0, LANE_H - 3.0);
+                    f.stroke(
+                        &Path::rectangle(Point::new(x0 - 1.0, ya - 1.0), Size::new(x1 - x0 + 2.0, ha + 2.0)),
+                        Stroke::default().with_color(pal.text).with_width(1.5),
+                    );
+                    for x in [x0, x1] {
+                        f.fill_rectangle(Point::new(x - 2.0, ya - 2.0), Size::new(4.0, ha + 4.0), pal.selection_edge);
+                    }
+                }
             }
         }
 
@@ -1088,6 +1204,25 @@ mod tests {
         assert_eq!(group_digits(1234567), "1,234,567");
         assert_eq!(group_digits(12), "12");
         assert_eq!(truncate("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn annotation_hits_and_resizing() {
+        // Edges grab within a few pixels, the nearer one wins.
+        assert_eq!(annotation_part(100.0, 200.0, 103.0), Some((Part::Start, 3.0)));
+        assert_eq!(annotation_part(100.0, 200.0, 198.0), Some((Part::End, 2.0)));
+        assert_eq!(annotation_part(100.0, 200.0, 150.0).map(|h| h.0), Some(Part::Body));
+        assert_eq!(annotation_part(100.0, 200.0, 90.0), None);
+        // Narrow annotation: the side of the cursor decides.
+        assert_eq!(annotation_part(100.0, 102.0, 99.0).map(|h| h.0), Some(Part::Start));
+        assert_eq!(annotation_part(100.0, 102.0, 103.0).map(|h| h.0), Some(Part::End));
+        assert_eq!(annotation_part(100.0, 100.0, 101.0).map(|h| h.0), Some(Part::End));
+        // Resizing keeps the other end and at least one column.
+        assert_eq!(resize_range(20, true, 5), (5, 20));
+        assert_eq!(resize_range(20, true, 25), (19, 20));
+        assert_eq!(resize_range(10, false, 30), (10, 30));
+        assert_eq!(resize_range(10, false, 3), (10, 11));
+        assert_eq!(resize_range(1, true, 0), (0, 1));
     }
 
     #[test]

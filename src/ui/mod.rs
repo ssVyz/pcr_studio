@@ -17,7 +17,7 @@ use crate::model::{Annotation, AnnotationKind, ConsensusThreshold, DocInfo, DocK
 use crate::primer::{self, OligoSource, Orientation, PrimerOptions};
 use crate::search::{self, Scope};
 use canvas::ViewMsg;
-use dialogs::{ExportDialog, ExportRows, MapDialog, Modal, RefChoice, SettingsDialog};
+use dialogs::{AnnotationDialog, EditTarget, ExportDialog, ExportRows, MapDialog, Modal, RefChoice, SequenceDialog, SettingsDialog};
 use iced::keyboard::{self, Key, key::Named};
 use iced::{Subscription, Task, Theme};
 use job::{Job, Payload};
@@ -125,6 +125,8 @@ pub enum ContextTarget {
     Entry(LibKey),
     /// Free space in the library list.
     Empty,
+    /// The sequence viewer, on an annotation (id) or not.
+    Viewer(Option<i64>),
 }
 
 /// Where a dragged library entry would land.
@@ -184,6 +186,12 @@ pub enum Message {
     ImportFasta,
     ImportPicked(Option<Vec<PathBuf>>),
     ImportDone(Payload<Result<Vec<i64>, String>>),
+    /// New document from typed or pasted text (in the current folder).
+    NewSequence,
+    /// Edit the sequence of a single-sequence document.
+    EditSequence(i64),
+    Sequence(dialogs::SequenceMsg),
+    SaveSequence,
     AskRename(i64),
     AskDelete(i64),
     ConfirmDelete(i64),
@@ -264,11 +272,18 @@ pub enum Message {
     PrimerOrientation(Orientation),
     CopyOligo,
     CopyReport,
-    AnnotationName(String),
-    AnnotationKind(AnnotationKind),
-    AddAnnotation,
+    /// Open the oligo report whenever columns are selected.
+    ToggleAutoReport(bool),
+    /// Properties dialog for a new annotation on the selected columns.
+    NewAnnotation,
+    AnnotationProperties(i64),
+    AnnotationEdit(dialogs::AnnotationMsg),
+    SaveAnnotation,
+    /// Select an annotation and its columns (side panel).
+    SelectAnnotation(i64),
+    AskDeleteAnnotation(i64),
+    /// Deletion confirmed.
     DeleteAnnotation(i64),
-    GotoAnnotation(usize),
     // Metadata
     ImportMetadata,
     MetadataPicked(Option<PathBuf>),
@@ -1012,6 +1027,34 @@ impl App {
                     None => {}
                 }
             }
+            Message::NewSequence => {
+                if !self.busy() {
+                    self.modal = Some(Modal::Sequence(SequenceDialog::create(self.target_folder())));
+                    return dialogs::focus_sequence();
+                }
+            }
+            Message::EditSequence(id) => {
+                if self.busy() {
+                    return Task::none();
+                }
+                match self.db.load_document(id, &|_| {}) {
+                    Ok((info, doc, anns)) if doc.rows.len() == 1 => {
+                        let row = doc.rows.into_iter().next().unwrap();
+                        let annotation_ends = anns.iter().map(|a| a.end).collect();
+                        let target = EditTarget { id, doc_name: info.name, kind: info.kind, row, annotation_ends };
+                        self.modal = Some(Modal::Sequence(SequenceDialog::edit(target)));
+                        return dialogs::focus_sequence();
+                    }
+                    Ok(_) => self.error = Some("Only documents with a single sequence can be edited".into()),
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            Message::Sequence(m) => {
+                if let Some(Modal::Sequence(d)) = self.modal.as_mut() {
+                    d.update(m);
+                }
+            }
+            Message::SaveSequence => return self.save_sequence(),
             Message::AskRename(id) => {
                 if let Some(d) = self.library.iter().find(|d| d.id == id) {
                     self.modal = Some(Modal::Rename { id, text: d.name.clone(), folder: false });
@@ -1042,7 +1085,7 @@ impl App {
                 }
                 self.reload_library();
             }
-            Message::View(m) => self.on_view(m),
+            Message::View(m) => return self.on_view(m),
             Message::ZoomIn => self.zoom_by(1.5),
             Message::ZoomOut => self.zoom_by(1.0 / 1.5),
             Message::ZoomFit => self.with_doc(|od, _| {
@@ -1141,6 +1184,7 @@ impl App {
             Message::ClearRowSelection => self.with_doc(|od, _| od.selected_rows.clear()),
             Message::ClearSelection => self.with_doc(|od, _| {
                 od.selection = None;
+                od.selected_annotation = None;
                 od.report = None;
                 od.popup_open = false;
             }),
@@ -1170,16 +1214,56 @@ impl App {
                         return iced::clipboard::write(text);
                     }
             }
-            Message::AnnotationName(s) => self.with_doc(|od, _| od.annotation_name = s),
-            Message::AnnotationKind(k) => self.with_doc(|od, _| od.annotation_kind = k),
-            Message::AddAnnotation => self.add_annotation(),
+            Message::ToggleAutoReport(b) => self.set_pref(|p| p.auto_report = b),
+            Message::NewAnnotation => {
+                let Some(od) = self.open.as_ref() else { return Task::none() };
+                let Some(sel) = od.selection else {
+                    self.error = Some("Select columns first (drag across the alignment).".into());
+                    return Task::none();
+                };
+                let name = format!("Oligo {}", od.annotations.len() + 1);
+                self.modal = Some(Modal::Annotation(AnnotationDialog::new(None, name, od.annotation_kind, sel.c0, sel.c1, od)));
+                return dialogs::focus_annotation();
+            }
+            Message::AnnotationProperties(id) => {
+                if let Some(od) = self.open.as_ref()
+                    && let Some(a) = od.annotation(id)
+                {
+                    self.modal = Some(Modal::Annotation(AnnotationDialog::new(Some(id), a.name.clone(), a.kind, a.start, a.end, od)));
+                    return dialogs::focus_annotation();
+                }
+            }
+            Message::AnnotationEdit(m) => {
+                if let Some(Modal::Annotation(d)) = self.modal.as_mut() {
+                    d.update(m);
+                }
+            }
+            Message::SaveAnnotation => self.save_annotation(),
+            Message::SelectAnnotation(id) => self.select_annotation(id, true, self.settings.view.auto_report),
+            Message::AskDeleteAnnotation(id) => {
+                if let Some(od) = self.open.as_ref()
+                    && let Some(a) = od.annotation(id)
+                {
+                    let detail = format!("{} · {}", a.kind, annotation_range_label(od, a.start, a.end));
+                    self.modal = Some(Modal::ConfirmDeleteAnnotation { id, name: a.name.clone(), detail });
+                }
+            }
             Message::DeleteAnnotation(id) => {
+                self.modal = None;
                 if let Err(e) = self.db.delete_annotation(id) {
                     self.error = Some(e);
+                    return Task::none();
                 }
-                self.with_doc(|od, _| od.annotations.retain(|a| a.id != id));
+                if let Some(od) = self.open.as_mut()
+                    && let Some(i) = od.annotations.iter().position(|a| a.id == id)
+                {
+                    let a = od.annotations.remove(i);
+                    if od.selected_annotation == Some(id) {
+                        od.selected_annotation = None;
+                    }
+                    self.status = format!("Deleted annotation “{}”", a.name);
+                }
             }
-            Message::GotoAnnotation(i) => self.goto_annotation(i),
             Message::ImportMetadata => {
                 if self.open.is_none() {
                     return Task::none();
@@ -1315,15 +1399,39 @@ impl App {
         });
     }
 
-    fn on_view(&mut self, m: ViewMsg) {
-        if let ViewMsg::NameWidth { w, done } = m {
-            self.settings.view.name_w = w.clamp(state::NAME_W_MIN, state::NAME_W_MAX);
-            if done {
-                self.save_settings();
+    fn on_view(&mut self, m: ViewMsg) -> Task<Message> {
+        match m {
+            ViewMsg::NameWidth { w, done } => {
+                self.settings.view.name_w = w.clamp(state::NAME_W_MIN, state::NAME_W_MAX);
+                if done {
+                    self.save_settings();
+                }
+                return Task::none();
             }
-            return;
+            ViewMsg::ClickAnnotation(id) => {
+                self.select_annotation(id, false, self.settings.view.auto_report);
+                return Task::none();
+            }
+            ViewMsg::OpenAnnotation(id) => return self.update(Message::AnnotationProperties(id)),
+            ViewMsg::ResizeAnnotation { id, start, end, done } => {
+                self.resize_annotation(id, start, end, done);
+                return Task::none();
+            }
+            ViewMsg::Context { pos, annotation } => {
+                // Right-click selects the annotation, like the library entries;
+                // the oligo report stays as it is.
+                if let Some(id) = annotation {
+                    let popup = self.open.as_ref().is_some_and(|o| o.popup_open);
+                    self.select_annotation(id, false, popup);
+                }
+                self.menu = None;
+                self.context = Some(ContextMenu { target: ContextTarget::Viewer(annotation), pos });
+                return Task::none();
+            }
+            _ => {}
         }
-        let Some(od) = self.open.as_mut() else { return };
+        let auto_report = self.settings.view.auto_report;
+        let Some(od) = self.open.as_mut() else { return Task::none() };
         let width = od.width();
         match m {
             ViewMsg::Resized { canvas, seq_w, rows_h } => {
@@ -1358,6 +1466,7 @@ impl App {
             }
             ViewMsg::Select { anchor, to, finished } => {
                 od.selection = Some(Selection::new(anchor, to));
+                od.selected_annotation = None;
                 if !finished {
                     // The report belongs to the previous selection until the drag ends.
                     od.popup_open = false;
@@ -1365,14 +1474,11 @@ impl App {
                 if finished {
                     let opts = self.settings.primer;
                     od.evaluate_selection(&opts);
-                    od.popup_open = od.selection.is_some_and(|s| s.len() >= 1);
-                    if od.annotation_name.is_empty() {
-                        od.annotation_name = format!("Oligo {}", od.annotations.len() + 1);
-                    }
+                    od.popup_open = auto_report && od.selection.is_some_and(|s| s.len() >= 1);
                 }
             }
             ViewMsg::ClickItem { item, ctrl, shift } => {
-                let Some(row) = od.item_row(item) else { return };
+                let Some(row) = od.item_row(item) else { return Task::none() };
                 if shift {
                     if let Some(last) = od.last_clicked_item {
                         let (a, b) = (last.min(item), last.max(item));
@@ -1403,9 +1509,13 @@ impl App {
                 od.rebuild_items();
             }
             ViewMsg::Hover(h) => od.hover = h,
-            ViewMsg::ClickAnnotation(i) => self.goto_annotation(i),
-            ViewMsg::NameWidth { .. } => {}
+            ViewMsg::NameWidth { .. }
+            | ViewMsg::ClickAnnotation(_)
+            | ViewMsg::OpenAnnotation(_)
+            | ViewMsg::ResizeAnnotation { .. }
+            | ViewMsg::Context { .. } => {}
         }
+        Task::none()
     }
 
     fn on_key(&mut self, e: keyboard::Event) -> Task<Message> {
@@ -1447,10 +1557,16 @@ impl App {
         if self.modal.is_some() {
             return Task::none();
         }
+        if let Key::Named(Named::Delete) = key
+            && let Some(id) = self.open.as_ref().and_then(|o| o.selected_annotation)
+        {
+            return self.update(Message::AskDeleteAnnotation(id));
+        }
         if modifiers.command() {
             if let Key::Character(c) = &key {
                 match c.as_str() {
                     "c" => return self.update(Message::CopyOligo),
+                    "n" => return self.update(Message::NewSequence),
                     "o" => return self.update(Message::ImportFasta),
                     "e" => return self.update(Message::OpenExport),
                     "m" => return self.update(Message::OpenMapDialog),
@@ -1509,9 +1625,10 @@ impl App {
         let (c0, c1) = (c0.min(c1), c0.max(c1));
         if b.is_some() {
             od.selection = Some(Selection::new(c0, c1));
+            od.selected_annotation = None;
             let opts = self.settings.primer;
             od.evaluate_selection(&opts);
-            od.popup_open = true;
+            od.popup_open = self.settings.view.auto_report;
         }
         if od.vp.col_w < 4.0 {
             od.vp.col_w = BASE_COL_W;
@@ -1562,6 +1679,7 @@ impl App {
         }
         od.clamp_view();
         od.selection = Some(Selection { anchor: h.c0, c0: h.c0, c1: h.c1 });
+        od.selected_annotation = None;
         od.evaluate_selection(&opts);
     }
 
@@ -1585,45 +1703,88 @@ impl App {
         };
     }
 
-    fn add_annotation(&mut self) {
+    /// Selects an annotation and makes its range the column selection; primer
+    /// annotations set the report orientation. `reveal` scrolls to it;
+    /// `popup` is whether the oligo report is shown afterwards.
+    fn select_annotation(&mut self, id: i64, reveal: bool, popup: bool) {
         let Some(od) = self.open.as_mut() else { return };
-        let Some(sel) = od.selection else { return };
-        let name = if od.annotation_name.trim().is_empty() { format!("Oligo {}", od.annotations.len() + 1) } else { od.annotation_name.trim().to_string() };
-        let note = od.report.as_ref().map(|r| String::from_utf8_lossy(&r.oligo).to_string()).unwrap_or_default();
-        let mut a = Annotation { id: 0, name, kind: od.annotation_kind, start: sel.c0, end: sel.c1, note };
-        match self.db.add_annotation(od.info.id, &a) {
-            Ok(id) => {
-                a.id = id;
-                self.status = format!("Annotation “{}” added", a.name);
-                od.annotations.push(a);
-                od.annotations.sort_by_key(|a| (a.start, a.end));
-                od.annotation_name = format!("Oligo {}", od.annotations.len() + 1);
-            }
-            Err(e) => self.error = Some(e),
-        }
-    }
-
-    fn goto_annotation(&mut self, i: usize) {
-        let opts = self.settings.primer;
-        let Some(od) = self.open.as_mut() else { return };
-        let Some(a) = od.annotations.get(i).cloned() else { return };
-        od.selection = Some(Selection { anchor: a.start, c0: a.start, c1: a.end });
+        let Some(a) = od.annotation(id).cloned() else { return };
         match a.kind {
             AnnotationKind::ReversePrimer => self.settings.primer.orientation = Orientation::Reverse,
             AnnotationKind::ForwardPrimer => self.settings.primer.orientation = Orientation::Forward,
             _ => {}
         }
-        let opts = PrimerOptions { orientation: self.settings.primer.orientation, ..opts };
-        od.evaluate_selection(&opts);
-        od.popup_open = true;
-        od.annotation_name = a.name.clone();
-        od.annotation_kind = a.kind;
-        if od.vp.col_w < 4.0 {
-            od.vp.col_w = BASE_COL_W;
+        od.selected_annotation = Some(id);
+        od.selection = Some(Selection { anchor: a.start, c0: a.start, c1: a.end });
+        od.evaluate_selection(&self.settings.primer);
+        od.popup_open = popup;
+        if reveal {
+            if od.vp.col_w < 4.0 {
+                od.vp.col_w = BASE_COL_W;
+                od.clamp_view();
+            }
+            od.vp.reveal_col(a.start, a.end);
             od.clamp_view();
         }
-        od.vp.reveal_col(a.start, a.end);
-        od.clamp_view();
+    }
+
+    /// An annotation edge is being dragged; the new range is saved when `done`.
+    fn resize_annotation(&mut self, id: i64, start: usize, end: usize, done: bool) {
+        let auto_report = self.settings.view.auto_report;
+        let source = self.settings.primer.source;
+        let Some(od) = self.open.as_mut() else { return };
+        let Some(i) = od.annotations.iter().position(|a| a.id == id) else { return };
+        (od.annotations[i].start, od.annotations[i].end) = (start, end);
+        od.selected_annotation = Some(id);
+        od.selection = Some(Selection { anchor: start, c0: start, c1: end });
+        if !done {
+            // The report belongs to the old range until the drag ends.
+            od.popup_open = false;
+            return;
+        }
+        od.annotations[i].note = od.oligo(source, od.annotations[i].kind, start, end);
+        let a = od.annotations[i].clone();
+        od.annotations.sort_by_key(|a| (a.start, a.end));
+        od.evaluate_selection(&self.settings.primer);
+        od.popup_open = auto_report;
+        let range = annotation_range_label(od, a.start, a.end);
+        match self.db.update_annotation(&a) {
+            Ok(()) => self.status = format!("Annotation “{}” now {range}", a.name),
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// Adds the annotation of the properties dialog, or saves its changes.
+    fn save_annotation(&mut self) {
+        let Some(Modal::Annotation(d)) = self.modal.as_ref() else { return };
+        let (Ok((c0, c1)), None) = (d.range(), d.problem()) else { return };
+        let (id, name, kind) = (d.id, d.name.trim().to_string(), d.kind);
+        let source = self.settings.primer.source;
+        let Some(od) = self.open.as_mut() else { return };
+        let note = od.oligo(source, kind, c0, c1);
+        let mut a = Annotation { id: id.unwrap_or(0), name, kind, start: c0, end: c1, note };
+        let saved = match id {
+            None => self.db.add_annotation(od.info.id, &a).map(|new| {
+                a.id = new;
+                od.annotations.push(a.clone());
+            }),
+            Some(_) => self.db.update_annotation(&a).map(|()| {
+                if let Some(x) = od.annotations.iter_mut().find(|x| x.id == a.id) {
+                    *x = a.clone();
+                }
+            }),
+        };
+        if let Err(e) = saved {
+            self.error = Some(e);
+            return;
+        }
+        od.annotations.sort_by_key(|a| (a.start, a.end));
+        od.annotation_kind = kind;
+        let popup = od.popup_open;
+        let range = annotation_range_label(od, c0, c1);
+        self.status = format!("Annotation “{}” {} ({range})", a.name, if id.is_some() { "saved" } else { "added" });
+        self.modal = None;
+        self.select_annotation(a.id, false, popup);
     }
 
     fn apply_metadata(&mut self, f: impl FnOnce(&mut [Row]) -> String) {
@@ -1908,6 +2069,86 @@ impl App {
         )
     }
 
+    /// Single-sequence document the Edit menu acts on: the selected library
+    /// document, or the open one when nothing is selected.
+    fn editable_sequence(&self) -> Option<i64> {
+        let id = self.library_selected.or_else(|| self.open.as_ref().map(|o| o.info.id))?;
+        self.library.iter().find(|d| d.id == id && d.n_rows == 1).map(|d| d.id)
+    }
+
+    /// Creates the document of the sequence dialog, or saves the edited sequence.
+    fn save_sequence(&mut self) -> Task<Message> {
+        let Some(Modal::Sequence(d)) = self.modal.take() else { return Task::none() };
+        if d.problem().is_some() {
+            self.modal = Some(Modal::Sequence(d));
+            return Task::none();
+        }
+        let name = d.name.trim().to_string();
+        let description = d.description.trim().to_string();
+        let Some(t) = &d.edit else {
+            let (kind, doc) = fasta::document_from_pasted(&d.records, &name, &description);
+            let n = doc.rows.len();
+            let note = if n == 1 { "Entered manually".to_string() } else { format!("Entered manually ({n} sequences)") };
+            return match self.db.insert_document(&name, kind, &doc, None, &note, d.folder, &|_| {}) {
+                Ok(id) => {
+                    self.reload_library();
+                    self.reveal_folder(d.folder);
+                    self.set_primary(Some(LibKey::Doc(id)));
+                    self.lib_multi.clear();
+                    self.status = if n == 1 {
+                        format!("Created “{name}” ({} bp)", canvas::group_digits(doc.rows[0].ungapped_len()))
+                    } else {
+                        format!("Created “{name}” with {n} sequences")
+                    };
+                    self.open_document(id)
+                }
+                Err(e) => {
+                    self.error = Some(e);
+                    self.modal = Some(Modal::Sequence(d));
+                    Task::none()
+                }
+            };
+        };
+        // Renaming in the dialog renames the document and its sequence;
+        // otherwise both keep their names.
+        let row_name = if name != t.doc_name { name.clone() } else { t.row.name.clone() };
+        let mut row = Row::from_gapped(row_name, description, d.records[0].seq.clone());
+        row.meta = t.row.meta.clone();
+        let kind = match t.kind {
+            DocKind::Contig => DocKind::Contig,
+            _ => fasta::alignment_kind(d.records[0].seq.contains(&crate::seq::GAP), &[row.end()]),
+        };
+        match self.db.replace_single_row(t.id, &name, kind, &row) {
+            Ok(dropped) => {
+                self.reload_library();
+                self.status = format!("Saved “{name}” ({} bp)", canvas::group_digits(row.ungapped_len()));
+                if dropped > 0 {
+                    self.status.push_str(&format!("; removed {dropped} annotation(s) past the new end"));
+                }
+                if self.open.as_ref().is_some_and(|o| o.info.id == t.id) {
+                    // Reload (one sequence: quick) so consensus, statistics and
+                    // annotations match; the view keeps its zoom and position.
+                    match self.db.load_document(t.id, &|_| {}) {
+                        Ok((info, doc, anns)) => {
+                            let mut od = OpenDoc::new(info, doc, anns, &self.settings.view);
+                            if let Some(old) = &self.open {
+                                od.vp = old.vp;
+                            }
+                            od.clamp_view();
+                            self.open = Some(od);
+                        }
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+            }
+            Err(e) => {
+                self.error = Some(e);
+                self.modal = Some(Modal::Sequence(d));
+            }
+        }
+        Task::none()
+    }
+
     fn demo_data(&mut self) -> Task<Message> {
         if self.busy() {
             return Task::none();
@@ -1931,5 +2172,13 @@ impl App {
             },
             |r| Message::ImportDone(Payload::new(r.unwrap_or_else(|| Err("Demo generation failed".into())))),
         )
+    }
+}
+
+/// Range of columns `[c0, c1)` for messages: reference positions or columns.
+fn annotation_range_label(od: &OpenDoc, c0: usize, c1: usize) -> String {
+    match od.ref_range(c0, c1) {
+        Some((a, b)) => format!("ref {}–{}", canvas::group_digits(a as usize), canvas::group_digits(b as usize)),
+        None => format!("columns {}–{}", canvas::group_digits(c0 + 1), canvas::group_digits(c1)),
     }
 }

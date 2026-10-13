@@ -7,6 +7,65 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.0.11] - 2026-10-13
+
+### Added
+
+- **Right-click menu in the sequence viewer**: Add annotation…, Oligo report, Copy oligo,
+  Extract selection to library, Clear selection. On an annotation it also offers Annotation
+  properties… and Delete annotation…; the right-click selects that annotation.
+- **Annotations can be selected**: clicking one (in the viewer or in the side panel list)
+  highlights it with grips on both edges and makes its range the column selection. Primer
+  annotations set the report orientation, as before.
+- **Resizing**: drag either edge of an annotation in the viewer, snapping to columns, with
+  a minimum length of one column. The cursor shows a resize arrow over an edge. The new
+  range is saved when the mouse is released.
+- **Annotation properties dialog** (double-click, right-click menu, Edit menu, ✎ in the
+  side panel): name, type and range. The range is entered as 1-based reference positions
+  when the document has a reference, otherwise as alignment columns; the dialog shows the
+  resulting columns and rejects invalid ranges. A field left unchanged keeps its exact
+  column, so annotations that start or end in insertion columns are not shifted. New
+  annotations open the same dialog pre-filled from the selection (Add).
+- **Deleting an annotation** (right-click menu, Edit menu, Delete key, ✕ in the side panel,
+  Delete… in the dialog) asks for confirmation.
+- **"Open automatically"** checkbox next to the Oligo report button in the display options
+  panel (saved in the settings, on by default). When it is off, selecting columns, jumping
+  to a range or clicking an annotation no longer opens the report.
+- Edit menu: Add annotation from selection…, Annotation properties…, Delete annotation… (Del).
+- `Db::update_annotation`, `RefCoords::range` / `RefCoords::columns`, with tests.
+
+### Changed
+
+- The oligo report no longer contains the annotation name, type and "Add annotation"
+  controls.
+- An annotation's stored oligo (note) is updated when its range or type changes.
+
+## [0.0.10] - 2026-10-13
+
+### Added
+
+- **New sequence…** (File menu, Ctrl+N, right-click on free library space or on a folder,
+  welcome screen): a dialog with name, description and a multi-line sequence box for typed
+  or pasted text. Accepts a plain sequence or FASTA. Spaces, line breaks and position numbers
+  (GenBank/EMBL listings) are ignored, U becomes T, and characters that are not nucleotide
+  codes become N, as on FASTA import. The dialog says how many characters were converted.
+  A single FASTA header fills in name and description; several records create one sequence
+  list, or an alignment when gapped or all the same length, like a FASTA import. The dialog
+  shows length, GC and ambiguous bases, or the records found. The new document goes to the
+  right-clicked or current folder and opens.
+- **Edit sequence…** (right-click on a document, Edit menu) for documents with a single
+  sequence; disabled for other documents. Edits the name, description and bases in the same
+  dialog. Renaming there renames the document and its sequence. Metadata is kept.
+  Annotations keep their positions; any that end past the new sequence end are removed, and
+  the dialog warns before saving. An open document is reloaded in place.
+- `fasta::parse_pasted`, `fasta::document_from_pasted`, `fasta::pasted_kind` and
+  `Db::replace_single_row`, with tests.
+
+### Changed
+
+- FASTA import and pasted text share one rule for detecting alignments
+  (`fasta::alignment_kind`).
+
 ## [0.0.9] - 2026-09-28
 
 ### Added

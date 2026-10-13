@@ -186,6 +186,32 @@ impl Db {
         Ok(())
     }
 
+    /// Replaces the sequence of a single-sequence document and renames the
+    /// document. Annotations that end past the new sequence are removed;
+    /// returns how many.
+    pub fn replace_single_row(&mut self, id: i64, doc_name: &str, kind: DocKind, row: &Row) -> Result<usize, String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let n_rows: i64 = tx
+            .query_row("SELECT n_rows FROM documents WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Document {id} not found"))?;
+        if n_rows != 1 {
+            return Err("Only documents with a single sequence can be edited".into());
+        }
+        let width = row.end() as i64;
+        tx.execute("UPDATE documents SET name = ?2, kind = ?3, width = ?4 WHERE id = ?1", params![id, doc_name, kind.as_str(), width])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE rows SET name = ?2, description = ?3, start = ?4, data = ?5, meta = ?6 WHERE doc_id = ?1 AND idx = 0",
+            params![id, row.name, row.description, row.start as i64, row.data, meta_to_json(&row.meta)],
+        )
+        .map_err(|e| e.to_string())?;
+        let dropped = tx.execute("DELETE FROM annotations WHERE doc_id = ?1 AND end_col > ?2", params![id, width]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(dropped)
+    }
+
     pub fn set_reference(&self, id: i64, reference: Option<usize>) -> Result<(), String> {
         self.conn
             .execute("UPDATE documents SET reference = ?2 WHERE id = ?1", params![id, reference.map(|r| r as i64)])
@@ -233,6 +259,17 @@ impl Db {
             )
             .map_err(|e| e.to_string())?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Saves name, type, range and note of an existing annotation.
+    pub fn update_annotation(&self, a: &Annotation) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE annotations SET name = ?2, kind = ?3, start_col = ?4, end_col = ?5, note = ?6 WHERE id = ?1",
+                params![a.id, a.name, a.kind.as_str(), a.start as i64, a.end as i64, a.note],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn delete_annotation(&self, id: i64) -> Result<(), String> {
@@ -341,6 +378,9 @@ mod tests {
             .add_annotation(id, &Annotation { id: 0, name: "F1".into(), kind: AnnotationKind::ForwardPrimer, start: 1, end: 4, note: String::new() })
             .unwrap();
         assert_eq!(db.annotations(id).unwrap()[0].id, aid);
+        let edited = Annotation { id: aid, name: "R1".into(), kind: AnnotationKind::ReversePrimer, start: 2, end: 6, note: "x".into() };
+        db.update_annotation(&edited).unwrap();
+        assert_eq!(db.annotations(id).unwrap(), vec![edited]);
         db.set_setting("k", "v1").unwrap();
         db.set_setting("k", "v2").unwrap();
         assert_eq!(db.setting("k").as_deref(), Some("v2"));
@@ -357,6 +397,23 @@ mod tests {
         db.delete_folder(a).unwrap();
         assert_eq!(db.list_documents().unwrap()[0].folder, None);
         assert!(db.list_folders().unwrap().is_empty());
+        // Editing is limited to single-sequence documents.
+        assert!(db.replace_single_row(id, "x", DocKind::Sequences, &Row::default()).is_err());
+        let one = Document::new(vec![Row::from_gapped("s".into(), String::new(), b"ACGTACGT".to_vec())]);
+        let single = db.insert_document("single", DocKind::Sequences, &one, None, "", None, &|_| {}).unwrap();
+        for (s, e) in [(0, 4), (2, 8)] {
+            db.add_annotation(single, &Annotation { id: 0, name: "a".into(), kind: AnnotationKind::Region, start: s, end: e, note: String::new() })
+                .unwrap();
+        }
+        let mut edited = Row::from_gapped("s2".into(), "d".into(), b"AC-GTA".to_vec());
+        edited.set_meta("k", "v".into());
+        assert_eq!(db.replace_single_row(single, "renamed", DocKind::Alignment, &edited).unwrap(), 1);
+        let (info, loaded, anns) = db.load_document(single, &|_| {}).unwrap();
+        assert_eq!((info.name.as_str(), info.kind, info.width, info.n_rows), ("renamed", DocKind::Alignment, 6, 1));
+        assert_eq!((loaded.rows[0].name.as_str(), loaded.rows[0].data.as_slice()), ("s2", &b"AC-GTA"[..]));
+        assert_eq!(loaded.rows[0].meta_value("k"), Some("v"));
+        assert_eq!(anns.len(), 1);
+        db.delete_document(single).unwrap();
         db.delete_document(id).unwrap();
         assert!(db.list_documents().unwrap().is_empty());
         assert!(db.annotations(id).unwrap().is_empty());

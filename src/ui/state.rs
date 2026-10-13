@@ -62,6 +62,8 @@ pub struct ViewPrefs {
     pub threshold: ConsensusThreshold,
     pub color_bases: bool,
     pub graph: GraphMode,
+    /// Open the oligo report whenever columns are selected.
+    pub auto_report: bool,
 }
 
 impl Default for ViewPrefs {
@@ -78,6 +80,7 @@ impl Default for ViewPrefs {
             threshold: ConsensusThreshold::Majority,
             color_bases: true,
             graph: GraphMode::Conservation,
+            auto_report: true,
         }
     }
 }
@@ -203,7 +206,9 @@ pub struct OpenDoc {
     pub search: SearchState,
     pub jump_text: String,
     pub hover: Option<Hover>,
-    pub annotation_name: String,
+    /// Selected annotation (id).
+    pub selected_annotation: Option<i64>,
+    /// Type of the last annotation added (default for the next one).
     pub annotation_kind: crate::model::AnnotationKind,
 }
 
@@ -235,7 +240,7 @@ impl OpenDoc {
             search: SearchState::default(),
             jump_text: String::new(),
             hover: None,
-            annotation_name: String::new(),
+            selected_annotation: None,
             annotation_kind: crate::model::AnnotationKind::ForwardPrimer,
         };
         od.recompute_stats(prefs);
@@ -426,14 +431,20 @@ impl OpenDoc {
 
     /// 1-based reference range covered by columns `[c0, c1)`, if there is a reference.
     pub fn ref_range(&self, c0: usize, c1: usize) -> Option<(u32, u32)> {
-        let rc = self.ref_coords.as_ref()?;
-        let c1 = c1.min(rc.pos_at.len());
-        if c1 == 0 || c0 >= c1 {
-            return None;
-        }
-        let first = (c0..c1).find(|&c| rc.is_base[c]).map(|c| rc.pos_at[c])?;
-        let last = rc.pos_at[(c1 - 1).min(rc.pos_at.len() - 1)];
-        Some((first, last))
+        self.ref_coords.as_ref()?.range(c0, c1)
+    }
+
+    pub fn annotation(&self, id: i64) -> Option<&Annotation> {
+        self.annotations.iter().find(|a| a.id == id)
+    }
+
+    /// Oligo of columns `[c0, c1)` in the given source, 5'→3' for the
+    /// annotation type (reverse complement for reverse primers).
+    pub fn oligo(&self, source: OligoSource, kind: crate::model::AnnotationKind, c0: usize, c1: usize) -> String {
+        let t = self.template_row(source);
+        let s = crate::seq::ungap(&t[c0.min(t.len())..c1.min(t.len())]);
+        let s = if kind == crate::model::AnnotationKind::ReversePrimer { crate::seq::revcomp(&s) } else { s };
+        String::from_utf8_lossy(&s).into_owned()
     }
 
     /// Row shown by a display item (group headers have none).

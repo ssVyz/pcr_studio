@@ -28,8 +28,8 @@ The menu bar holds all application commands:
 
 | Menu | Entries |
 |---|---|
-| File | Import FASTA… (Ctrl+O), Import metadata table…, Generate demo data, Export FASTA… (Ctrl+E), Extract selection to library, New folder, Close document (Ctrl+W), Exit |
-| Edit | Copy oligo (Ctrl+C), Copy oligo report, Add annotation from selection, Clear selection (Esc), Set selected row as reference, Clear reference, Settings… (Ctrl+,) |
+| File | New sequence… (Ctrl+N), Import FASTA… (Ctrl+O), Import metadata table…, Generate demo data, Export FASTA… (Ctrl+E), Extract selection to library, New folder, Close document (Ctrl+W), Exit |
+| Edit | Edit sequence… (single-sequence documents), Add annotation from selection…, Annotation properties…, Delete annotation… (Del), Copy oligo (Ctrl+C), Copy oligo report, Clear selection (Esc), Set selected row as reference, Clear reference, Settings… (Ctrl+,) |
 | View | Display options panel (show/hide, Ctrl+Shift+D; showing restores the default width), Reset panel sizes |
 | Tools | Map to reference… (Ctrl+M), Metadata from sequence names…, Oligo report for selection, Find sequence… (Ctrl+F), Go to position… (Ctrl+G) |
 
@@ -40,6 +40,12 @@ Entries that do not apply (e.g. without an open document or selection) are disab
    gaps are treated as missing data, not deletions. `key=value` and `[key=value]`
    tokens in FASTA descriptions become metadata. **Demo data** adds a synthetic
    35 kb × 2,000 genome set.
+   **New sequence** (File menu, Ctrl+N, or right-click free library space / a folder) creates
+   a document from typed or pasted text: a plain sequence (spaces, line breaks and GenBank
+   position numbers are ignored) or FASTA. A FASTA header fills in the name; several records
+   become a sequence list. Documents with a single sequence can be changed with **Edit
+   sequence…** (right-click the document, or the Edit menu); annotations keep their positions
+   and those past the new end are removed.
 2. **Open** a document from the library (double-click it). Icons distinguish folders,
    sequence lists, alignments and contigs. Organize the library in folders: **New folder**
    creates one inside the selected folder (or next to the selected document); **drag** a
@@ -47,9 +53,9 @@ Entries that do not apply (e.g. without an open document or selection) are disab
    entries to move it to the top level (hovering a collapsed folder expands it, the list
    scrolls at its edges, Escape cancels, invalid targets are marked red). **Move to…** does
    the same from a list. The chevron or a double-click expands/collapses a folder (remembered).
-   **Right-click** an entry for Open / Rename… / Delete… (documents) or Expand/Collapse /
-   New subfolder / Rename… / Delete folder… (folders), or free space for New folder /
-   Import FASTA…; deleting always asks for confirmation and warns that it cannot be undone.
+   **Right-click** an entry for Open / Edit sequence… / Rename… / Delete… (documents) or
+   Expand/Collapse / New sequence… / New subfolder / Rename… / Delete folder… (folders), or
+   free space for New sequence… / New folder / Import FASTA…; deleting always asks for confirmation and warns that it cannot be undone.
    **Ctrl+click** selects several entries; dragging one of them (or **Move to…**) moves all
    of them. Entries inside a selected folder move with it; a click on free space clears the
    selection. Deleting a folder keeps its contents (they move up one
@@ -62,12 +68,20 @@ Entries that do not apply (e.g. without an open document or selection) are disab
    1 / 2 / ≥3 mismatch counts, 3' end mismatches, sequences without coverage,
    mismatches per position, the most common target variants, and, when rows are
    grouped, inclusivity per group. Switch between consensus/reference as the source
-   and forward/reverse orientation. Add the selection as an annotation (forward
-   primer, reverse primer, probe, region).
-5. **Extract slice** (selection panel or oligo report): saves the selected columns of all
+   and forward/reverse orientation. The report opens on every selection while
+   **Open automatically** (next to the Oligo report button in the right panel) is checked.
+   **Right-click** the viewer for Add annotation…, Oligo report, Copy oligo, Extract selection
+   and Clear selection.
+5. **Annotations** (forward primer, reverse primer, probe, region): right-click → Add
+   annotation… (or the Edit menu) opens the properties dialog for the selected columns. Click
+   an annotation to select it (its columns become the selection); drag its edges to resize
+   it. Double-click it, right-click it or use ✎ in the side panel for the properties
+   dialog: name, type and range (reference positions, or columns without a reference).
+   Delete via right-click, the Delete key, the Edit menu or ✕; deleting asks for confirmation.
+6. **Extract slice** (selection panel or oligo report): saves the selected columns of all
    sequences, without the reference and with the original names, as a new library document
    next to the source. Sequences without bases in the range and empty columns are dropped.
-6. **Export** (File menu or Ctrl+E) all, shown or selected sequences, optionally only the selected
+7. **Export** (File menu or Ctrl+E) all, shown or selected sequences, optionally only the selected
    columns, gapped or ungapped, with reference and/or consensus.
 
 ### Viewer
@@ -83,6 +97,8 @@ Entries that do not apply (e.g. without an open document or selection) are disab
 | Overview | Top strip: conservation of the whole alignment; click or drag to navigate |
 | Select rows | Click names; Ctrl/Shift for several. Used for "Set selected row as reference", export and mapping subsets |
 | Groups | Group by any metadata field; click a group header to fold it |
+| Annotations | Click to select, drag an edge to resize, double-click for properties, Delete key to delete (with confirmation) |
+| Right-click | Viewer menu: annotation properties/delete (on an annotation), add annotation, oligo report, copy, extract, clear selection |
 | Escape | Close dialog/report, then clear the selection |
 
 Display options (right panel): consensus threshold (majority or 50–100 %), graph mode
@@ -102,7 +118,7 @@ split from sequence names at a delimiter.
 |---|---|
 | `model.rs` | Rows (start column + gapped data; outside = no coverage), documents, annotations, column statistics, consensus, identity/conservation, reference coordinates |
 | `seq.rs` | Normalization, IUPAC masks, reverse complement, GC, ambiguity expansion |
-| `fasta.rs` | FASTA I/O (rust-bio), description metadata, CSV/TSV tables |
+| `fasta.rs` | FASTA I/O (rust-bio), pasted sequence/FASTA text, description metadata, CSV/TSV tables |
 | `thermo.rs` | SantaLucia 1998 nearest-neighbor Tm, salt and Mg²⁺ correction (primer3 defaults, validated against primer3) |
 | `mapper/` | `index.rs` k-mer index, `align.rs` seed chaining (rust-bio `sdpkpp`) + DP gap filling (rust-bio pairwise), `contig.rs` insertion-aware merge and consensus target, `mod.rs` orchestration and fine tuning |
 | `primer.rs` | Oligo/selection evaluation |
@@ -110,7 +126,7 @@ split from sequence names at a delimiter.
 | `search.rs` | Motif search |
 | `db.rs` | SQLite library (documents, rows, annotations, folders, settings) |
 | `demo.rs` | Synthetic data |
-| `ui/` | iced application: `mod.rs` state/messages/update, `menu.rs` menu bar and drop-downs, `view.rs` layout and panels, `canvas.rs` alignment renderer, `dialogs.rs`, `state.rs` viewer state, `style.rs`, `job.rs` background jobs |
+| `ui/` | iced application: `mod.rs` state/messages/update, `menu.rs` menu bar and drop-downs, `view.rs` layout and panels, `canvas.rs` alignment renderer, `dialogs.rs` (incl. new/edit sequence), `state.rs` viewer state, `style.rs`, `job.rs` background jobs |
 
 ### Map to reference
 

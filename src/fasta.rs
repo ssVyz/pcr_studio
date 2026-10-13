@@ -47,15 +47,91 @@ pub fn read_fasta(path: &Path, progress: &dyn Fn(f32)) -> Result<Imported, Strin
     if rows.is_empty() {
         return Err(format!("{} contains no FASTA records", path.display()));
     }
-    // Aligned FASTA: gapped or all sequences share one (full) length.
-    let full_len = |r: &Row| r.start + r.data.len();
-    let same_len = rows.len() > 1 && {
-        let raw_lens: Vec<usize> = rows.iter().map(full_len).collect();
-        raw_lens.iter().all(|&l| l == raw_lens[0])
-    };
-    let kind = if any_gap || same_len { DocKind::Alignment } else { DocKind::Sequences };
+    let kind = alignment_kind(any_gap, &rows.iter().map(Row::end).collect::<Vec<_>>());
     let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Imported".into());
     Ok(Imported { name, kind, document: Document::new(rows) })
+}
+
+/// Aligned FASTA: gapped, or several sequences that all share one length.
+pub fn alignment_kind(any_gap: bool, lengths: &[usize]) -> DocKind {
+    let same_len = lengths.len() > 1 && lengths.iter().all(|&l| l == lengths[0]);
+    if any_gap || same_len { DocKind::Alignment } else { DocKind::Sequences }
+}
+
+/// Document kind for pasted records, decided as on FASTA import.
+pub fn pasted_kind(records: &[PastedRecord]) -> DocKind {
+    let any_gap = records.iter().any(|r| r.seq.contains(&seq::GAP));
+    alignment_kind(any_gap, &records.iter().map(|r| r.seq.len()).collect::<Vec<_>>())
+}
+
+/// One record of pasted or typed sequence text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PastedRecord {
+    /// FASTA header id (first word after `>`), `None` without a header.
+    pub id: Option<String>,
+    /// Rest of the header line.
+    pub description: String,
+    /// Sequence in the internal alphabet.
+    pub seq: Vec<u8>,
+    /// Characters that are not nucleotide codes and became `N`.
+    pub unknown: usize,
+}
+
+/// Parses pasted text: a plain sequence or FASTA records. Sequence characters
+/// are normalized as on FASTA import: whitespace and digits (GenBank/EMBL
+/// listings) are dropped, `U` becomes `T`, gaps are kept and anything unknown
+/// becomes `N`. Text before the first header is a record without a header.
+pub fn parse_pasted(text: &str) -> Vec<PastedRecord> {
+    let mut out: Vec<PastedRecord> = Vec::new();
+    let empty = || PastedRecord { id: None, description: String::new(), seq: Vec::new(), unknown: 0 };
+    for line in text.lines() {
+        if let Some(header) = line.trim_start().strip_prefix('>') {
+            let header = header.trim();
+            let (id, desc) = header.split_once(char::is_whitespace).unwrap_or((header, ""));
+            out.push(PastedRecord { id: (!id.is_empty()).then(|| id.to_string()), description: desc.trim().to_string(), ..empty() });
+            continue;
+        }
+        let mut chars = line.chars().filter(|c| !c.is_whitespace()).peekable();
+        if chars.peek().is_none() {
+            continue;
+        }
+        if out.is_empty() {
+            out.push(empty());
+        }
+        let rec = out.last_mut().unwrap();
+        for c in chars {
+            // Per character, so non-ASCII text becomes one N, not one per byte.
+            let Some(b) = (if c.is_ascii() { seq::normalize_byte(c as u8) } else { Some(b'N') }) else { continue };
+            if b == b'N' && !c.eq_ignore_ascii_case(&'n') {
+                rec.unknown += 1;
+            }
+            rec.seq.push(b);
+        }
+    }
+    out
+}
+
+/// Builds a document from pasted records. A single record gets `name` and
+/// `description`; several records keep their header names ("Sequence N"
+/// without a header) and descriptions. `key=value` tokens in descriptions
+/// become metadata, terminal gaps "no coverage", as on FASTA import.
+pub fn document_from_pasted(records: &[PastedRecord], name: &str, description: &str) -> (DocKind, Document) {
+    let single = records.len() == 1;
+    let rows: Vec<Row> = records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let (name, desc) = if single {
+                (name.to_string(), description.to_string())
+            } else {
+                (r.id.clone().unwrap_or_else(|| format!("Sequence {}", i + 1)), r.description.clone())
+            };
+            let mut row = Row::from_gapped(name, desc.clone(), r.seq.clone());
+            row.meta = parse_description_meta(&desc);
+            row
+        })
+        .collect();
+    (pasted_kind(records), Document::new(rows))
 }
 
 struct CountingReader<R> {
@@ -231,6 +307,46 @@ mod tests {
         let imp = read_fasta(&p, &|_| {}).unwrap();
         assert_eq!(imp.kind, DocKind::Sequences);
         let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn pasted_plain_and_genbank() {
+        // GenBank ORIGIN listing: numbers and spaces are ignored, case and U normalized.
+        let recs = parse_pasted("        1 acgtacgtac gtnnu\n       16 ACG\u{a0}T\r\n");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].id, None);
+        assert_eq!(recs[0].seq, b"ACGTACGTACGTNNTACGT");
+        assert_eq!(recs[0].unknown, 0);
+        // Unknown characters become N and are counted; non-ASCII counts once.
+        let recs = parse_pasted("AC-GJ?–T");
+        assert_eq!(recs[0].seq, b"AC-GNNNT");
+        assert_eq!(recs[0].unknown, 3);
+        assert!(parse_pasted(" \n\n").is_empty());
+    }
+
+    #[test]
+    fn pasted_fasta_records() {
+        let recs = parse_pasted("\n>s1 [host=human] demo\nACGT\nAC\n> \nGG\n>s3\n");
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].id.as_deref(), Some("s1"));
+        assert_eq!(recs[0].description, "[host=human] demo");
+        assert_eq!(recs[0].seq, b"ACGTAC");
+        assert_eq!(recs[1].id, None);
+        assert!(recs[2].seq.is_empty());
+        let (kind, doc) = document_from_pasted(&recs[..2], "ignored", "");
+        assert_eq!(kind, DocKind::Sequences);
+        assert_eq!(doc.rows[0].name, "s1");
+        assert_eq!(doc.rows[0].meta_value("host"), Some("human"));
+        assert_eq!(doc.rows[1].name, "Sequence 2");
+        // A single record takes the given name and description.
+        let (kind, doc) = document_from_pasted(&recs[..1], "My seq", "year=2020");
+        assert_eq!(kind, DocKind::Sequences);
+        assert_eq!((doc.rows[0].name.as_str(), doc.rows[0].meta_value("year")), ("My seq", Some("2020")));
+        // Gaps or equal lengths make an alignment, as on import.
+        let (kind, doc) = document_from_pasted(&parse_pasted("--AC-GT"), "g", "");
+        assert_eq!((kind, doc.rows[0].start, doc.width), (DocKind::Alignment, 2, 7));
+        let (kind, _) = document_from_pasted(&parse_pasted(">a\nACGT\n>b\nTTTT"), "x", "");
+        assert_eq!(kind, DocKind::Alignment);
     }
 
     #[test]

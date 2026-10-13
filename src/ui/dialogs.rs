@@ -1,11 +1,15 @@
-//! Modal dialogs: map to reference, export, settings, rename, confirmations.
+//! Modal dialogs: new/edit sequence, map to reference, export, settings,
+//! rename, confirmations.
 
+use super::canvas::group_digits;
 use super::state::OpenDoc;
 use super::{AppSettings, Message, style};
+use crate::fasta::{self, PastedRecord};
 use crate::mapper::{MapParams, Sensitivity};
-use crate::model::DocInfo;
-use iced::widget::{Space, button, checkbox, column, container, pick_list, row, rule, text, text_input};
-use iced::{Element, Fill, Length, Task};
+use crate::model::{AnnotationKind, DocInfo, DocKind, RefCoords, Row};
+use crate::seq::{self, GAP};
+use iced::widget::{Space, button, checkbox, column, container, pick_list, row, rule, text, text_editor, text_input};
+use iced::{Element, Fill, Font, Length, Task};
 
 /// Id of the rename text field, focused when the dialog opens.
 pub const RENAME_INPUT: &str = "rename-input";
@@ -15,7 +19,26 @@ pub fn focus_rename<T: Send + 'static>() -> Task<T> {
     Task::batch([iced::widget::operation::focus(RENAME_INPUT), iced::widget::operation::select_all(RENAME_INPUT)])
 }
 
+/// Id of the sequence text box of the new/edit sequence dialog.
+pub const SEQUENCE_INPUT: &str = "sequence-input";
+
+/// Focuses the sequence text box (ready for pasting).
+pub fn focus_sequence<T: Send + 'static>() -> Task<T> {
+    iced::widget::operation::focus(SEQUENCE_INPUT)
+}
+
+/// Id of the annotation name field, focused when the dialog opens.
+pub const ANNOTATION_NAME: &str = "annotation-name";
+
+/// Focuses the annotation name and selects its text.
+pub fn focus_annotation<T: Send + 'static>() -> Task<T> {
+    Task::batch([iced::widget::operation::focus(ANNOTATION_NAME), iced::widget::operation::select_all(ANNOTATION_NAME)])
+}
+
 pub enum Modal {
+    Sequence(SequenceDialog),
+    Annotation(AnnotationDialog),
+    ConfirmDeleteAnnotation { id: i64, name: String, detail: String },
     Map(MapDialog),
     Export(ExportDialog),
     Settings(SettingsDialog),
@@ -34,6 +57,419 @@ pub enum ModalMsg {
     KeysInput(String),
     ApplyNameFields,
     DismissError,
+}
+
+// ---------------------------------------------------------------- new / edit sequence
+
+/// The single-sequence document edited by the sequence dialog.
+pub struct EditTarget {
+    pub id: i64,
+    pub doc_name: String,
+    pub kind: DocKind,
+    /// The stored sequence (name, description, metadata, placement).
+    pub row: Row,
+    /// End columns of the document's annotations.
+    pub annotation_ends: Vec<usize>,
+}
+
+impl EditTarget {
+    /// The stored sequence with its leading gaps, as shown in the text box.
+    fn gapped(&self) -> Vec<u8> {
+        let mut v = vec![GAP; self.row.start];
+        v.extend_from_slice(&self.row.data);
+        v
+    }
+}
+
+/// Creates a document from typed or pasted text (plain sequence or FASTA), or
+/// edits the sequence of a single-sequence document.
+pub struct SequenceDialog {
+    /// `None`: create a new document.
+    pub edit: Option<EditTarget>,
+    /// Folder that receives a new document.
+    pub folder: Option<i64>,
+    pub name: String,
+    pub description: String,
+    pub content: text_editor::Content,
+    /// The parsed text, refreshed on every edit.
+    pub records: Vec<PastedRecord>,
+    /// Name and description last suggested (FASTA header or stored values);
+    /// they follow the text until the user edits the fields.
+    suggested: (String, String),
+    /// Summary of the parsed text and notes, computed on edits (not per frame).
+    summary: String,
+    notes: Vec<String>,
+    /// Record names and lengths when several records were entered.
+    listing: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SequenceMsg {
+    Name(String),
+    Description(String),
+    Edit(text_editor::Action),
+}
+
+/// Bases per line when an existing sequence is shown for editing.
+const EDIT_LINE: usize = 60;
+
+impl SequenceDialog {
+    pub fn create(folder: Option<i64>) -> SequenceDialog {
+        Self::with(None, folder, String::new())
+    }
+
+    pub fn edit(target: EditTarget) -> SequenceDialog {
+        let text = target.gapped().chunks(EDIT_LINE).map(String::from_utf8_lossy).collect::<Vec<_>>().join("\n");
+        Self::with(Some(target), None, text)
+    }
+
+    fn with(edit: Option<EditTarget>, folder: Option<i64>, text: String) -> SequenceDialog {
+        let mut d = SequenceDialog {
+            edit,
+            folder,
+            name: String::new(),
+            description: String::new(),
+            content: text_editor::Content::with_text(&text),
+            records: Vec::new(),
+            suggested: (String::new(), String::new()),
+            summary: String::new(),
+            notes: Vec::new(),
+            listing: Vec::new(),
+        };
+        d.suggested = d.base_suggestion();
+        (d.name, d.description) = d.suggested.clone();
+        d.refresh();
+        d
+    }
+
+    /// Name and description without a FASTA header: empty, or the stored ones.
+    fn base_suggestion(&self) -> (String, String) {
+        match &self.edit {
+            Some(t) => (t.doc_name.clone(), t.row.description.clone()),
+            None => (String::new(), String::new()),
+        }
+    }
+
+    pub fn update(&mut self, m: SequenceMsg) {
+        match m {
+            SequenceMsg::Name(s) => self.name = s,
+            SequenceMsg::Description(s) => self.description = s,
+            SequenceMsg::Edit(action) => {
+                let edit = action.is_edit();
+                self.content.perform(action);
+                if edit {
+                    self.refresh();
+                }
+            }
+        }
+    }
+
+    /// Re-parses the text; a single FASTA header fills in name and description
+    /// unless the user changed them.
+    fn refresh(&mut self) {
+        self.records = fasta::parse_pasted(&self.content.text());
+        let suggestion = match self.records.as_slice() {
+            [r] if r.id.is_some() => (r.id.clone().unwrap_or_default(), r.description.clone()),
+            _ => self.base_suggestion(),
+        };
+        if self.name == self.suggested.0 {
+            self.name = suggestion.0.clone();
+        }
+        if self.description == self.suggested.1 {
+            self.description = suggestion.1.clone();
+        }
+        self.suggested = suggestion;
+
+        self.notes.clear();
+        self.listing.clear();
+        let unknown: usize = self.records.iter().map(|r| r.unknown).sum();
+        self.summary = match self.records.as_slice() {
+            [] => String::new(),
+            [r] => {
+                let bases = r.seq.iter().filter(|&&b| b != GAP).count();
+                let gaps = r.seq.len() - bases;
+                let ambiguous = r.seq.iter().filter(|&&b| b != GAP && !seq::is_acgt(b)).count();
+                let mut s = format!("{} bp · GC {:.1}%", group_digits(bases), seq::gc_percent(&r.seq));
+                if ambiguous > 0 {
+                    s.push_str(&format!(" · {} ambiguous (N, R, Y…)", group_digits(ambiguous)));
+                }
+                if gaps > 0 {
+                    s.push_str(&format!(" · {} gaps", group_digits(gaps)));
+                }
+                s
+            }
+            recs => {
+                let lens: Vec<usize> = recs.iter().map(|r| r.seq.iter().filter(|&&b| b != GAP).count()).collect();
+                let (min, max) = (lens.iter().min().copied().unwrap_or(0), lens.iter().max().copied().unwrap_or(0));
+                let range = if min == max { format!("{} bp each", group_digits(min)) } else { format!("{}–{} bp", group_digits(min), group_digits(max)) };
+                const SHOWN: usize = 6;
+                for (i, (r, len)) in recs.iter().zip(&lens).take(SHOWN).enumerate() {
+                    let name = r.id.clone().unwrap_or_else(|| format!("Sequence {}", i + 1));
+                    self.listing.push(format!("{name} · {} bp", group_digits(*len)));
+                }
+                if recs.len() > SHOWN {
+                    self.listing.push(format!("… {} more", recs.len() - SHOWN));
+                }
+                format!("{} sequences · {range} → new {}", recs.len(), fasta::pasted_kind(recs).label().to_lowercase())
+            }
+        };
+        if unknown > 0 {
+            self.notes.push(format!("{} character(s) that are not nucleotide codes will be stored as N.", group_digits(unknown)));
+        }
+        if let (Some(t), [r]) = (&self.edit, self.records.as_slice())
+            && !t.annotation_ends.is_empty()
+            && r.seq != t.gapped()
+        {
+            let end = r.seq.iter().rposition(|&b| b != GAP).map_or(0, |p| p + 1);
+            let n = t.annotation_ends.len();
+            let dropped = t.annotation_ends.iter().filter(|&&e| e > end).count();
+            let mut note = if n == 1 {
+                "This document has 1 annotation; its position is not shifted when bases are inserted or removed.".to_string()
+            } else {
+                format!("This document has {n} annotations; their positions are not shifted when bases are inserted or removed.")
+            };
+            note.push_str(&match (n, dropped) {
+                (_, 0) => String::new(),
+                (1, _) => " It extends past the new end and will be removed.".into(),
+                (_, 1) => " 1 of them extends past the new end and will be removed.".into(),
+                (_, d) => format!(" {d} of them extend past the new end and will be removed."),
+            });
+            self.notes.push(note);
+        }
+    }
+
+    /// Why the dialog cannot be confirmed yet.
+    pub fn problem(&self) -> Option<String> {
+        if self.records.is_empty() {
+            return Some("Type or paste a sequence.".into());
+        }
+        if let Some((i, r)) = self.records.iter().enumerate().find(|(_, r)| r.seq.iter().all(|&b| b == GAP)) {
+            let name = r.id.clone().unwrap_or_else(|| format!("Sequence {}", i + 1));
+            return Some(if self.records.len() == 1 { "The record has no sequence yet.".into() } else { format!("“{name}” has no sequence.") });
+        }
+        if self.edit.is_some() && self.records.len() > 1 {
+            return Some(format!(
+                "{} records found: this document holds one sequence. Use File → New sequence… to create a sequence list.",
+                self.records.len()
+            ));
+        }
+        if self.name.trim().is_empty() {
+            return Some("Enter a name.".into());
+        }
+        None
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let s = Message::Sequence;
+        let multi = self.records.len() > 1;
+        let label = |t: &'static str| text(t).size(13).width(Length::Fixed(96.0));
+        let name_hint = match (&self.edit, multi) {
+            (None, true) => "Name of the new document",
+            _ => "Name (or taken from a FASTA header)",
+        };
+        // The widget structure stays the same in every mode: a changed layout
+        // in front of the text box would reset it and drop its focus.
+        let list = multi && self.edit.is_none();
+        let description = if list {
+            text_input("Taken from each FASTA header", "").padding(6)
+        } else {
+            text_input("Optional; key=value pairs become metadata", &self.description)
+                .on_input(move |v| s(SequenceMsg::Description(v)))
+                .on_submit(Message::SaveSequence)
+                .padding(6)
+        };
+        let name = text_input(name_hint, &self.name).on_input(move |v| s(SequenceMsg::Name(v))).on_submit(Message::SaveSequence).padding(6);
+        let mut body = column![
+            row![label(if list { "Document" } else { "Name" }), name].spacing(8).align_y(iced::Center),
+            row![label("Description"), description].spacing(8).align_y(iced::Center),
+        ]
+        .spacing(10);
+        body = body.push(
+            text_editor(&self.content)
+                .id(SEQUENCE_INPUT)
+                .placeholder("Paste or type a nucleotide sequence, or FASTA text with one or more records")
+                .on_action(move |a| s(SequenceMsg::Edit(a)))
+                .font(Font::MONOSPACE)
+                .size(13)
+                .padding(8)
+                .height(Length::Fixed(300.0))
+                .wrapping(text::Wrapping::WordOrGlyph),
+        );
+        let help = if self.edit.is_some() {
+            "Spaces, line breaks and numbers are ignored; U becomes T; other characters that are not nucleotide codes become N."
+        } else {
+            "Spaces, line breaks and numbers (GenBank listings) are ignored; U becomes T; other characters that are not nucleotide codes become N. \
+             A FASTA header (>name description) fills in the name; several records create a sequence list."
+        };
+        body = body.push(text(help).size(12).style(style::muted));
+        // Always one summary line, so the dialog does not jump on the first key.
+        body = body.push(text(if self.summary.is_empty() { "0 bp" } else { self.summary.as_str() }).size(13).font(Font {
+            weight: iced::font::Weight::Semibold,
+            ..Font::DEFAULT
+        }));
+        if !self.listing.is_empty() {
+            body = body.push(column(self.listing.iter().map(|l| text(l.as_str()).size(12).font(Font::MONOSPACE).into())).spacing(1));
+        }
+        for n in &self.notes {
+            body = body.push(text(n.as_str()).size(12).style(|t: &iced::Theme| text::Style { color: Some(t.extended_palette().danger.base.color) }));
+        }
+        let problem = self.problem();
+        let confirm = if self.edit.is_some() { "Save" } else { "Create" };
+        let buttons = row![
+            text(problem.clone().unwrap_or_default()).size(12).style(style::muted).width(Fill),
+            button("Cancel").on_press(Message::CloseModal).style(button::secondary),
+            button(confirm).on_press_maybe(problem.is_none().then_some(Message::SaveSequence)).style(button::primary),
+        ]
+        .spacing(10)
+        .align_y(iced::Center);
+        let title = if self.edit.is_some() { "Edit sequence" } else { "New sequence" };
+        dialog_frame(title, body.into(), buttons.into(), 660.0)
+    }
+}
+
+// ---------------------------------------------------------------- annotation properties
+
+/// Creates an annotation from the selection or edits one: name, type, range.
+pub struct AnnotationDialog {
+    /// `None`: a new annotation.
+    pub id: Option<i64>,
+    pub name: String,
+    pub kind: AnnotationKind,
+    pub start: String,
+    pub end: String,
+    /// Columns and field texts when the dialog opened. A field the user does
+    /// not change keeps its column (reference positions cannot address
+    /// insertion columns).
+    initial: (usize, usize, String, String),
+    /// Reference coordinates of the range fields; `None`: alignment columns.
+    coords: Option<RefCoords>,
+    width: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum AnnotationMsg {
+    Name(String),
+    Kind(AnnotationKind),
+    Start(String),
+    End(String),
+}
+
+/// Range fields for columns `[c0, c1)`: 1-based reference positions, or columns.
+fn range_text(c0: usize, c1: usize, coords: Option<&RefCoords>) -> (String, String) {
+    match coords.and_then(|rc| rc.range(c0, c1)) {
+        Some((a, b)) => (a.to_string(), b.to_string()),
+        None => ((c0 + 1).to_string(), c1.to_string()),
+    }
+}
+
+impl AnnotationDialog {
+    pub fn new(id: Option<i64>, name: String, kind: AnnotationKind, c0: usize, c1: usize, od: &OpenDoc) -> AnnotationDialog {
+        // Reference positions when the range holds reference bases.
+        let coords = od.ref_coords.clone().filter(|rc| rc.range(c0, c1).is_some());
+        let (start, end) = range_text(c0, c1, coords.as_ref());
+        AnnotationDialog {
+            id,
+            name,
+            kind,
+            initial: (c0, c1, start.clone(), end.clone()),
+            start,
+            end,
+            coords,
+            width: od.width(),
+        }
+    }
+
+    pub fn update(&mut self, m: AnnotationMsg) {
+        match m {
+            AnnotationMsg::Name(s) => self.name = s,
+            AnnotationMsg::Kind(k) => self.kind = k,
+            AnnotationMsg::Start(s) => self.start = s,
+            AnnotationMsg::End(s) => self.end = s,
+        }
+    }
+
+    /// The range as columns `[c0, c1)`, or why the fields are invalid.
+    pub fn range(&self) -> Result<(usize, usize), String> {
+        let parse = |s: &str, what: &str| s.trim().replace(',', "").parse::<usize>().map_err(|_| format!("{what} must be a whole number."));
+        let (p0, p1) = (parse(&self.start, "Start")?, parse(&self.end, "End")?);
+        let max = self.coords.as_ref().map_or(self.width, |rc| rc.col_of.len());
+        if p0 < 1 || p1 > max {
+            return Err(format!("The range must lie within 1–{}.", group_digits(max)));
+        }
+        if p1 < p0 {
+            return Err("The end must not be before the start.".into());
+        }
+        let (c0, c1) = match &self.coords {
+            Some(rc) => rc.columns(p0, p1).ok_or("Invalid range.")?,
+            None => (p0 - 1, p1),
+        };
+        let (i0, i1, s0, s1) = &self.initial;
+        let c0 = if self.start.trim() == s0 { *i0 } else { c0 };
+        let c1 = if self.end.trim() == s1 { *i1 } else { c1 };
+        if c1 <= c0 {
+            return Err("The end must not be before the start.".into());
+        }
+        Ok((c0, c1))
+    }
+
+    pub fn problem(&self) -> Option<String> {
+        if self.name.trim().is_empty() {
+            return Some("Enter a name.".into());
+        }
+        self.range().err()
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let a = Message::AnnotationEdit;
+        let label = |t: &'static str| text(t).size(13).width(Length::Fixed(96.0));
+        let unit = if self.coords.is_some() { "reference position" } else { "alignment column" };
+        let field = |value: &str, f: fn(String) -> AnnotationMsg| {
+            text_input("", value).on_input(move |s| a(f(s))).on_submit(Message::SaveAnnotation).padding(6).width(110)
+        };
+        let info: Element<Message> = match self.range() {
+            Ok((c0, c1)) => {
+                let cols = format!("{} column(s), {}–{}", group_digits(c1 - c0), group_digits(c0 + 1), group_digits(c1));
+                let s = match &self.coords {
+                    Some(rc) => {
+                        let bases = (c0..c1).filter(|&c| rc.is_base[c]).count();
+                        format!("{} reference bases · {cols}", group_digits(bases))
+                    }
+                    None => cols,
+                };
+                text(s).size(12).style(style::muted).into()
+            }
+            Err(e) => text(e).size(12).style(|t: &iced::Theme| text::Style { color: Some(t.extended_palette().danger.base.color) }).into(),
+        };
+        let body = column![
+            row![
+                label("Name"),
+                text_input("Annotation name", &self.name)
+                    .id(ANNOTATION_NAME)
+                    .on_input(move |s| a(AnnotationMsg::Name(s)))
+                    .on_submit(Message::SaveAnnotation)
+                    .padding(6)
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+            row![label("Type"), pick_list(&AnnotationKind::ALL[..], Some(self.kind), move |k| a(AnnotationMsg::Kind(k))).width(Fill)]
+                .spacing(8)
+                .align_y(iced::Center),
+            row![label("Range"), field(&self.start, AnnotationMsg::Start), text("to").size(13), field(&self.end, AnnotationMsg::End), text(unit).size(12).style(style::muted)]
+                .spacing(8)
+                .align_y(iced::Center),
+            row![Space::new().width(Length::Fixed(104.0)), info],
+        ]
+        .spacing(10);
+        let mut buttons = row![].spacing(10).align_y(iced::Center);
+        if let Some(id) = self.id {
+            buttons = buttons.push(button("Delete…").on_press(Message::AskDeleteAnnotation(id)).style(button::danger));
+        }
+        let ok = self.problem().is_none();
+        buttons = buttons.push(Space::new().width(Fill)).push(button("Cancel").on_press(Message::CloseModal).style(button::secondary)).push(
+            button(if self.id.is_some() { "Save" } else { "Add" }).on_press_maybe(ok.then_some(Message::SaveAnnotation)).style(button::primary),
+        );
+        dialog_frame(if self.id.is_some() { "Annotation properties" } else { "New annotation" }, body.into(), buttons.into(), 520.0)
+    }
 }
 
 // ---------------------------------------------------------------- mapping
@@ -581,6 +1017,23 @@ pub fn dialog_frame<'a>(title: &'a str, body: Element<'a, Message>, buttons: Ele
 
 pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
     match modal {
+        Modal::Sequence(d) => d.view(),
+        Modal::Annotation(d) => d.view(),
+        Modal::ConfirmDeleteAnnotation { id, name, detail } => {
+            let body = column![
+                text(format!("Delete the annotation “{name}”?")).size(14),
+                text(detail.as_str()).size(12).style(style::muted),
+                irreversible("The annotation is removed permanently."),
+            ]
+            .spacing(10);
+            let buttons = row![
+                Space::new().width(Fill),
+                button("Cancel").on_press(Message::CloseModal).style(button::secondary),
+                button("Delete").on_press(Message::DeleteAnnotation(*id)).style(button::danger),
+            ]
+            .spacing(10);
+            dialog_frame("Delete annotation", body.into(), buttons.into(), 420.0)
+        }
         Modal::Map(d) => d.view(),
         Modal::Export(d) => d.view(),
         Modal::Settings(d) => d.view(),
@@ -661,5 +1114,54 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
             let buttons = row![Space::new().width(Fill), button("OK").on_press(Message::CloseModal).style(button::primary)];
             dialog_frame(title.as_str(), body.into(), buttons.into(), 480.0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::state::ViewPrefs;
+    use super::*;
+    use crate::model::Document;
+
+    fn open(rows: &[&str], reference: Option<usize>) -> OpenDoc {
+        let doc = Document::new(rows.iter().enumerate().map(|(i, s)| Row::from_gapped(format!("s{i}"), String::new(), s.as_bytes().to_vec())).collect());
+        let info = DocInfo {
+            id: 1,
+            name: "d".into(),
+            kind: DocKind::Alignment,
+            n_rows: doc.rows.len(),
+            width: doc.width,
+            reference,
+            created: String::new(),
+            description: String::new(),
+            folder: None,
+        };
+        OpenDoc::new(info, doc, Vec::new(), &ViewPrefs::default())
+    }
+
+    #[test]
+    fn annotation_range_fields() {
+        // Reference positions; the reference has an insertion at columns 2-3.
+        let od = open(&["AC--GTAC", "ACTTGTAC"], Some(0));
+        let mut d = AnnotationDialog::new(None, "a".into(), AnnotationKind::Region, 1, 5, &od);
+        assert_eq!((d.start.as_str(), d.end.as_str()), ("2", "3"));
+        assert_eq!(d.range(), Ok((1, 5)));
+        // A changed field is converted; the unchanged one keeps its column.
+        d.end = "5".into();
+        assert_eq!(d.range(), Ok((1, 7)));
+        d.start = "4".into();
+        d.end = "3".into();
+        assert!(d.range().is_err());
+        d.start = "1".into();
+        d.end = "7".into();
+        assert!(d.range().is_err());
+        // Without a reference the fields are alignment columns.
+        let od = open(&["ACGT", "ACGA"], None);
+        let mut d = AnnotationDialog::new(Some(3), "b".into(), AnnotationKind::Probe, 0, 2, &od);
+        assert_eq!((d.start.as_str(), d.end.as_str()), ("1", "2"));
+        d.end = "4".into();
+        assert_eq!(d.range(), Ok((0, 4)));
+        d.name = " ".into();
+        assert_eq!(d.problem().as_deref(), Some("Enter a name."));
     }
 }

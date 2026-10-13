@@ -463,6 +463,25 @@ impl RefCoords {
         let i = pos.clamp(1, self.col_of.len()) - 1;
         Some(self.col_of[i] as usize)
     }
+
+    /// 1-based reference range covered by columns `[c0, c1)`; `None` if they
+    /// contain no reference base.
+    pub fn range(&self, c0: usize, c1: usize) -> Option<(u32, u32)> {
+        let c1 = c1.min(self.pos_at.len());
+        if c0 >= c1 {
+            return None;
+        }
+        let first = (c0..c1).find(|&c| self.is_base[c]).map(|c| self.pos_at[c])?;
+        Some((first, self.pos_at[c1 - 1]))
+    }
+
+    /// Columns `[c0, c1)` from the first to the last base of the 1-based
+    /// reference positions `p0..=p1`; `None` outside the reference.
+    pub fn columns(&self, p0: usize, p1: usize) -> Option<(usize, usize)> {
+        let a = *self.col_of.get(p0.checked_sub(1)?)? as usize;
+        let b = *self.col_of.get(p1.checked_sub(1)?)? as usize;
+        (p0 <= p1).then_some((a, b + 1))
+    }
 }
 
 #[cfg(test)]
@@ -551,5 +570,13 @@ mod tests {
         let rc = RefCoords::new(&r, 6);
         assert_eq!(rc.pos_at, vec![1, 2, 2, 2, 3, 4]);
         assert_eq!(rc.column_of(3), Some(4));
+        // Ranges: insertion columns map to the preceding base.
+        assert_eq!(rc.range(1, 5), Some((2, 3)));
+        assert_eq!(rc.range(2, 4), None);
+        assert_eq!(rc.columns(2, 3), Some((1, 5)));
+        assert_eq!(rc.columns(1, 4), Some((0, 6)));
+        assert_eq!(rc.columns(0, 2), None);
+        assert_eq!(rc.columns(3, 5), None);
+        assert_eq!(rc.columns(3, 2), None);
     }
 }
