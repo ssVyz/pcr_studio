@@ -81,8 +81,10 @@ Entries that do not apply (e.g. without an open document or selection) are disab
 6. **Extract slice** (selection panel or oligo report): saves the selected columns of all
    sequences, without the reference and with the original names, as a new library document
    next to the source. Sequences without bases in the range and empty columns are dropped.
+   With **Collapse gaps** on, the columns where the reference has a gap are left out too.
 7. **Export** (File menu or Ctrl+E) all, shown or selected sequences, optionally only the selected
-   columns, gapped or ungapped, with reference and/or consensus.
+   columns, gapped or ungapped, with reference and/or consensus, optionally without the
+   columns where the reference has a gap (preset while **Collapse gaps** is on).
 
 ### Viewer
 
@@ -95,6 +97,7 @@ Entries that do not apply (e.g. without an open document or selection) are disab
 | Jump | Position box: reference position (or column when there is no reference); a range selects it |
 | Search | IUPAC motif with 0–3 mismatches, both strands, in reference, consensus or all sequences; Enter or ‹ › cycles through hits |
 | Overview | Top strip: conservation of the whole alignment; click or drag to navigate |
+| Collapse gaps | Right panel (needs a reference): hides the columns where the reference has a gap, i.e. insertions in the other sequences, so the view follows reference coordinates. A ▼ on the ruler marks where columns are hidden; selections and annotations snap to the shown columns. Off by default. |
 | Select rows | Click names; Ctrl/Shift for several. Used for "Set selected row as reference", export and mapping subsets |
 | Groups | Group by any metadata field; click a group header to fold it |
 | Annotations | Click to select, drag an edge to resize, double-click for properties, Delete key to delete (with confirmation) |

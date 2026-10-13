@@ -1,7 +1,7 @@
 //! State of the open document and the viewer.
 
 use crate::display::{self, DisplayOptions, Item};
-use crate::model::{Annotation, ColumnStats, ConsensusThreshold, DocInfo, Document, RefCoords};
+use crate::model::{Annotation, ColumnMap, ColumnStats, ConsensusThreshold, DocInfo, Document, RefCoords};
 use crate::primer::{OligoSource, PrimerOptions, PrimerReport};
 use crate::search::{Hit, Scope};
 use crate::seq::GAP;
@@ -64,6 +64,8 @@ pub struct ViewPrefs {
     pub graph: GraphMode,
     /// Open the oligo report whenever columns are selected.
     pub auto_report: bool,
+    /// Hide the columns where the reference has a gap (or no coverage).
+    pub collapse_gaps: bool,
 }
 
 impl Default for ViewPrefs {
@@ -81,6 +83,7 @@ impl Default for ViewPrefs {
             color_bases: true,
             graph: GraphMode::Conservation,
             auto_report: true,
+            collapse_gaps: false,
         }
     }
 }
@@ -191,6 +194,8 @@ pub struct OpenDoc {
     pub identity: Vec<Option<f32>>,
     pub conservation: Vec<Option<f32>>,
     pub ref_coords: Option<RefCoords>,
+    /// Columns shown in the viewer; the viewport counts display columns.
+    pub cols: ColumnMap,
     pub row_identity: Option<Vec<f32>>,
     pub meta_keys: Vec<String>,
     pub display: DisplayOptions,
@@ -226,6 +231,7 @@ impl OpenDoc {
             identity: Vec::new(),
             conservation: Vec::new(),
             ref_coords: None,
+            cols: ColumnMap::default(),
             row_identity: None,
             meta_keys,
             display: DisplayOptions::default(),
@@ -255,6 +261,49 @@ impl OpenDoc {
         self.doc.width
     }
 
+    /// Number of columns in the viewer (fewer than `width` with gaps collapsed).
+    pub fn view_width(&self) -> usize {
+        self.cols.len()
+    }
+
+    /// Flags of the columns slices and exports keep: the reference's bases
+    /// while gaps are collapsed, otherwise `None` (all columns).
+    pub fn kept_columns(&self) -> Option<&[bool]> {
+        self.ref_coords.as_ref().filter(|_| self.cols.is_subset()).map(|rc| rc.is_base.as_slice())
+    }
+
+    /// Shows all columns, or (`collapse` with a reference) only those where
+    /// the reference has a base. The column at the center of the view stays
+    /// there; a view zoomed to fit the width stays fitted.
+    pub fn update_columns(&mut self, collapse: bool) {
+        let center = (self.vp.scroll_x + self.vp.visible_cols() / 2.0).max(0.0);
+        let c = self.cols.col(center as usize);
+        let fit = !self.cols.is_empty() && self.vp.col_w <= self.vp.min_col_w(self.cols.len()) * 1.001;
+        self.cols = match (&self.ref_coords, collapse) {
+            (Some(rc), true) => ColumnMap::only(&rc.is_base),
+            _ => ColumnMap::all(self.doc.width),
+        };
+        if fit {
+            self.vp.col_w = self.vp.min_col_w(self.cols.len());
+        }
+        self.vp.scroll_x = self.cols.disp(c) as f32 + center.fract() - self.vp.visible_cols() / 2.0;
+        self.clamp_view();
+    }
+
+    /// Scrolls horizontally so that columns `[c0, c1)` are visible (centered if needed).
+    pub fn reveal_cols(&mut self, c0: usize, c1: usize) {
+        let d0 = self.cols.disp(c0);
+        self.vp.reveal_col(d0, self.cols.disp(c1).max(d0 + 1));
+        self.clamp_view();
+    }
+
+    /// Centers the view on columns `[c0, c1)`.
+    pub fn center_on(&mut self, c0: usize, c1: usize) {
+        let mid = (self.cols.disp(c0) + self.cols.disp(c1)) as f32 / 2.0;
+        self.vp.scroll_x = mid - self.vp.visible_cols() / 2.0;
+        self.clamp_view();
+    }
+
     /// The per-column values shown in the graph for the chosen mode.
     pub fn graph_track(&self, mode: GraphMode) -> &[Option<f32>] {
         match mode {
@@ -268,6 +317,7 @@ impl OpenDoc {
         self.stats = ColumnStats::compute(&self.doc, self.reference);
         self.consensus = self.stats.consensus(prefs.threshold, b' ');
         self.ref_coords = self.reference.map(|r| RefCoords::new(&self.doc.rows[r], self.doc.width));
+        self.update_columns(prefs.collapse_gaps);
         self.recompute_graphs(prefs);
         self.row_identity = None;
     }
@@ -379,7 +429,7 @@ impl OpenDoc {
 
     pub fn clamp_view(&mut self) {
         let h = self.content_h();
-        self.vp.clamp(self.doc.width, h);
+        self.vp.clamp(self.cols.len(), h);
     }
 
     /// Scrolls vertically so that item `i` is visible.

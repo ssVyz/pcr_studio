@@ -274,6 +274,7 @@ pub enum Message {
     CopyReport,
     /// Open the oligo report whenever columns are selected.
     ToggleAutoReport(bool),
+    ToggleCollapseGaps(bool),
     /// Properties dialog for a new annotation on the selected columns.
     NewAnnotation,
     AnnotationProperties(i64),
@@ -959,7 +960,11 @@ impl App {
                             loaded.open.vp.seq_w = old.vp.seq_w;
                             loaded.open.vp.rows_h = old.vp.rows_h;
                         }
-                        let od = loaded.open;
+                        let mut od = loaded.open;
+                        // The setting may have changed while loading.
+                        if od.cols.is_subset() != (self.settings.view.collapse_gaps && od.reference.is_some()) {
+                            od.update_columns(self.settings.view.collapse_gaps);
+                        }
                         self.status = format!(
                             "Opened “{}”: {} sequences, {} columns",
                             od.info.name,
@@ -1089,7 +1094,7 @@ impl App {
             Message::ZoomIn => self.zoom_by(1.5),
             Message::ZoomOut => self.zoom_by(1.0 / 1.5),
             Message::ZoomFit => self.with_doc(|od, _| {
-                od.vp.col_w = od.vp.min_col_w(od.width());
+                od.vp.col_w = od.vp.min_col_w(od.view_width());
                 od.clamp_view();
             }),
             Message::ZoomLetters => self.with_doc(|od, _| {
@@ -1215,6 +1220,17 @@ impl App {
                     }
             }
             Message::ToggleAutoReport(b) => self.set_pref(|p| p.auto_report = b),
+            Message::ToggleCollapseGaps(b) => {
+                self.set_pref(|p| p.collapse_gaps = b);
+                self.with_doc(|od, _| od.update_columns(b));
+                if let Some(od) = self.open.as_ref().filter(|o| o.ref_coords.is_some()) {
+                    self.status = if b {
+                        format!("Collapsed {} column(s) with gaps in the reference", canvas::group_digits(od.cols.hidden()))
+                    } else {
+                        "Showing all columns".into()
+                    };
+                }
+            }
             Message::NewAnnotation => {
                 let Some(od) = self.open.as_ref() else { return Task::none() };
                 let Some(sel) = od.selection else {
@@ -1432,7 +1448,7 @@ impl App {
         }
         let auto_report = self.settings.view.auto_report;
         let Some(od) = self.open.as_mut() else { return Task::none() };
-        let width = od.width();
+        let width = od.view_width();
         match m {
             ViewMsg::Resized { canvas, seq_w, rows_h } => {
                 let first = od.vp.canvas == (0.0, 0.0);
@@ -1595,8 +1611,8 @@ impl App {
             Key::Named(Named::ArrowDown) => (0.0, row_h),
             Key::Named(Named::PageUp) => (0.0, -page_y),
             Key::Named(Named::PageDown) => (0.0, page_y),
-            Key::Named(Named::Home) => (-(od.width() as f32), 0.0),
-            Key::Named(Named::End) => (od.width() as f32, 0.0),
+            Key::Named(Named::Home) => (-(od.view_width() as f32), 0.0),
+            Key::Named(Named::End) => (od.view_width() as f32, 0.0),
             _ => return Task::none(),
         };
         od.vp.scroll_x += dx;
@@ -1634,8 +1650,7 @@ impl App {
             od.vp.col_w = BASE_COL_W;
         }
         od.clamp_view();
-        od.vp.scroll_x = (c0 + c1) as f32 / 2.0 - od.vp.visible_cols() / 2.0;
-        od.clamp_view();
+        od.center_on(c0, c1 + 1);
     }
 
     fn run_search(&mut self) {
@@ -1673,7 +1688,7 @@ impl App {
             od.vp.col_w = BASE_COL_W;
             od.clamp_view();
         }
-        od.vp.reveal_col(h.c0, h.c1);
+        od.reveal_cols(h.c0, h.c1);
         if let Some(item) = h.row.and_then(|r| od.item_of_row(r)) {
             od.reveal_item(item);
         }
@@ -1723,8 +1738,7 @@ impl App {
                 od.vp.col_w = BASE_COL_W;
                 od.clamp_view();
             }
-            od.vp.reveal_col(a.start, a.end);
-            od.clamp_view();
+            od.reveal_cols(a.start, a.end);
         }
     }
 
@@ -1900,6 +1914,10 @@ impl App {
             (true, Some(s)) => (s.c0, s.c1),
             _ => (0, doc.width),
         };
+        let only: Option<Vec<bool>> = match (d.omit_ref_gaps, &od.ref_coords) {
+            (true, Some(rc)) => Some(rc.is_base.clone()),
+            _ => None,
+        };
         let rows: Vec<usize> = match d.rows {
             ExportRows::All => (0..doc.rows.len()).filter(|&i| Some(i) != reference).collect(),
             ExportRows::Selected => {
@@ -1923,6 +1941,7 @@ impl App {
                 let (c0, c1) = region;
                 let mut records = Vec::new();
                 let render = |data: Vec<u8>| -> Vec<u8> {
+                    let data = crate::model::pick_columns(data, c0, only.as_deref());
                     let v: Vec<u8> = data.into_iter().map(|b| if b == b' ' { crate::seq::GAP } else { b }).collect();
                     if d.gapped { v } else { crate::seq::ungap(&v) }
                 };
@@ -2043,6 +2062,8 @@ impl App {
         };
         let doc = od.doc.clone();
         let reference = od.reference;
+        // Collapsed gaps: the columns where the reference has a gap are left out.
+        let only = od.kept_columns().map(|k| k.to_vec());
         let folder = od.info.folder;
         let kind = if od.info.kind == DocKind::Sequences { DocKind::Sequences } else { DocKind::Alignment };
         let range = match od.ref_range(sel.c0, sel.c1) {
@@ -2056,14 +2077,15 @@ impl App {
             "Extracting slice",
             false,
             move |p| {
-                let slice = doc.slice_columns(sel.c0, sel.c1, reference);
+                let slice = doc.slice_columns(sel.c0, sel.c1, reference, only.as_deref());
                 if slice.rows.is_empty() {
                     return Err("No sequence has bases in the selected columns".to_string());
                 }
                 let mut db = Db::open(&db_path)?;
-                let desc = format!("Slice {range} of “{source}”");
+                let gaps = if only.is_some() { " without the columns with gaps in the reference" } else { "" };
+                let desc = format!("Slice {range} of “{source}”{gaps}");
                 let id = db.insert_document(&name, kind, &slice, None, &desc, folder, &|f| p.set_fraction(f))?;
-                Ok((id, format!("Saved “{name}”: {} sequences × {} columns", canvas::group_digits(slice.rows.len()), slice.width)))
+                Ok((id, format!("Saved “{name}”: {} sequences × {} columns{gaps}", canvas::group_digits(slice.rows.len()), slice.width)))
             },
             |r| Message::SliceDone(Payload::new(r.unwrap_or_else(|| Err("Extracting the slice failed".into())))),
         )

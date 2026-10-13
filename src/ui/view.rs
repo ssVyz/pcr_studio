@@ -595,6 +595,27 @@ impl App {
             checkbox(prefs.show_overview).label("Overview strip").on_toggle(Message::ToggleOverview).text_size(13),
             checkbox(prefs.show_annotations).label("Annotations").on_toggle(Message::ToggleAnnotations).text_size(13),
             checkbox(prefs.color_bases).label("Color bases").on_toggle(Message::ToggleColors).text_size(13),
+            tooltip(
+                checkbox(prefs.collapse_gaps && od.reference.is_some())
+                    .label("Collapse gaps")
+                    .on_toggle_maybe(od.reference.is_some().then_some(Message::ToggleCollapseGaps))
+                    .text_size(13),
+                container(
+                    text(
+                        "Hide the columns where the reference has a gap (insertions in other sequences).                          Extract slice leaves them out too, and so does Export FASTA by default."
+                    )
+                    .size(12)
+                )
+                .padding(6)
+                .max_width(320)
+                .style(container::rounded_box),
+                tooltip::Position::Bottom,
+            ),
+            match (od.reference.is_some(), od.cols.hidden()) {
+                (false, _) => Some(text("Collapsing gaps needs a reference sequence.").size(11).style(style::muted)),
+                (true, n) if n > 0 => Some(text(format!("{} columns hidden", group_digits(n))).size(11).style(style::muted)),
+                _ => None,
+            },
         ]
         .spacing(6);
 
@@ -710,9 +731,18 @@ impl App {
         let selection: Element<Message> = match od.selection {
             Some(sel) => {
                 let rr = od.ref_range(sel.c0, sel.c1).map(|(a, b)| format!(" · ref {}–{}", group_digits(a as usize), group_digits(b as usize))).unwrap_or_default();
+                let hidden = match od.cols.hidden_in(sel.c0, sel.c1) {
+                    0 => String::new(),
+                    n => format!(", {n} hidden"),
+                };
+                let slice_tip = if od.cols.is_subset() {
+                    "Save these columns of all sequences (without the reference) as a new library document;                      columns with gaps in the reference are left out (Collapse gaps)"
+                } else {
+                    "Save these columns of all sequences (without the reference) as a new library document"
+                };
                 column![
                     section("Selection"),
-                    text(format!("{} columns ({}–{}){rr}", sel.len(), group_digits(sel.c0 + 1), group_digits(sel.c1))).size(12),
+                    text(format!("{} columns{hidden} ({}–{}){rr}", sel.len(), group_digits(sel.c0 + 1), group_digits(sel.c1))).size(12),
                     report_row,
                     row![
                         tooltip(
@@ -720,9 +750,7 @@ impl App {
                                 .padding([4, 8])
                                 .style(button::secondary)
                                 .on_press_maybe((!self.busy()).then_some(Message::ExtractSlice)),
-                            container(text("Save these columns of all sequences (without the reference) as a new library document").size(12))
-                                .padding(6)
-                                .style(container::rounded_box),
+                            container(text(slice_tip).size(12)).padding(6).max_width(320).style(container::rounded_box),
                             tooltip::Position::Bottom,
                         ),
                         button(text("Clear").size(12)).padding([4, 8]).style(button::text).on_press(Message::ClearSelection),

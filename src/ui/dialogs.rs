@@ -798,6 +798,8 @@ pub struct ExportDialog {
     pub gapped: bool,
     pub include_reference: bool,
     pub include_consensus: bool,
+    /// Leave out the columns where the reference has a gap.
+    pub omit_ref_gaps: bool,
     has_selection: bool,
     has_reference: bool,
     selection_len: usize,
@@ -812,6 +814,7 @@ pub enum ExportMsg {
     Gapped(bool),
     IncludeReference(bool),
     IncludeConsensus(bool),
+    OmitRefGaps(bool),
     Save,
 }
 
@@ -823,6 +826,7 @@ impl ExportDialog {
             gapped: od.info.kind != crate::model::DocKind::Sequences,
             include_reference: od.reference.is_some(),
             include_consensus: false,
+            omit_ref_gaps: od.cols.is_subset(),
             has_selection: od.selection.is_some(),
             has_reference: od.reference.is_some(),
             selection_len: od.selection.map(|s| s.len()).unwrap_or(0),
@@ -838,6 +842,7 @@ impl ExportDialog {
             ExportMsg::Gapped(b) => self.gapped = b,
             ExportMsg::IncludeReference(b) => self.include_reference = b,
             ExportMsg::IncludeConsensus(b) => self.include_consensus = b,
+            ExportMsg::OmitRefGaps(b) => self.omit_ref_gaps = b,
             ExportMsg::Save => {
                 let file_name = format!("{}.fasta", sanitize(&self.doc_name));
                 return Some(Task::perform(
@@ -870,6 +875,9 @@ impl ExportDialog {
                 .label("Include the reference sequence")
                 .on_toggle_maybe(self.has_reference.then_some(move |b| e(ExportMsg::IncludeReference(b)))),
             checkbox(self.include_consensus).label("Include the consensus sequence").on_toggle(move |b| e(ExportMsg::IncludeConsensus(b))),
+            checkbox(self.omit_ref_gaps)
+                .label("Leave out columns with gaps in the reference")
+                .on_toggle_maybe(self.has_reference.then_some(move |b| e(ExportMsg::OmitRefGaps(b)))),
         ]
         .spacing(10);
         let buttons = row![

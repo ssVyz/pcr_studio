@@ -120,10 +120,11 @@ impl Document {
     }
 
     /// Columns `[c0, c1)` of all rows except `exclude` (the reference), keeping
-    /// names, descriptions and metadata. Rows without any base in the slice and
-    /// columns that are empty in every remaining row are dropped; terminal gaps
-    /// become "no coverage" as on import.
-    pub fn slice_columns(&self, c0: usize, c1: usize, exclude: Option<usize>) -> Document {
+    /// names, descriptions and metadata. With `only` (one flag per alignment
+    /// column) just the flagged columns are taken. Rows without any base in the
+    /// slice and columns that are empty in every remaining row are dropped;
+    /// terminal gaps become "no coverage" as on import.
+    pub fn slice_columns(&self, c0: usize, c1: usize, exclude: Option<usize>, only: Option<&[bool]>) -> Document {
         let c1 = c1.min(self.width);
         let c0 = c0.min(c1);
         let rows: Vec<(&Row, Vec<u8>)> = self
@@ -131,10 +132,11 @@ impl Document {
             .iter()
             .enumerate()
             .filter(|(i, _)| Some(*i) != exclude)
-            .map(|(_, r)| (r, r.slice_with_blanks(c0, c1)))
+            .map(|(_, r)| (r, pick_columns(r.slice_with_blanks(c0, c1), c0, only)))
             .filter(|(_, d)| d.iter().any(|&b| b != GAP && b != b' '))
             .collect();
-        let keep: Vec<bool> = (0..c1 - c0).map(|i| rows.iter().any(|(_, d)| d[i] != GAP && d[i] != b' ')).collect();
+        let n = rows.first().map_or(0, |(_, d)| d.len());
+        let keep: Vec<bool> = (0..n).map(|i| rows.iter().any(|(_, d)| d[i] != GAP && d[i] != b' ')).collect();
         let out = rows
             .into_iter()
             .map(|(r, d)| {
@@ -484,6 +486,116 @@ impl RefCoords {
     }
 }
 
+/// Keeps the entries of `data` (columns `c0..`) whose column is flagged in
+/// `only`; everything without `only`.
+pub fn pick_columns(data: Vec<u8>, c0: usize, only: Option<&[bool]>) -> Vec<u8> {
+    match only {
+        Some(m) => data.into_iter().enumerate().filter(|(i, _)| m.get(c0 + i).copied().unwrap_or(false)).map(|(_, b)| b).collect(),
+        None => data,
+    }
+}
+
+/// The alignment columns shown in the viewer, numbered from 0 as display
+/// columns: all of them, or a subset (gaps collapsed: only the columns where
+/// the reference has a base). Positions between columns are "boundaries";
+/// boundary `c` lies before column `c`.
+#[derive(Debug, Clone, Default)]
+pub struct ColumnMap {
+    width: usize,
+    subset: Option<Subset>,
+}
+
+#[derive(Debug, Clone)]
+struct Subset {
+    /// Alignment column of each display column.
+    shown: Vec<u32>,
+    /// Number of shown columns before each alignment column (len = width + 1).
+    before: Vec<u32>,
+}
+
+impl ColumnMap {
+    pub fn all(width: usize) -> ColumnMap {
+        ColumnMap { width, subset: None }
+    }
+
+    /// Only the flagged columns; all of them if none is flagged.
+    pub fn only(flags: &[bool]) -> ColumnMap {
+        let shown: Vec<u32> = (0..flags.len()).filter(|&c| flags[c]).map(|c| c as u32).collect();
+        if shown.is_empty() || shown.len() == flags.len() {
+            return ColumnMap::all(flags.len());
+        }
+        let mut before = Vec::with_capacity(flags.len() + 1);
+        let mut n = 0u32;
+        for &f in flags {
+            before.push(n);
+            n += f as u32;
+        }
+        before.push(n);
+        ColumnMap { width: flags.len(), subset: Some(Subset { shown, before }) }
+    }
+
+    /// Whether some columns are hidden.
+    pub fn is_subset(&self) -> bool {
+        self.subset.is_some()
+    }
+
+    /// Number of display columns.
+    pub fn len(&self) -> usize {
+        self.subset.as_ref().map_or(self.width, |s| s.shown.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of hidden columns.
+    pub fn hidden(&self) -> usize {
+        self.width - self.len()
+    }
+
+    /// Alignment column of display column `d` (clamped to the last one).
+    pub fn col(&self, d: usize) -> usize {
+        match &self.subset {
+            Some(s) => s.shown[d.min(s.shown.len() - 1)] as usize,
+            None => d.min(self.width.saturating_sub(1)),
+        }
+    }
+
+    /// Display boundary of alignment boundary `c`: the number of shown columns before it.
+    pub fn disp(&self, c: usize) -> usize {
+        match &self.subset {
+            Some(s) => s.before[c.min(self.width)] as usize,
+            None => c.min(self.width),
+        }
+    }
+
+    /// Hidden columns in `[c0, c1)`.
+    pub fn hidden_in(&self, c0: usize, c1: usize) -> usize {
+        (c1.min(self.width).saturating_sub(c0)).saturating_sub(self.disp(c1) - self.disp(c0).min(self.disp(c1)))
+    }
+
+    /// Whether columns are hidden between display columns `d - 1` and `d`.
+    pub fn hidden_before(&self, d: usize) -> bool {
+        d > 0 && d < self.len() && self.col(d) > self.col(d - 1) + 1
+    }
+
+    /// Range of an annotation whose start (`left`) or end edge is dragged to
+    /// display boundary `d` while the other end stays at alignment boundary
+    /// `fixed`. The moved edge snaps to the shown column next to it (hidden
+    /// columns there stay outside), and the range keeps at least one column.
+    pub fn resize(&self, fixed: usize, left: bool, d: usize) -> (usize, usize) {
+        if left {
+            let d = d.min(self.disp(fixed).saturating_sub(1));
+            let start = if d < self.len() { self.col(d) } else { self.width };
+            (start.min(fixed.saturating_sub(1)), fixed)
+        } else {
+            let d = d.max(self.disp(fixed) + 1).min(self.len());
+            let end = if d > 0 { self.col(d - 1) + 1 } else { 0 };
+            (fixed, end.max(fixed + 1))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,7 +663,7 @@ mod tests {
     fn slices_columns() {
         //            ref       insertion column 2 only in the reference
         let d = doc(&["ACGTAC", "AC-TAC", "--GTA-", "A-----"]);
-        let s = d.slice_columns(1, 5, Some(0));
+        let s = d.slice_columns(1, 5, Some(0), None);
         // Row 3 has no base in 1..5 and is dropped; column 2 is kept (row 2 has G).
         assert_eq!(s.rows.len(), 2);
         assert_eq!(s.rows[0].name, "s1");
@@ -559,9 +671,56 @@ mod tests {
         assert_eq!((s.rows[1].start, s.rows[1].data.as_slice()), (1, &b"GTA"[..]));
         // A column that is a gap in every remaining row disappears.
         let d = doc(&["ACGT", "A-GT", "A-GT"]);
-        let s = d.slice_columns(0, 4, Some(0));
+        let s = d.slice_columns(0, 4, Some(0), None);
         assert_eq!(s.width, 3);
         assert_eq!(s.rows[0].data, b"AGT");
+        // Only flagged columns (the reference's bases): insertions in other rows
+        // go, and a row with bases only there is dropped.
+        let d = doc(&["AC--GT", "ACTTGT", "--TT--", "AC--GA"]);
+        let rc = RefCoords::new(&d.rows[0], d.width);
+        let s = d.slice_columns(0, 6, Some(0), Some(&rc.is_base));
+        assert_eq!(s.rows.len(), 2);
+        assert_eq!(s.rows[0].data, b"ACGT");
+        assert_eq!(s.rows[1].data, b"ACGA");
+        assert_eq!(pick_columns(b"CTTG".to_vec(), 1, Some(&rc.is_base)), b"CG");
+        assert_eq!(pick_columns(b"CTTG".to_vec(), 1, None), b"CTTG");
+    }
+
+    #[test]
+    fn column_map() {
+        let all = ColumnMap::all(5);
+        assert!(!all.is_subset());
+        assert_eq!((all.len(), all.col(3), all.disp(3), all.col(9), all.disp(9)), (5, 3, 3, 4, 5));
+        assert_eq!(all.hidden_in(0, 5), 0);
+        // Reference AC--GT-: columns 2, 3 and 6 are hidden.
+        let r = Row::from_gapped("r".into(), String::new(), b"AC--GT".to_vec());
+        let m = ColumnMap::only(&RefCoords::new(&r, 7).is_base);
+        assert!(m.is_subset());
+        assert_eq!((m.len(), m.hidden()), (4, 3));
+        assert_eq!((0..4).map(|d| m.col(d)).collect::<Vec<_>>(), vec![0, 1, 4, 5]);
+        assert_eq!((0..=7).map(|c| m.disp(c)).collect::<Vec<_>>(), vec![0, 1, 2, 2, 2, 3, 4, 4]);
+        assert_eq!(m.hidden_in(1, 5), 2);
+        assert_eq!(m.hidden_in(0, 2), 0);
+        assert!(m.hidden_before(2) && !m.hidden_before(1) && !m.hidden_before(3));
+        // Resizing snaps to shown columns and keeps hidden ones at the moved edge outside.
+        assert_eq!(m.resize(6, true, 2), (4, 6));
+        assert_eq!(m.resize(0, false, 2), (0, 2));
+        assert_eq!(m.resize(0, false, 4), (0, 6));
+        // At least one shown column.
+        assert_eq!(m.resize(5, true, 4), (4, 5));
+        assert_eq!(m.resize(1, false, 0), (1, 2));
+        // A fixed start inside hidden columns: they stay in, the next shown column is the minimum.
+        assert_eq!(m.resize(2, false, 0), (2, 5));
+        // Without hidden columns this is plain column arithmetic.
+        let a = ColumnMap::all(40);
+        assert_eq!(a.resize(20, true, 5), (5, 20));
+        assert_eq!(a.resize(20, true, 25), (19, 20));
+        assert_eq!(a.resize(10, false, 30), (10, 30));
+        assert_eq!(a.resize(10, false, 3), (10, 11));
+        assert_eq!(a.resize(1, true, 0), (0, 1));
+        // Nothing (or everything) flagged: all columns are shown.
+        assert!(!ColumnMap::only(&[false, false]).is_subset());
+        assert!(!ColumnMap::only(&[true, true]).is_subset());
     }
 
     #[test]

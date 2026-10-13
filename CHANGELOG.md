@@ -7,6 +7,31 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.0.12] - 2026-10-13
+
+### Added
+
+- **Collapse gaps** (Display section of the right panel, off by default, saved in the
+  settings): hides the columns where the reference has a gap or no coverage, i.e. insertions
+  in the other sequences, so the alignment is shown in reference coordinates. Needs a
+  reference; without one the option is disabled and says so. The panel shows how many columns
+  are hidden, and a ▼ on the ruler marks each place where columns are hidden. Toggling keeps
+  the column at the center of the view in place, and a view zoomed to fit stays fitted.
+- **Extract slice** leaves out the columns with gaps in the reference while gaps are
+  collapsed (the new document's description and the status message say so).
+- Export FASTA: **Leave out columns with gaps in the reference** (needs a reference; preset
+  while gaps are collapsed), for the whole alignment or the selected columns.
+- The selection summary in the right panel shows how many of the selected columns are hidden.
+- `model::ColumnMap` (display ↔ alignment columns), `model::pick_columns` and a column
+  filter for `Document::slice_columns`, with tests.
+
+### Changed
+
+- The viewer's zoom and scroll position count displayed columns. Selections, annotations,
+  search hits and positions still refer to alignment columns; dragging an annotation edge or
+  selecting while gaps are collapsed snaps to the shown columns.
+- The oligo report still evaluates every column of a selection, including hidden ones.
+
 ## [0.0.11] - 2026-10-13
 
 ### Added

@@ -170,30 +170,35 @@ fn annotation_part(x0: f32, x1: f32, x: f32) -> Option<(Part, f32)> {
     (x > x0 && x < x1).then_some((Part::Body, EDGE_GRAB + 1.0))
 }
 
-/// Range of an annotation whose start (`left`) or end edge is dragged to
-/// column boundary `b` while the other end stays at `fixed`; at least one column.
-fn resize_range(fixed: usize, left: bool, b: usize) -> (usize, usize) {
-    if left { (b.min(fixed.saturating_sub(1)), fixed) } else { (fixed, b.max(fixed + 1)) }
-}
-
 pub struct AlignmentView<'a> {
     pub od: &'a OpenDoc,
     pub prefs: &'a ViewPrefs,
     pub pal: Palette,
 }
 
+// The viewport counts display columns (`OpenDoc::cols`): all alignment
+// columns, or fewer with gaps collapsed. Selections, annotations and hits
+// stay in alignment columns.
 impl AlignmentView<'_> {
+    /// Display position (fractional display columns) at `x`.
     fn col_at(&self, lay: &Lay, x: f32) -> f32 {
         self.od.vp.scroll_x + (x - lay.seq_x0) / self.od.vp.col_w
     }
 
+    /// Alignment column under `x`.
     fn col_index(&self, lay: &Lay, x: f32) -> usize {
-        let w = self.od.width();
-        (self.col_at(lay, x).floor().max(0.0) as usize).min(w.saturating_sub(1))
+        let n = self.od.view_width();
+        self.od.cols.col((self.col_at(lay, x).floor().max(0.0) as usize).min(n.saturating_sub(1)))
     }
 
-    fn x_of(&self, lay: &Lay, col: f32) -> f32 {
-        lay.seq_x0 + (col - self.od.vp.scroll_x) * self.od.vp.col_w
+    /// Screen x of display position `d`.
+    fn x_of(&self, lay: &Lay, d: f32) -> f32 {
+        lay.seq_x0 + (d - self.od.vp.scroll_x) * self.od.vp.col_w
+    }
+
+    /// Screen x of alignment boundary `c` (before column `c`).
+    fn x_col(&self, lay: &Lay, c: usize) -> f32 {
+        self.x_of(lay, self.od.cols.disp(c) as f32)
     }
 
     fn item_at(&self, lay: &Lay, y: f32) -> Option<usize> {
@@ -213,7 +218,7 @@ impl AlignmentView<'_> {
     }
 
     fn hthumb(&self, lay: &Lay) -> (f32, f32) {
-        let total = self.od.width().max(1) as f32;
+        let total = self.od.view_width().max(1) as f32;
         let vis = (lay.seq_w / self.od.vp.col_w).min(total);
         let tw = (lay.seq_w * vis / total).max(24.0).min(lay.seq_w);
         let max_scroll = (total - vis).max(0.0);
@@ -231,7 +236,7 @@ impl AlignmentView<'_> {
             if lay.lanes[i] != lane {
                 continue;
             }
-            let Some((part, dist)) = annotation_part(self.x_of(lay, a.start as f32), self.x_of(lay, a.end as f32), p.x) else { continue };
+            let Some((part, dist)) = annotation_part(self.x_col(lay, a.start), self.x_col(lay, a.end), p.x) else { continue };
             let score = if self.od.selected_annotation == Some(a.id) { dist - 100.0 } else { dist };
             if best.is_none_or(|b| score < b.2) {
                 best = Some((i, part, score));
@@ -240,9 +245,9 @@ impl AlignmentView<'_> {
         best.map(|(i, part, _)| (i, part))
     }
 
-    /// Column boundary nearest to `x`.
+    /// Display boundary nearest to `x`.
     fn boundary_at(&self, lay: &Lay, x: f32) -> usize {
-        self.col_at(lay, x).round().clamp(0.0, self.od.width() as f32) as usize
+        self.col_at(lay, x).round().clamp(0.0, self.od.view_width() as f32) as usize
     }
 
     fn hover_at(&self, lay: &Lay, p: Point) -> Option<Hover> {
@@ -310,7 +315,7 @@ impl canvas::Program<Message> for AlignmentView<'_> {
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let p = pos?;
-                let width = self.od.width();
+                let width = self.od.view_width();
                 // Right edge of the name column: resize it.
                 if near_name_edge(&lay, p) {
                     state.drag = Drag::NameColumn;
@@ -402,7 +407,7 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                     }
                     Drag::HThumb { grab } => {
                         let (_, tw) = self.hthumb(&lay);
-                        let total = self.od.width() as f32;
+                        let total = self.od.view_width() as f32;
                         let vis = lay.seq_w / vp.col_w;
                         let span = (lay.seq_w - tw).max(1.0);
                         let frac = ((p.x - grab - lay.seq_x0) / span).clamp(0.0, 1.0);
@@ -412,7 +417,7 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                         return msg(ViewMsg::NameWidth { w: p.x, done: false });
                     }
                     Drag::AnnotationEdge { id, fixed, left, .. } => {
-                        let (start, end) = resize_range(fixed, left, self.boundary_at(&lay, p.x));
+                        let (start, end) = self.od.cols.resize(fixed, left, self.boundary_at(&lay, p.x));
                         if self.od.annotations.iter().any(|a| a.id == id && (a.start, a.end) == (start, end)) {
                             return Some(Action::capture());
                         }
@@ -420,7 +425,7 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                         return msg(ViewMsg::ResizeAnnotation { id, start, end, done: false });
                     }
                     Drag::Overview => {
-                        let col = (p.x - lay.seq_x0) / lay.seq_w * self.od.width() as f32;
+                        let col = (p.x - lay.seq_x0) / lay.seq_w * self.od.view_width() as f32;
                         return msg(ViewMsg::SetScroll { x: Some(col - lay.seq_w / vp.col_w / 2.0), y: None });
                     }
                     Drag::Pan { x, y, sx, sy } => {
@@ -449,7 +454,7 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                         return Some(Action::capture());
                     }
                     let p = cursor.position().map(|q| Point::new(q.x - bounds.x, q.y - bounds.y)).unwrap_or(Point::ORIGIN);
-                    let (start, end) = resize_range(fixed, left, self.boundary_at(&lay, p.x));
+                    let (start, end) = self.od.cols.resize(fixed, left, self.boundary_at(&lay, p.x));
                     return msg(ViewMsg::ResizeAnnotation { id, start, end, done: true });
                 }
                 if let Drag::Select { anchor } = drag {
@@ -592,10 +597,11 @@ impl Drawer<'_, '_> {
         out
     }
 
+    /// Visible display columns.
     fn visible_cols(&self) -> (usize, usize) {
         let vp = &self.od().vp;
         let c0 = vp.scroll_x.floor().max(0.0) as usize;
-        let c1 = ((vp.scroll_x + self.lay.seq_w / vp.col_w).ceil() as usize + 1).min(self.od().width());
+        let c1 = ((vp.scroll_x + self.lay.seq_w / vp.col_w).ceil() as usize + 1).min(self.od().view_width());
         (c0.min(c1), c1)
     }
 
@@ -663,6 +669,7 @@ impl Drawer<'_, '_> {
     /// Draws one sequence track (a row, the reference or the consensus).
     fn track(&self, f: &mut Frame, y: f32, h: f32, at: &dyn Fn(usize) -> Option<u8>, cmp: Option<&dyn Fn(usize) -> Option<u8>>) {
         let vp = &self.od().vp;
+        let cols = &self.od().cols;
         let col_w = vp.col_w;
         let (c0, c1) = self.visible_cols();
         let highlight = cmp.is_some();
@@ -675,10 +682,11 @@ impl Drawer<'_, '_> {
             let letters = col_w >= 7.0 && h >= 9.0;
             let size = (col_w.min(h) * 0.82).clamp(7.0, 15.0);
             let mut glyphs: Vec<(f32, char, Color)> = Vec::new();
-            for c in c0..c1 {
+            for d in c0..c1 {
+                let c = cols.col(d);
                 let b = at(c);
                 let cell = self.classify(b, cmp.and_then(|g| g(c)), highlight);
-                let x = self.v.x_of(self.lay, c as f32);
+                let x = self.v.x_of(self.lay, d as f32);
                 if let Some(fill) = self.cell_fill(cell, letters) {
                     runs.push(f, x, x + col_w, fill);
                 } else {
@@ -709,7 +717,7 @@ impl Drawer<'_, '_> {
         } else {
             // Several columns per pixel: summarize each pixel column.
             let px_n = self.lay.seq_w.ceil() as usize;
-            let width = self.od().width();
+            let width = self.od().view_width();
             for px in 0..px_n {
                 let x = self.lay.seq_x0 + px as f32;
                 let ca = self.v.col_at(self.lay, x).floor().max(0.0) as usize;
@@ -722,7 +730,7 @@ impl Drawer<'_, '_> {
                 let mut gap_seen = false;
                 if highlight {
                     let g = cmp.unwrap();
-                    for c in ca..cb {
+                    for c in (ca..cb).map(|d| cols.col(d)) {
                         let Some(b) = at(c) else { continue };
                         covered = true;
                         let r = g(c);
@@ -737,7 +745,7 @@ impl Drawer<'_, '_> {
                     }
                 } else {
                     let mid = (ca + cb) / 2;
-                    match at(mid) {
+                    match at(cols.col(mid)) {
                         Some(GAP) => {
                             covered = true;
                             gap_seen = true;
@@ -747,7 +755,7 @@ impl Drawer<'_, '_> {
                             color = Some(if self.v.prefs.color_bases { self.pal.base(b) } else { self.pal.same });
                         }
                         None => {
-                            covered = (ca..cb).any(|c| at(c).is_some());
+                            covered = (ca..cb).any(|d| at(cols.col(d)).is_some());
                         }
                     }
                 }
@@ -805,8 +813,8 @@ impl Drawer<'_, '_> {
     }
 
     fn hit_box(&self, f: &mut Frame, c0: usize, c1: usize, y: f32, h: f32) {
-        let x0 = self.v.x_of(self.lay, c0 as f32);
-        let x1 = self.v.x_of(self.lay, c1 as f32).max(x0 + 2.0);
+        let x0 = self.v.x_col(self.lay, c0);
+        let x1 = self.v.x_col(self.lay, c1).max(x0 + 2.0);
         f.stroke(&Path::rectangle(Point::new(x0, y), Size::new(x1 - x0, h)), Stroke::default().with_color(self.pal.hit).with_width(2.0));
     }
 
@@ -815,7 +823,8 @@ impl Drawer<'_, '_> {
         let lay = self.lay;
         let pal = self.pal;
         let vp = &od.vp;
-        let width = od.width();
+        let cols = &od.cols;
+        let width = od.view_width();
         let header_h = lay.rows_y0;
         f.fill_rectangle(Point::new(lay.seq_x0, 0.0), Size::new(lay.seq_w + SB, header_h), pal.header_bg);
         let (c0, c1) = self.visible_cols();
@@ -831,7 +840,7 @@ impl Drawer<'_, '_> {
             for px in 0..px_n {
                 let ca = px * width / px_n.max(1);
                 let cb = ((px + 1) * width / px_n.max(1)).max(ca + 1).min(width);
-                let v = bin_value(&track[ca..cb], mode);
+                let v = bin_value((ca..cb).map(|d| track[cols.col(d)]), mode);
                 let x = lay.seq_x0 + px as f32;
                 match v {
                     Some(v) => runs.push(f, x, x + 1.0, pal.graph(mode, v)),
@@ -839,18 +848,19 @@ impl Drawer<'_, '_> {
                 }
             }
             runs.flush(f);
-            let to_x = |c: f32| lay.seq_x0 + c / width as f32 * lay.seq_w;
+            let to_x = |d: f32| lay.seq_x0 + d / width as f32 * lay.seq_w;
+            let col_x = |c: usize| to_x(cols.disp(c) as f32);
             for a in &od.annotations {
-                let x0 = to_x(a.start as f32);
-                let x1 = to_x(a.end as f32).max(x0 + 2.0);
+                let x0 = col_x(a.start);
+                let x1 = col_x(a.end).max(x0 + 2.0);
                 f.fill_rectangle(Point::new(x0, y), Size::new(x1 - x0, 3.0), pal.annotation(a.kind));
             }
             for h in od.search.hits.iter().take(2000) {
-                f.fill_rectangle(Point::new(to_x(h.c0 as f32), y + h_off(h.row.is_none())), Size::new(1.5, 3.0), pal.hit);
+                f.fill_rectangle(Point::new(col_x(h.c0), y + h_off(h.row.is_none())), Size::new(1.5, 3.0), pal.hit);
             }
             if let Some(sel) = od.selection {
-                let x0 = to_x(sel.c0 as f32);
-                f.fill_rectangle(Point::new(x0 - 1.0, y + 1.0), Size::new((to_x(sel.c1 as f32) - x0).max(2.0) + 1.0, h - 2.0), pal.selection);
+                let x0 = col_x(sel.c0);
+                f.fill_rectangle(Point::new(x0 - 1.0, y + 1.0), Size::new((col_x(sel.c1) - x0).max(2.0) + 1.0, h - 2.0), pal.selection);
             }
             let vx0 = to_x(vp.scroll_x);
             let vx1 = to_x((vp.scroll_x + lay.seq_w / vp.col_w).min(width as f32));
@@ -865,12 +875,15 @@ impl Drawer<'_, '_> {
         f.fill_rectangle(Point::new(lay.seq_x0, ry + rh - 1.0), Size::new(lay.seq_w, 1.0), pal.grid);
         let step = nice_step(80.0 / vp.col_w);
         let ref_coords = od.ref_coords.as_ref();
-        let sel_xs: Vec<f32> = od
-            .selection
-            .map(|s| vec![self.v.x_of(lay, s.c0 as f32 + 0.5), self.v.x_of(lay, (s.c1 - 1) as f32 + 0.5)])
-            .unwrap_or_default();
+        // Middles of the first and last selected display columns.
+        let sel_ds = od.selection.map(|s| {
+            let (d0, d1) = (cols.disp(s.c0) as f32, cols.disp(s.c1) as f32);
+            (d0 + 0.5, (d1 - 0.5).max(d0 + 0.5))
+        });
+        let sel_xs: Vec<f32> = sel_ds.map(|(a, b)| vec![self.v.x_of(lay, a), self.v.x_of(lay, b)]).unwrap_or_default();
         let mut last_label_x = f32::NEG_INFINITY;
-        for c in c0..c1 {
+        for d in c0..c1 {
+            let c = cols.col(d);
             let (num, show) = match ref_coords {
                 Some(rc) => (rc.pos_at[c] as usize, rc.is_base[c] && ((rc.pos_at[c] as usize).is_multiple_of(step) || rc.pos_at[c] == 1)),
                 None => (c + 1, (c + 1) % step == 0 || c == 0),
@@ -878,7 +891,7 @@ impl Drawer<'_, '_> {
             if !show {
                 continue;
             }
-            let x = self.v.x_of(lay, c as f32 + 0.5);
+            let x = self.v.x_of(lay, d as f32 + 0.5);
             f.fill_rectangle(Point::new(x, ry + rh - 6.0), Size::new(1.0, 5.0), pal.text_muted);
             if x - last_label_x > 60.0 && sel_xs.iter().all(|sx| (sx - x).abs() > 44.0) {
                 f.fill_text(Text {
@@ -892,14 +905,28 @@ impl Drawer<'_, '_> {
                 last_label_x = x;
             }
         }
+        // Collapsed gaps: a marker where hidden columns lie between two shown ones.
+        if cols.is_subset() && vp.col_w >= 2.0 {
+            let y = ry + rh - 1.0;
+            for d in (c0..c1).filter(|&d| cols.hidden_before(d)) {
+                let x = self.v.x_of(lay, d as f32);
+                let tri = Path::new(|p| {
+                    p.move_to(Point::new(x - 3.5, y - 6.0));
+                    p.line_to(Point::new(x + 3.5, y - 6.0));
+                    p.line_to(Point::new(x, y));
+                    p.close();
+                });
+                f.fill(&tri, pal.gap_strong);
+            }
+        }
         // Selection bounds on the ruler.
-        if let Some(sel) = od.selection {
-            for c in [sel.c0, sel.c1 - 1] {
+        if let (Some(sel), Some((d0, d1))) = (od.selection, sel_ds) {
+            for (c, d) in [(sel.c0, d0), (sel.c1 - 1, d1)] {
                 let num = match ref_coords {
                     Some(rc) => rc.pos_at[c] as usize,
                     None => c + 1,
                 };
-                let x = self.v.x_of(lay, c as f32 + 0.5);
+                let x = self.v.x_of(lay, d);
                 if x >= lay.seq_x0 && x <= lay.seq_x0 + lay.seq_w {
                     f.fill_text(Text {
                         content: group_digits(num),
@@ -935,9 +962,9 @@ impl Drawer<'_, '_> {
                 f.fill_rectangle(Point::new(x, base - bh), Size::new(w, bh), pal.graph(mode, v));
             };
             if vp.col_w >= 1.0 {
-                for c in c0..c1 {
-                    if let Some(v) = track[c] {
-                        bar(f, self.v.x_of(lay, c as f32), vp.col_w, v);
+                for d in c0..c1 {
+                    if let Some(v) = track[cols.col(d)] {
+                        bar(f, self.v.x_of(lay, d as f32), vp.col_w, v);
                     }
                 }
             } else {
@@ -951,7 +978,7 @@ impl Drawer<'_, '_> {
                     }
                     // Zoomed out: mean of the pixel's columns (on the log scale a single
                     // variable site still pulls a conserved bin down visibly).
-                    let (sum, n) = track[ca..cb].iter().flatten().fold((0.0f32, 0u32), |(s, n), v| (s + v, n + 1));
+                    let (sum, n) = (ca..cb).filter_map(|d| track[cols.col(d)]).fold((0.0f32, 0u32), |(s, n), v| (s + v, n + 1));
                     if let Some(v) = (n > 0).then(|| sum / n as f32) {
                         bar(f, x, 1.0, v);
                     }
@@ -963,12 +990,13 @@ impl Drawer<'_, '_> {
         // Annotations.
         if let Some((y0, _)) = lay.annotations {
             for (i, a) in od.annotations.iter().enumerate() {
-                if a.end <= c0 || a.start >= c1 {
+                let (a0, a1) = (cols.disp(a.start), cols.disp(a.end));
+                if a1 < c0 || a0 > c1 {
                     continue;
                 }
                 let y = y0 + 2.0 + lay.lanes[i] as f32 * LANE_H;
-                let x0 = self.v.x_of(lay, a.start as f32).max(lay.seq_x0 - 20.0);
-                let x1 = self.v.x_of(lay, a.end as f32).min(lay.seq_x0 + lay.seq_w + 20.0);
+                let x0 = self.v.x_of(lay, a0 as f32).max(lay.seq_x0 - 20.0);
+                let x1 = self.v.x_of(lay, a1 as f32).min(lay.seq_x0 + lay.seq_w + 20.0);
                 self.arrow(f, x0, x1, y + 1.0, LANE_H - 3.0, a);
                 if od.selected_annotation == Some(a.id) {
                     // Outline plus grips on both edges (they can be dragged).
@@ -1037,8 +1065,8 @@ impl Drawer<'_, '_> {
         let od = self.od();
         let lay = self.lay;
         let Some(sel) = od.selection else { return };
-        let x0 = self.v.x_of(lay, sel.c0 as f32).max(lay.seq_x0 - 2.0);
-        let x1 = self.v.x_of(lay, sel.c1 as f32).min(lay.seq_x0 + lay.seq_w + 2.0);
+        let x0 = self.v.x_col(lay, sel.c0).max(lay.seq_x0 - 2.0);
+        let x1 = self.v.x_col(lay, sel.c1).min(lay.seq_x0 + lay.seq_w + 2.0);
         if x1 < lay.seq_x0 || x0 > lay.seq_x0 + lay.seq_w {
             return;
         }
@@ -1142,11 +1170,12 @@ fn graph_height(mode: super::state::GraphMode, v: f32) -> f32 {
 }
 
 /// Summary of a pixel bin in the overview strip.
-fn bin_value(values: &[Option<f32>], mode: super::state::GraphMode) -> Option<f32> {
+fn bin_value(values: impl Iterator<Item = Option<f32>>, mode: super::state::GraphMode) -> Option<f32> {
+    let values = values.flatten();
     match mode {
-        super::state::GraphMode::Identity => values.iter().flatten().copied().reduce(f32::min),
+        super::state::GraphMode::Identity => values.reduce(f32::min),
         super::state::GraphMode::Conservation => {
-            let (sum, n) = values.iter().flatten().fold((0.0f32, 0u32), |(s, n), v| (s + v, n + 1));
+            let (sum, n) = values.fold((0.0f32, 0u32), |(s, n), v| (s + v, n + 1));
             (n > 0).then(|| sum / n as f32)
         }
     }
@@ -1217,12 +1246,7 @@ mod tests {
         assert_eq!(annotation_part(100.0, 102.0, 99.0).map(|h| h.0), Some(Part::Start));
         assert_eq!(annotation_part(100.0, 102.0, 103.0).map(|h| h.0), Some(Part::End));
         assert_eq!(annotation_part(100.0, 100.0, 101.0).map(|h| h.0), Some(Part::End));
-        // Resizing keeps the other end and at least one column.
-        assert_eq!(resize_range(20, true, 5), (5, 20));
-        assert_eq!(resize_range(20, true, 25), (19, 20));
-        assert_eq!(resize_range(10, false, 30), (10, 30));
-        assert_eq!(resize_range(10, false, 3), (10, 11));
-        assert_eq!(resize_range(1, true, 0), (0, 1));
+        // Resizing: `ColumnMap::resize` (tested in `model`).
     }
 
     #[test]
