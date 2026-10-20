@@ -11,6 +11,7 @@ mod primer;
 mod search;
 mod seq;
 mod thermo;
+mod tools;
 mod ui;
 
 fn main() -> iced::Result {

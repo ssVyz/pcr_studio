@@ -78,6 +78,8 @@ pub enum DocKind {
     Alignment,
     /// Result of map-to-reference.
     Contig,
+    /// Plain text (e.g. the output of an external tool); no sequences.
+    Text,
 }
 
 impl DocKind {
@@ -86,6 +88,7 @@ impl DocKind {
             DocKind::Sequences => "sequences",
             DocKind::Alignment => "alignment",
             DocKind::Contig => "contig",
+            DocKind::Text => "text",
         }
     }
 
@@ -93,6 +96,7 @@ impl DocKind {
         match s {
             "alignment" => DocKind::Alignment,
             "contig" => DocKind::Contig,
+            "text" => DocKind::Text,
             _ => DocKind::Sequences,
         }
     }
@@ -102,6 +106,7 @@ impl DocKind {
             DocKind::Sequences => "Sequence list",
             DocKind::Alignment => "Alignment",
             DocKind::Contig => "Contig",
+            DocKind::Text => "Text",
         }
     }
 }
@@ -125,19 +130,30 @@ impl Document {
     /// slice and columns that are empty in every remaining row are dropped;
     /// terminal gaps become "no coverage" as on import.
     pub fn slice_columns(&self, c0: usize, c1: usize, exclude: Option<usize>, only: Option<&[bool]>) -> Document {
+        let rows: Vec<usize> = (0..self.rows.len()).filter(|&i| Some(i) != exclude).collect();
+        self.slice_rows(&rows, c0, c1, only).0
+    }
+
+    /// Like `slice_columns`, for the rows `rows` (in that order). Also returns
+    /// the alignment column of every column of the slice.
+    pub fn slice_rows(&self, rows: &[usize], c0: usize, c1: usize, only: Option<&[bool]>) -> (Document, Vec<usize>) {
         let c1 = c1.min(self.width);
         let c0 = c0.min(c1);
-        let rows: Vec<(&Row, Vec<u8>)> = self
-            .rows
+        let picked: Vec<(&Row, Vec<u8>)> = rows
             .iter()
-            .enumerate()
-            .filter(|(i, _)| Some(*i) != exclude)
-            .map(|(_, r)| (r, pick_columns(r.slice_with_blanks(c0, c1), c0, only)))
+            .filter_map(|&i| self.rows.get(i))
+            .map(|r| (r, pick_columns(r.slice_with_blanks(c0, c1), c0, only)))
             .filter(|(_, d)| d.iter().any(|&b| b != GAP && b != b' '))
             .collect();
-        let n = rows.first().map_or(0, |(_, d)| d.len());
-        let keep: Vec<bool> = (0..n).map(|i| rows.iter().any(|(_, d)| d[i] != GAP && d[i] != b' ')).collect();
-        let out = rows
+        let n = picked.first().map_or(0, |(_, d)| d.len());
+        let keep: Vec<bool> = (0..n).map(|i| picked.iter().any(|(_, d)| d[i] != GAP && d[i] != b' ')).collect();
+        let columns: Vec<usize> = (c0..c1)
+            .filter(|&c| only.is_none_or(|m| m.get(c).copied().unwrap_or(false)))
+            .zip(&keep)
+            .filter(|(_, k)| **k)
+            .map(|(c, _)| c)
+            .collect();
+        let out = picked
             .into_iter()
             .map(|(r, d)| {
                 let data: Vec<u8> = d.iter().zip(&keep).filter(|(_, k)| **k).map(|(&b, _)| if b == b' ' { GAP } else { b }).collect();
@@ -146,7 +162,7 @@ impl Document {
                 row
             })
             .collect();
-        Document::new(out)
+        (Document::new(out), columns)
     }
 
     /// Sorted list of all metadata keys present in any row.
@@ -683,6 +699,12 @@ mod tests {
         assert_eq!(s.rows[0].data, b"ACGT");
         assert_eq!(s.rows[1].data, b"ACGA");
         assert_eq!(pick_columns(b"CTTG".to_vec(), 1, Some(&rc.is_base)), b"CG");
+        // Chosen rows in the given order, with the alignment column of each slice column.
+        let (s, cols) = d.slice_rows(&[3, 1], 0, 6, Some(&rc.is_base));
+        assert_eq!(s.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["s3", "s1"]);
+        assert_eq!(cols, [0, 1, 4, 5]);
+        let d = doc(&["ACGT", "A-GT", "A-GT"]);
+        assert_eq!(d.slice_rows(&[1, 2], 0, 4, None).1, [0, 2, 3]);
         assert_eq!(pick_columns(b"CTTG".to_vec(), 1, None), b"CTTG");
     }
 

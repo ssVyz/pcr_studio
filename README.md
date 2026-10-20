@@ -22,6 +22,25 @@ The document library is the SQLite file `pcr_studio.db` next to the executable
 (`target/release/pcr_studio.db` when started with `cargo run --release`).
 FASTA files given on the command line are imported at startup.
 
+### External tools
+
+Some features run external command-line programs. Without them PCR Studio works normally;
+only those features are unavailable (their menu entries are greyed out). Each tool's location
+is set in **Edit → Settings → External tools**:
+
+- **Bundled with PCR Studio** (default): PCR Studio's own copy in `assets/tools/` next to the
+  executable. Builds started from the source tree (`cargo run`, or a copy of the executable)
+  also find the repository's `assets/tools/`. The folder is not in git; put the binaries there.
+- **From PATH**: the first match in the folders of the `PATH` variable.
+- **Custom location**: any path (**Browse…**).
+
+**Test** checks the chosen location (the program has to answer `--version` with a supported
+version); saving the settings checks all tools again.
+
+| Tool | Binary | Used for |
+|---|---|---|
+| primersearch ≥ 0.1.1 | `assets/tools/primersearch.exe` | Tools → Find primers in selection |
+
 ## Workflow
 
 The menu bar holds all application commands:
@@ -31,7 +50,7 @@ The menu bar holds all application commands:
 | File | New sequence… (Ctrl+N), Import FASTA… (Ctrl+O), Import metadata table…, Generate demo data, Export FASTA… (Ctrl+E), Extract selection to library, New folder, Close document (Ctrl+W), Exit |
 | Edit | Edit sequence… (single-sequence documents), Add annotation from selection…, Annotation properties…, Delete annotation… (Del), Copy oligo (Ctrl+C), Copy oligo report, Clear selection (Esc), Set selected row as reference, Clear reference, Sort by name / length / bases in selection, Settings… (Ctrl+,) |
 | View | Display options panel (show/hide, Ctrl+Shift+D; showing restores the default width), Reset panel sizes |
-| Tools | Map to reference… (Ctrl+M), Metadata from sequence names…, Oligo report for selection, Find sequence… (Ctrl+F), Go to position… (Ctrl+G) |
+| Tools | Map to reference… (Ctrl+M), Metadata from sequence names…, Find primers in selection (primersearch)…, Oligo report for selection, Find sequence… (Ctrl+F), Go to position… (Ctrl+G) |
 
 Entries that do not apply (e.g. without an open document or selection) are disabled.
 
@@ -86,6 +105,22 @@ Entries that do not apply (e.g. without an open document or selection) are disab
 7. **Export** (File menu or Ctrl+E) all, shown or selected sequences, optionally only the selected
    columns, gapped or ungapped, with reference and/or consensus, optionally without the
    columns where the reference has a gap (preset while **Collapse gaps** is on).
+8. **Find primers** (needs primersearch, see "External tools"; Tools menu, right-click in the
+   viewer, or **Find primers…** in the selection panel): runs primersearch on the selected
+   columns of all, the shown or the selected sequences (never the reference), with **Collapse
+   gaps** leaving out the columns where the reference has a gap. The dialog sets the search mode
+   (no ambiguities, incremental IUPAC, optimize by mismatch), fixed slice, orientation, minimum
+   Tm, conserved 3' bases and the mode's options; reaction conditions come from Settings. Before
+   the run it shows how many sequences primersearch can use: it drops every sequence with a gap,
+   missing coverage or an N/ambiguity code in the selection (an insertion in some sequences puts
+   a gap into all others, which **Collapse gaps** avoids). The run continues in the background
+   while you keep working (status bar: progress, elapsed time, **Stop**; one run at a time;
+   exiting asks first and stops it). When it finishes, its text output is saved as a **text
+   document** in the library, in the source document's folder, and shown. The text starts with
+   a header (document, selection, sequences, tool version, command, times) and a map from the
+   output's positions, which count the columns passed to primersearch, to reference positions
+   and alignment columns. Double-click a text document to view it; **Copy all** and
+   **Save as .txt…** export it. The last parameters are remembered.
 
 ### Viewer
 
@@ -103,7 +138,7 @@ Entries that do not apply (e.g. without an open document or selection) are disab
 | Select rows | Click names; Ctrl/Shift for several. Used for "Set selected row as reference", export and mapping subsets |
 | Groups | Group by any metadata field; click a group header to fold it |
 | Annotations | Click to select, drag an edge to resize, double-click for properties, Delete key to delete (with confirmation) |
-| Right-click | Viewer menu: annotation properties/delete (on an annotation), add annotation, oligo report, copy, extract, clear selection |
+| Right-click | Viewer menu: annotation properties/delete (on an annotation), add annotation, oligo report, copy, extract, find primers (when primersearch is set up), clear selection |
 | Escape | Close dialog/report, then clear the selection |
 
 Display options (right panel): consensus row and its threshold (majority or 50–100 %), graph
@@ -132,9 +167,10 @@ a delimiter.
 | `primer.rs` | Oligo/selection evaluation |
 | `display.rs` | View sort, grouping, collapsing, filtering; sorting documents (name, length, bases) |
 | `search.rs` | Motif search |
-| `db.rs` | SQLite library (documents, rows and their order, annotations, folders, settings) |
+| `db.rs` | SQLite library (documents, rows and their order, annotations, folders, text documents, settings) |
+| `tools/` | External tools: `mod.rs` tool list, locations (bundled / PATH / custom) and version check, `run.rs` child processes (no console window, JSON-lines progress on stderr, cancel), `primersearch.rs` arguments, progress, input slice and report header |
 | `demo.rs` | Synthetic data |
-| `ui/` | iced application: `mod.rs` state/messages/update, `menu.rs` menu bar and drop-downs, `view.rs` layout and panels, `canvas.rs` alignment renderer, `dialogs.rs` (incl. new/edit sequence), `state.rs` viewer state, `style.rs`, `icons.rs` library icons, `job.rs` background jobs |
+| `ui/` | iced application: `mod.rs` state/messages/update, `menu.rs` menu bar and drop-downs, `view.rs` layout and panels, `canvas.rs` alignment renderer, `dialogs.rs` (incl. new/edit sequence, primersearch, text viewer), `state.rs` viewer state, `style.rs`, `icons.rs` library icons, `job.rs` background jobs |
 
 ### Map to reference
 

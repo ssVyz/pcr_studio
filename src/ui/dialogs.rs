@@ -1,15 +1,22 @@
 //! Modal dialogs: new/edit sequence, map to reference, export, settings,
-//! rename, confirmations.
+//! primersearch, text viewer, rename, confirmations.
 
 use super::canvas::group_digits;
+use super::job;
 use super::state::OpenDoc;
 use super::{AppSettings, Message, style};
 use crate::fasta::{self, PastedRecord};
 use crate::mapper::{MapParams, Sensitivity};
 use crate::model::{AnnotationKind, DocInfo, DocKind, RefCoords, Row};
+use crate::primer::Orientation;
 use crate::seq::{self, GAP};
-use iced::widget::{Space, button, checkbox, column, container, pick_list, row, rule, text, text_editor, text_input};
+use crate::thermo::TmConditions;
+use crate::tools::primersearch::{self as ps, Criterion, InputStats, Mode};
+use crate::tools::{self, ToolConfig, ToolSource, ToolSpec, ToolStatus};
+use iced::widget::{Space, button, checkbox, column, container, pick_list, row, rule, scrollable, text, text_editor, text_input};
 use iced::{Element, Fill, Font, Length, Task};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Id of the rename text field, focused when the dialog opens.
 pub const RENAME_INPUT: &str = "rename-input";
@@ -47,6 +54,10 @@ pub enum Modal {
     ConfirmDeleteFolder { id: i64, name: String, documents: usize, subfolders: usize },
     NameFields { delimiter: String, keys: String },
     Info { title: String, text: String },
+    Primersearch(PrimersearchDialog),
+    TextView(TextView),
+    /// Exit requested while a tool runs; `detail` describes the run.
+    ConfirmExit { detail: String },
 }
 
 #[derive(Debug, Clone)]
@@ -566,7 +577,7 @@ impl MapDialog {
             reference: RefChoice::ThisDocument(reference),
             ref_filter: String::new(),
             candidates: Vec::new(),
-            docs: library.iter().filter(|x| x.id != od.info.id).map(|x| DocOption { id: x.id, name: x.name.clone() }).collect(),
+            docs: library.iter().filter(|x| x.id != od.info.id && x.kind != DocKind::Text).map(|x| DocOption { id: x.id, name: x.name.clone() }).collect(),
             sensitivity: last.sensitivity,
             word_len: last.word_len.to_string(),
             repeats: last.max_word_repeats.to_string(),
@@ -896,6 +907,14 @@ fn sanitize(s: &str) -> String {
 
 // ---------------------------------------------------------------- settings
 
+/// Location setting of one external tool in the settings dialog.
+pub struct ToolRow {
+    pub spec: &'static ToolSpec,
+    pub config: ToolConfig,
+    /// Result of checking `config`; `None`: changed since the last check.
+    pub status: Option<ToolStatus>,
+}
+
 pub struct SettingsDialog {
     oligo: String,
     na: String,
@@ -903,6 +922,7 @@ pub struct SettingsDialog {
     dntp: String,
     window: String,
     dark: bool,
+    pub tools: Vec<ToolRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -914,10 +934,18 @@ pub enum SettingsMsg {
     Window(String),
     Dark(bool),
     Defaults,
+    ToolSource(usize, ToolSource),
+    ToolPath(usize, String),
+    ToolBrowse(usize),
+    ToolPicked(usize, Option<PathBuf>),
+    ToolTest(usize),
+    /// Result of a test of the given configuration.
+    ToolTested(usize, ToolConfig, ToolStatus),
 }
 
 impl SettingsDialog {
-    pub fn new(s: &AppSettings) -> SettingsDialog {
+    /// `status`: the current status of each tool (by id).
+    pub fn new(s: &AppSettings, status: &HashMap<&'static str, ToolStatus>) -> SettingsDialog {
         let tm = s.primer.tm;
         SettingsDialog {
             oligo: format!("{}", tm.oligo_nm),
@@ -926,10 +954,14 @@ impl SettingsDialog {
             dntp: format!("{}", tm.dntp_mm),
             window: s.primer.three_prime_window.to_string(),
             dark: s.dark,
+            tools: tools::ALL
+                .into_iter()
+                .map(|spec| ToolRow { spec, config: s.tool_config(spec.id), status: status.get(spec.id).cloned() })
+                .collect(),
         }
     }
 
-    pub fn update(&mut self, m: SettingsMsg) {
+    pub fn update(&mut self, m: SettingsMsg) -> Option<Task<Message>> {
         match m {
             SettingsMsg::Oligo(s) => self.oligo = s,
             SettingsMsg::Na(s) => self.na = s,
@@ -938,10 +970,58 @@ impl SettingsDialog {
             SettingsMsg::Window(s) => self.window = s,
             SettingsMsg::Dark(b) => self.dark = b,
             SettingsMsg::Defaults => {
+                // Tool locations are kept.
                 let d = AppSettings { dark: self.dark, ..AppSettings::default() };
-                *self = SettingsDialog::new(&d);
+                let tools = std::mem::take(&mut self.tools);
+                *self = SettingsDialog::new(&d, &HashMap::new());
+                self.tools = tools;
+            }
+            SettingsMsg::ToolSource(i, src) => {
+                if let Some(r) = self.tools.get_mut(i).filter(|r| r.config.source != src) {
+                    r.config.source = src;
+                    r.status = None;
+                }
+            }
+            SettingsMsg::ToolPath(i, p) => {
+                if let Some(r) = self.tools.get_mut(i) {
+                    r.config.custom_path = p;
+                    r.status = None;
+                }
+            }
+            SettingsMsg::ToolBrowse(i) => {
+                let name = self.tools.get(i)?.spec.name;
+                return Some(Task::perform(
+                    rfd::AsyncFileDialog::new().set_title(format!("Locate {name}")).add_filter("Programs", &["exe"]).add_filter("All files", &["*"]).pick_file(),
+                    move |f| Message::Settings(SettingsMsg::ToolPicked(i, f.map(|f| f.path().to_path_buf()))),
+                ));
+            }
+            SettingsMsg::ToolPicked(i, Some(path)) => {
+                if let Some(r) = self.tools.get_mut(i) {
+                    r.config = ToolConfig { source: ToolSource::Custom, custom_path: path.display().to_string() };
+                    r.status = None;
+                }
+            }
+            SettingsMsg::ToolPicked(_, None) => {}
+            SettingsMsg::ToolTest(i) => {
+                let r = self.tools.get_mut(i)?;
+                r.status = Some(ToolStatus::Checking);
+                let (spec, cfg) = (r.spec, r.config.clone());
+                let tested = cfg.clone();
+                return Some(job::background(
+                    move || tools::check(spec, &tested),
+                    move |st| {
+                        let st = st.unwrap_or_else(|| ToolStatus::Unavailable("the check failed".into()));
+                        Message::Settings(SettingsMsg::ToolTested(i, cfg, st))
+                    },
+                ));
+            }
+            SettingsMsg::ToolTested(i, cfg, st) => {
+                if let Some(r) = self.tools.get_mut(i).filter(|r| r.config == cfg) {
+                    r.status = Some(st);
+                }
             }
         }
+        None
     }
 
     pub fn apply(&self, s: &mut AppSettings) {
@@ -955,6 +1035,9 @@ impl SettingsDialog {
             s.primer.three_prime_window = w.clamp(1, 20);
         }
         s.dark = self.dark;
+        for r in &self.tools {
+            s.tools.insert(r.spec.id.to_string(), r.config.clone());
+        }
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -963,7 +1046,7 @@ impl SettingsDialog {
                 .spacing(8)
                 .align_y(iced::Center)
         };
-        let body = column![
+        let mut body = column![
             text("Melting temperature (SantaLucia 1998 nearest neighbor)").size(15),
             field("Oligo concentration (nM)", &self.oligo, SettingsMsg::Oligo),
             field("Monovalent cations Na⁺/K⁺ (mM)", &self.na, SettingsMsg::Na),
@@ -976,8 +1059,16 @@ impl SettingsDialog {
             rule::horizontal(1),
             text("Appearance").size(15),
             checkbox(self.dark).label("Dark theme").on_toggle(|b| Message::Settings(SettingsMsg::Dark(b))),
+            rule::horizontal(1),
+            text("External tools").size(15),
+            text("Programs PCR Studio runs for some features. Without them those features are unavailable; everything else works.")
+                .size(12)
+                .style(style::muted),
         ]
         .spacing(10);
+        for (i, r) in self.tools.iter().enumerate() {
+            body = body.push(tool_row(i, r));
+        }
         let buttons = row![
             button("Defaults").on_press(Message::Settings(SettingsMsg::Defaults)).style(button::text),
             Space::new().width(Fill),
@@ -985,7 +1076,485 @@ impl SettingsDialog {
             button("Save").on_press(Message::SaveSettings).style(button::primary),
         ]
         .spacing(10);
-        dialog_frame("Settings", body.into(), buttons.into(), 480.0)
+        let body = scrollable(body.padding(iced::Padding { right: 12.0, ..Default::default() })).height(Length::Shrink);
+        dialog_frame("Settings", body.into(), buttons.into(), 580.0)
+    }
+}
+
+fn tool_row(i: usize, r: &ToolRow) -> Element<'_, Message> {
+    let set = Message::Settings;
+    let bold = Font { weight: iced::font::Weight::Bold, ..Font::DEFAULT };
+    let mut c = column![
+        row![
+            text(r.spec.name).size(14).font(bold).width(Length::Fixed(120.0)),
+            pick_list(&ToolSource::ALL[..], Some(r.config.source), move |src| set(SettingsMsg::ToolSource(i, src))).text_size(13).width(Fill),
+            button(text("Test").size(13)).padding([5, 12]).style(button::secondary).on_press(set(SettingsMsg::ToolTest(i))),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+        text(r.spec.purpose).size(12).style(style::muted),
+    ]
+    .spacing(6);
+    let exe = format!("{}{}", r.spec.exe, std::env::consts::EXE_SUFFIX);
+    match r.config.source {
+        ToolSource::Bundled => {
+            c = c.push(text(format!("PCR Studio's own copy: {exe} in assets\\tools next to the program.")).size(12).style(style::muted));
+        }
+        ToolSource::Path => c = c.push(text(format!("The first {exe} found in the folders of the PATH variable.")).size(12).style(style::muted)),
+        ToolSource::Custom => {
+            c = c.push(
+                row![
+                    text_input("Path to the program", &r.config.custom_path).on_input(move |p| set(SettingsMsg::ToolPath(i, p))).padding(5).size(13),
+                    button(text("Browse…").size(13)).padding([5, 10]).style(button::secondary).on_press(set(SettingsMsg::ToolBrowse(i))),
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
+            );
+        }
+    }
+    let status: Element<Message> = match &r.status {
+        None => text("Not checked yet: press Test, or Save to check.").size(12).style(style::muted).into(),
+        Some(ToolStatus::Checking) => text("Checking…").size(12).style(style::muted).into(),
+        Some(ToolStatus::Ready { path, version }) => text(format!("✓ {} {version} · {}", r.spec.name, path.display()))
+            .size(12)
+            .wrapping(text::Wrapping::WordOrGlyph)
+            .style(|t: &iced::Theme| text::Style { color: Some(t.extended_palette().success.base.color) })
+            .into(),
+        Some(ToolStatus::Unavailable(e)) => text(format!("✗ Not available: {e}"))
+            .size(12)
+            .wrapping(text::Wrapping::WordOrGlyph)
+            .style(|t: &iced::Theme| text::Style { color: Some(t.extended_palette().danger.base.color) })
+            .into(),
+    };
+    c.push(status).into()
+}
+
+// ---------------------------------------------------------------- primersearch
+
+/// Numeric fields of the primersearch dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PsField {
+    Tm,
+    ThreePrime,
+    Target,
+    MaxAmb,
+    MaxSeeds,
+    NOligos,
+    Mismatches,
+    Ambiguities,
+    MaxCandidates,
+    MaxWork,
+    Threads,
+    Oligo,
+    Na,
+    Mg,
+    Dntp,
+}
+
+const PS_FIELDS: usize = 15;
+
+/// Runs primersearch on the selected columns.
+pub struct PrimersearchDialog {
+    pub rows: ExportRows,
+    pub name: String,
+    pub mode: Mode,
+    pub fixed: bool,
+    pub orientation: Orientation,
+    pub exclude_n: bool,
+    pub only_twofold: bool,
+    pub criterion: Criterion,
+    pub spacer: bool,
+    fields: [String; PS_FIELDS],
+    /// Selected columns `[c0, c1)` and their description.
+    pub c0: usize,
+    pub c1: usize,
+    pub range: String,
+    /// The columns with gaps in the reference are left out (Collapse gaps).
+    pub collapsed: bool,
+    pub stats: InputStats,
+    pub version: String,
+    conditions: TmConditions,
+    n_selected: usize,
+    doc_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum PrimersearchMsg {
+    Rows(ExportRows),
+    Name(String),
+    Mode(Mode),
+    Fixed(bool),
+    Orientation(Orientation),
+    ExcludeN(bool),
+    OnlyTwofold(bool),
+    Criterion(Criterion),
+    Spacer(bool),
+    Field(PsField, String),
+    Defaults,
+}
+
+impl PrimersearchDialog {
+    /// `last`: the parameters of the previous run; `conditions`: the Tm settings.
+    pub fn new(od: &OpenDoc, c0: usize, c1: usize, last: &ps::Params, conditions: TmConditions, version: &str) -> PrimersearchDialog {
+        let range = match od.ref_range(c0, c1) {
+            Some((a, b)) => format!(
+                "ref {}–{} (columns {}–{})",
+                group_digits(a as usize),
+                group_digits(b as usize),
+                group_digits(c0 + 1),
+                group_digits(c1)
+            ),
+            None => format!("columns {}–{}", group_digits(c0 + 1), group_digits(c1)),
+        };
+        let short = match od.ref_range(c0, c1) {
+            Some((a, b)) => format!("ref {a}-{b}"),
+            None => format!("columns {}-{}", c0 + 1, c1),
+        };
+        let mut d = PrimersearchDialog {
+            rows: if od.selected_rows.is_empty() { ExportRows::All } else { ExportRows::Selected },
+            name: format!("{} [{short}] primersearch", od.info.name),
+            mode: Mode::default(),
+            fixed: false,
+            orientation: Orientation::Forward,
+            exclude_n: false,
+            only_twofold: false,
+            criterion: Criterion::default(),
+            spacer: true,
+            fields: Default::default(),
+            c0,
+            c1,
+            range,
+            collapsed: od.kept_columns().is_some(),
+            stats: InputStats::default(),
+            version: version.to_string(),
+            conditions,
+            n_selected: od.selected_rows.len(),
+            doc_name: od.info.name.clone(),
+        };
+        d.set_params(last);
+        d.refresh(od);
+        d
+    }
+
+    fn set_params(&mut self, p: &ps::Params) {
+        self.mode = p.mode;
+        self.fixed = p.fixed;
+        self.orientation = if p.reverse { Orientation::Reverse } else { Orientation::Forward };
+        self.exclude_n = p.exclude_n;
+        self.only_twofold = p.only_twofold;
+        self.criterion = p.criterion;
+        self.spacer = p.spacer;
+        let c = &self.conditions;
+        self.fields = [
+            p.tm.to_string(),
+            p.three_prime.to_string(),
+            p.target.to_string(),
+            p.max_amb.to_string(),
+            p.max_seeds.to_string(),
+            p.n_oligos.to_string(),
+            p.mismatches.to_string(),
+            p.ambiguities.to_string(),
+            p.max_candidates.to_string(),
+            p.max_work.to_string(),
+            p.threads.to_string(),
+            c.oligo_nm.to_string(),
+            c.monovalent_mm.to_string(),
+            c.divalent_mm.to_string(),
+            c.dntp_mm.to_string(),
+        ];
+    }
+
+    /// Recounts the input after the row choice changed.
+    fn refresh(&mut self, od: &OpenDoc) {
+        let rows = super::chosen_rows(od, self.rows);
+        self.stats = ps::Input::new(&od.doc, &rows, self.c0, self.c1, od.kept_columns()).stats();
+    }
+
+    fn field(&self, f: PsField) -> &str {
+        self.fields[f as usize].trim()
+    }
+
+    pub fn update(&mut self, m: PrimersearchMsg, od: Option<&OpenDoc>) {
+        match m {
+            PrimersearchMsg::Rows(r) => {
+                self.rows = r;
+                if let Some(od) = od {
+                    self.refresh(od);
+                }
+            }
+            PrimersearchMsg::Name(s) => self.name = s,
+            PrimersearchMsg::Mode(x) => self.mode = x,
+            PrimersearchMsg::Fixed(b) => self.fixed = b,
+            PrimersearchMsg::Orientation(o) => self.orientation = o,
+            PrimersearchMsg::ExcludeN(b) => self.exclude_n = b,
+            PrimersearchMsg::OnlyTwofold(b) => self.only_twofold = b,
+            PrimersearchMsg::Criterion(c) => self.criterion = c,
+            PrimersearchMsg::Spacer(b) => self.spacer = b,
+            PrimersearchMsg::Field(f, s) => self.fields[f as usize] = s,
+            PrimersearchMsg::Defaults => self.set_params(&ps::Params::default()),
+        }
+    }
+
+    /// The run parameters and conditions, or the first invalid field.
+    pub fn params(&self) -> Result<(ps::Params, ps::Conditions), String> {
+        let float = |f: PsField, what: &str, lo: f64, hi: f64| {
+            self.field(f)
+                .replace(',', ".")
+                .parse::<f64>()
+                .ok()
+                .filter(|x| (lo..=hi).contains(x))
+                .ok_or_else(|| format!("{what} must be a number from {lo} to {hi}."))
+        };
+        let int = |f: PsField, what: &str, min: u64| {
+            self.field(f).replace([',', '_', ' '], "").parse::<u64>().ok().filter(|&x| x >= min).ok_or_else(|| {
+                if min > 0 { format!("{what} must be a whole number of at least {min}.") } else { format!("{what} must be a whole number.") }
+            })
+        };
+        let p = ps::Params {
+            mode: self.mode,
+            fixed: self.fixed,
+            reverse: self.orientation == Orientation::Reverse,
+            tm: float(PsField::Tm, "The minimum Tm", 0.0, 100.0)?,
+            three_prime: int(PsField::ThreePrime, "Conserved 3' bases", 0)? as usize,
+            target: float(PsField::Target, "The coverage target", 0.0, 100.0)?,
+            max_amb: int(PsField::MaxAmb, "Ambiguity codes per primer", 0)? as usize,
+            max_seeds: int(PsField::MaxSeeds, "Seeds per range", 0)? as usize,
+            exclude_n: self.exclude_n,
+            only_twofold: self.only_twofold,
+            criterion: self.criterion,
+            n_oligos: int(PsField::NOligos, "Oligos in the set", 1)? as usize,
+            mismatches: int(PsField::Mismatches, "Mismatches", 0)? as usize,
+            ambiguities: int(PsField::Ambiguities, "Ambiguity codes per oligo", 0)? as usize,
+            max_candidates: int(PsField::MaxCandidates, "Max. candidates", 0)?,
+            max_work: int(PsField::MaxWork, "Max. work", 0)?,
+            spacer: self.spacer,
+            threads: int(PsField::Threads, "Threads", 0)? as usize,
+        };
+        let c = ps::Conditions {
+            oligo_um: float(PsField::Oligo, "The oligo concentration", 0.001, 1e9)? / 1000.0,
+            na_mm: float(PsField::Na, "Na⁺", 0.0, 1e6)?,
+            mg_mm: float(PsField::Mg, "Mg²⁺", 0.0, 1e6)?,
+            dntp_mm: float(PsField::Dntp, "dNTP", 0.0, 1e6)?,
+        };
+        Ok((p, c))
+    }
+
+    /// Why the run cannot start yet.
+    pub fn problem(&self) -> Option<String> {
+        if self.stats.usable == 0 {
+            return Some("No sequence is usable in the selected columns.".into());
+        }
+        if self.name.trim().is_empty() {
+            return Some("Enter a name for the result.".into());
+        }
+        self.params().err()
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let m = Message::Primersearch;
+        let muted = |t: String| text(t).size(12).style(style::muted).wrapping(text::Wrapping::WordOrGlyph);
+        let field = |label: &'static str, f: PsField| {
+            row![
+                text(label).size(13).width(Fill),
+                text_input("", &self.fields[f as usize]).on_input(move |s| m(PrimersearchMsg::Field(f, s))).padding(4).size(13).width(120)
+            ]
+            .spacing(8)
+            .align_y(iced::Center)
+        };
+        let labeled = |label: &'static str, w: Element<'static, Message>| {
+            row![text(label).size(13).width(Length::Fixed(90.0)), w].spacing(8).align_y(iced::Center)
+        };
+        let s = &self.stats;
+        let d = group_digits;
+        let mut options = vec![ExportRows::All, ExportRows::Shown];
+        if self.n_selected > 0 {
+            options.push(ExportRows::Selected);
+        }
+        let empty = s.usable == 0;
+        let usable = text(format!("{} of {} sequences usable", d(s.usable), d(s.written)))
+            .size(13)
+            .font(Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT })
+            .style(move |t: &iced::Theme| text::Style { color: empty.then(|| t.extended_palette().danger.base.color) });
+        let mut dropped = format!(
+            "primersearch drops sequences with a gap, missing coverage or an N/ambiguity code in the selection: \
+             {} with gaps or no coverage, {} with N/ambiguity codes.",
+            d(s.gaps),
+            d(s.ambiguous)
+        );
+        if s.chosen > s.written {
+            dropped.push_str(&format!(" {} without any base in the selection are left out.", d(s.chosen - s.written)));
+        }
+        let mut input = column![
+            text("Input").size(15),
+            text(format!("Selection: {}, {} columns", self.range, d(s.columns))).size(13).wrapping(text::Wrapping::WordOrGlyph),
+        ]
+        .spacing(8);
+        if self.collapsed {
+            input = input.push(muted("Columns with gaps in the reference are left out (Collapse gaps).".into()));
+        }
+        input = input.push(pick_list(options, Some(self.rows), move |r| m(PrimersearchMsg::Rows(r))).text_size(13).width(Fill));
+        input = input.push(usable).push(muted(dropped));
+        let left = column![
+            input,
+            rule::horizontal(1),
+            text("Reaction conditions").size(15),
+            field("Oligo concentration (nM)", PsField::Oligo),
+            field("Na⁺/K⁺ (mM)", PsField::Na),
+            field("Mg²⁺ (mM)", PsField::Mg),
+            field("dNTP (mM)", PsField::Dntp),
+            muted("From Settings; changes here apply to this run only.".into()),
+            rule::horizontal(1),
+            text("Result").size(15),
+            text_input("Name of the result", &self.name).on_input(move |s| m(PrimersearchMsg::Name(s))).padding(6),
+            muted(format!(
+                "Saved as a text document in the library (in the folder of “{}”) when the run finishes. \
+                 PCR Studio stays usable while it runs.",
+                self.doc_name
+            )),
+        ]
+        .spacing(8)
+        .width(Fill);
+
+        let mut right = column![
+            text("Search").size(15),
+            labeled("Mode", pick_list(&Mode::ALL[..], Some(self.mode), move |x| m(PrimersearchMsg::Mode(x))).text_size(13).width(Fill).into()),
+            checkbox(self.fixed).label("Fixed slice: the selection is the primer site").on_toggle(move |b| m(PrimersearchMsg::Fixed(b))).text_size(13),
+            muted(if self.fixed {
+                "Generates the primer variants that cover all sequences at the selected columns. The Tm threshold is not enforced.".into()
+            } else {
+                "Searches the selected columns for primers that reach the minimum Tm.".into()
+            }),
+            labeled(
+                "Orientation",
+                pick_list([Orientation::Forward, Orientation::Reverse], Some(self.orientation), move |o| m(PrimersearchMsg::Orientation(o)))
+                    .text_size(13)
+                    .width(Fill)
+                    .into()
+            ),
+            field("Minimum Tm (°C)", PsField::Tm),
+            field("Conserved 3' bases", PsField::ThreePrime),
+        ]
+        .spacing(8)
+        .width(Fill);
+        match self.mode {
+            Mode::NoAmbiguities => {}
+            Mode::Incremental => {
+                right = right
+                    .push(field("Coverage target (%)", PsField::Target))
+                    .push(field("Ambiguity codes per primer", PsField::MaxAmb))
+                    .push(field("Seeds per range (0 = no cap)", PsField::MaxSeeds));
+            }
+            Mode::OptimizeByMismatch => {
+                right = right
+                    .push(
+                        row![
+                            text("Count sequences with").size(13).width(Fill),
+                            pick_list(&Criterion::ALL[..], Some(self.criterion), move |c| m(PrimersearchMsg::Criterion(c))).text_size(13).width(200)
+                        ]
+                        .spacing(8)
+                        .align_y(iced::Center),
+                    )
+                    .push(field("Mismatches", PsField::Mismatches))
+                    .push(field("Oligos in the set", PsField::NOligos))
+                    .push(field("Ambiguity codes per oligo", PsField::Ambiguities))
+                    .push(field("Max. candidates (0 = no limit)", PsField::MaxCandidates))
+                    .push(field("Max. work (0 = no limit)", PsField::MaxWork))
+                    .push(muted("The search is exhaustive; a run that exceeds a limit stops with an explanation.".into()));
+            }
+        }
+        if self.mode.uses_iupac() {
+            right = right
+                .push(checkbox(self.exclude_n).label("No N in primers").on_toggle(move |b| m(PrimersearchMsg::ExcludeN(b))).text_size(13))
+                .push(
+                    checkbox(self.only_twofold)
+                        .label("Only two-fold codes (R, Y, S, W, K, M)")
+                        .on_toggle(move |b| m(PrimersearchMsg::OnlyTwofold(b)))
+                        .text_size(13),
+                );
+        }
+        right = right
+            .push(rule::horizontal(1))
+            .push(text("Output").size(15))
+            .push(checkbox(self.spacer).label("Primer sequences in groups of three bases").on_toggle(move |b| m(PrimersearchMsg::Spacer(b))).text_size(13))
+            .push(field("Threads (0 = all cores)", PsField::Threads));
+
+        let body = scrollable(row![left, right].spacing(32).padding(iced::Padding { right: 12.0, ..Default::default() })).height(Length::Shrink);
+        let problem = self.problem();
+        let buttons = row![
+            text(problem.clone().unwrap_or_default()).size(12).style(style::muted).width(Fill),
+            button("Defaults").on_press(m(PrimersearchMsg::Defaults)).style(button::text),
+            button("Cancel").on_press(Message::CloseModal).style(button::secondary),
+            button("Run").on_press_maybe(problem.is_none().then_some(Message::RunPrimersearch)).style(button::primary),
+        ]
+        .spacing(10)
+        .align_y(iced::Center);
+        dialog_frame_owned(format!("Find primers · primersearch {}", self.version), body.into(), buttons.into(), 920.0)
+    }
+}
+
+// ---------------------------------------------------------------- text viewer
+
+/// Shows a text document (read-only; text can be selected and copied).
+pub struct TextView {
+    pub name: String,
+    pub info: String,
+    pub content: text_editor::Content,
+}
+
+#[derive(Debug, Clone)]
+pub enum TextViewMsg {
+    Action(text_editor::Action),
+    Copy,
+    SaveAs,
+}
+
+impl TextView {
+    pub fn new(name: String, info: String, content: &str) -> TextView {
+        TextView { name, info, content: text_editor::Content::with_text(content) }
+    }
+
+    pub fn update(&mut self, m: TextViewMsg) -> Option<Task<Message>> {
+        match m {
+            // Selecting and scrolling only; the text cannot be changed.
+            TextViewMsg::Action(a) => {
+                if !a.is_edit() {
+                    self.content.perform(a);
+                }
+                None
+            }
+            TextViewMsg::Copy => Some(iced::clipboard::write(self.content.text())),
+            TextViewMsg::SaveAs => Some(Task::perform(
+                rfd::AsyncFileDialog::new()
+                    .set_title("Save as text file")
+                    .set_file_name(format!("{}.txt", sanitize(&self.name)))
+                    .add_filter("Text", &["txt"])
+                    .save_file(),
+                |f| Message::TextSavePicked(f.map(|f| f.path().to_path_buf())),
+            )),
+        }
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let t = Message::TextView;
+        let body = column![
+            text(self.info.as_str()).size(12).style(style::muted).wrapping(text::Wrapping::WordOrGlyph),
+            text_editor(&self.content)
+                .on_action(move |a| t(TextViewMsg::Action(a)))
+                .font(Font::MONOSPACE)
+                .size(12)
+                .padding(8)
+                .height(Length::Fixed(600.0))
+                .wrapping(text::Wrapping::WordOrGlyph),
+        ]
+        .spacing(10);
+        let buttons = row![
+            button("Copy all").on_press(t(TextViewMsg::Copy)).style(button::secondary),
+            button("Save as .txt…").on_press(t(TextViewMsg::SaveAs)).style(button::secondary),
+            Space::new().width(Fill),
+            button("Close").on_press(Message::CloseModal).style(button::primary),
+        ]
+        .spacing(10);
+        dialog_frame(self.name.as_str(), body.into(), buttons.into(), 1040.0)
     }
 }
 
@@ -1015,6 +1584,10 @@ fn irreversible<'a>(what: &'a str) -> Element<'a, Message> {
 }
 
 pub fn dialog_frame<'a>(title: &'a str, body: Element<'a, Message>, buttons: Element<'a, Message>, width: f32) -> Element<'a, Message> {
+    dialog_frame_owned(title.to_string(), body, buttons, width)
+}
+
+pub fn dialog_frame_owned<'a>(title: String, body: Element<'a, Message>, buttons: Element<'a, Message>, width: f32) -> Element<'a, Message> {
     container(column![text(title).size(20), body, buttons].spacing(16))
         .padding(22)
         .width(Length::Fixed(width))
@@ -1118,9 +1691,25 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
             dialog_frame("Metadata from sequence names", body.into(), buttons.into(), 520.0)
         }
         Modal::Info { title, text: t } => {
-            let body = text(t.as_str()).size(14);
+            let body = text(t.as_str()).size(14).wrapping(text::Wrapping::WordOrGlyph);
             let buttons = row![Space::new().width(Fill), button("OK").on_press(Message::CloseModal).style(button::primary)];
             dialog_frame(title.as_str(), body.into(), buttons.into(), 480.0)
+        }
+        Modal::Primersearch(d) => d.view(),
+        Modal::TextView(v) => v.view(),
+        Modal::ConfirmExit { detail } => {
+            let body = column![
+                text(detail.as_str()).size(14),
+                text("Exiting stops it; its output is not saved.").size(13).style(style::muted),
+            ]
+            .spacing(10);
+            let buttons = row![
+                Space::new().width(Fill),
+                button("Keep running").on_press(Message::CloseModal).style(button::secondary),
+                button("Stop and exit").on_press(Message::ConfirmExit).style(button::danger),
+            ]
+            .spacing(10);
+            dialog_frame("Exit PCR Studio?", body.into(), buttons.into(), 460.0)
         }
     }
 }

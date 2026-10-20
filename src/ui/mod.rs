@@ -16,23 +16,31 @@ use crate::mapper::{self, MapParams};
 use crate::model::{Annotation, AnnotationKind, ConsensusThreshold, DocInfo, DocKind, Document, Folder, Row};
 use crate::primer::{self, OligoSource, Orientation, PrimerOptions};
 use crate::search::{self, Scope};
+use crate::tools::primersearch as ps;
+use crate::tools::{self, ToolConfig, ToolSpec, ToolStatus};
 use canvas::ViewMsg;
-use dialogs::{AnnotationDialog, EditTarget, ExportDialog, ExportRows, MapDialog, Modal, RefChoice, SequenceDialog, SettingsDialog};
+use dialogs::{
+    AnnotationDialog, EditTarget, ExportDialog, ExportRows, MapDialog, Modal, PrimersearchDialog, RefChoice, SequenceDialog, SettingsDialog, TextView,
+    TextViewMsg,
+};
 use iced::keyboard::{self, Key, key::Named};
 use iced::{Subscription, Task, Theme};
 use job::{Job, Payload};
 use serde::{Deserialize, Serialize};
 use state::{BASE_COL_W, Highlight, OpenDoc, Selection, ViewPrefs};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 pub fn run() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
-        // Start maximized; restoring the window returns to 1500 × 920.
-        .window(iced::window::Settings { size: iced::Size::new(1500.0, 920.0), maximized: true, ..Default::default() })
+        // Start maximized; restoring the window returns to 1500 × 920. Closing
+        // asks first while an external tool runs.
+        .window(iced::window::Settings { size: iced::Size::new(1500.0, 920.0), maximized: true, exit_on_close_request: false, ..Default::default() })
         .antialiasing(false)
         .run()
 }
@@ -50,6 +58,16 @@ pub struct AppSettings {
     pub library_w: f32,
     pub options_w: f32,
     pub show_options: bool,
+    /// Location of each external tool (by tool id); missing: the default.
+    pub tools: BTreeMap<String, ToolConfig>,
+    /// Parameters of the last primersearch run.
+    pub primersearch: ps::Params,
+}
+
+impl AppSettings {
+    pub fn tool_config(&self, id: &str) -> ToolConfig {
+        self.tools.get(id).cloned().unwrap_or_default()
+    }
 }
 
 impl Default for AppSettings {
@@ -63,6 +81,8 @@ impl Default for AppSettings {
             library_w: LIBRARY_W_DEFAULT,
             options_w: OPTIONS_W_DEFAULT,
             show_options: true,
+            tools: BTreeMap::new(),
+            primersearch: ps::Params::default(),
         }
     }
 }
@@ -175,6 +195,22 @@ impl std::fmt::Display for FolderChoice {
 
 pub struct LoadedDoc {
     open: OpenDoc,
+}
+
+/// An external tool running alongside the regular jobs (one at a time).
+struct ToolRun {
+    name: &'static str,
+    job: Job,
+    handle: Arc<tools::run::Handle>,
+    started: Instant,
+}
+
+/// How a tool run ended.
+pub enum RunOutcome {
+    /// The output was saved as library document `id`.
+    Saved { id: i64, status: String },
+    Cancelled,
+    Failed(String),
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +346,19 @@ pub enum Message {
     CloseModal,
     CancelJob,
     DemoData,
+    // External tools
+    /// Result of checking a tool with the given configuration.
+    ToolChecked(&'static str, ToolConfig, ToolStatus),
+    OpenPrimersearch,
+    Primersearch(dialogs::PrimersearchMsg),
+    RunPrimersearch,
+    PrimersearchDone(Payload<RunOutcome>),
+    CancelToolRun,
+    TextView(TextViewMsg),
+    TextSavePicked(Option<PathBuf>),
+    /// The window's close button (or Exit) while a tool may be running.
+    CloseRequested,
+    ConfirmExit,
     // Menu bar
     ToggleMenu(menu::MenuId),
     HoverMenu(menu::MenuId),
@@ -350,6 +399,9 @@ pub struct App {
     open: Option<OpenDoc>,
     settings: AppSettings,
     job: Option<Job>,
+    /// Status of each external tool (by id).
+    tool_status: HashMap<&'static str, ToolStatus>,
+    tool_run: Option<ToolRun>,
     modal: Option<Modal>,
     status: String,
     error: Option<String>,
@@ -374,8 +426,7 @@ impl App {
         let paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).filter(|p| p.is_file()).collect();
         let import = if paths.is_empty() { Task::none() } else { Task::done(Message::ImportPicked(Some(paths))) };
         let size = iced::window::latest().and_then(iced::window::size).map(Message::WindowSize);
-        let task = Task::batch([import, size]);
-        let app = App {
+        let mut app = App {
             db,
             db_path,
             library,
@@ -394,11 +445,14 @@ impl App {
             open: None,
             settings,
             job: None,
+            tool_status: HashMap::new(),
+            tool_run: None,
             modal: None,
             status,
             error,
         };
-        (app, task)
+        let check = app.check_tools(tools::ALL);
+        (app, Task::batch([import, size, check]))
     }
 
     fn title(&self) -> String {
@@ -417,7 +471,8 @@ impl App {
             keyboard::listen().map(Message::Key),
             iced::window::resize_events().map(|(_id, size)| Message::WindowSize(size)),
         ];
-        if self.job.is_some() {
+        subs.push(iced::window::close_requests().map(|_| Message::CloseRequested));
+        if self.job.is_some() || self.tool_run.is_some() {
             subs.push(iced::time::every(std::time::Duration::from_millis(120)).map(|_| Message::Tick));
         }
         if let Some(d) = &self.drag {
@@ -672,6 +727,38 @@ impl App {
         self.job.is_some()
     }
 
+    fn tool_ready(&self, id: &str) -> bool {
+        self.tool_status.get(id).is_some_and(ToolStatus::is_ready)
+    }
+
+    /// Checks the tools in the background with their current settings.
+    fn check_tools(&mut self, specs: impl IntoIterator<Item = &'static ToolSpec>) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for spec in specs {
+            self.tool_status.insert(spec.id, ToolStatus::Checking);
+            let cfg = self.settings.tool_config(spec.id);
+            let checked = cfg.clone();
+            tasks.push(job::background(move || tools::check(spec, &checked), move |st| {
+                Message::ToolChecked(spec.id, cfg, st.unwrap_or_else(|| ToolStatus::Unavailable("the check failed".into())))
+            }));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Exit, after asking while an external tool runs.
+    fn request_exit(&mut self) -> Task<Message> {
+        match &self.tool_run {
+            Some(r) => {
+                let detail = format!("A {} run is in progress (running for {}).", r.name, ps::duration(r.started.elapsed().as_secs_f64()));
+                self.menu = None;
+                self.context = None;
+                self.modal = Some(Modal::ConfirmExit { detail });
+                Task::none()
+            }
+            None => iced::exit(),
+        }
+    }
+
     fn start_job<T: Send + 'static>(
         &mut self,
         title: &str,
@@ -685,6 +772,10 @@ impl App {
     }
 
     fn open_document(&mut self, id: i64) -> Task<Message> {
+        if self.library.iter().any(|d| d.id == id && d.kind == DocKind::Text) {
+            self.open_text(id);
+            return Task::none();
+        }
         if self.busy() {
             return Task::none();
         }
@@ -705,6 +796,23 @@ impl App {
             },
             |r| Message::DocLoaded(Payload::new(r.unwrap_or_else(|| Err("Opening the document failed".into())))),
         )
+    }
+
+    /// Shows a text document; the open alignment stays open.
+    fn open_text(&mut self, id: i64) {
+        let Some(info) = self.library.iter().find(|d| d.id == id) else { return };
+        match self.db.text_content(id) {
+            Ok(content) => {
+                let mut about = info.description.clone();
+                if !about.is_empty() {
+                    about.push_str(" · ");
+                }
+                about.push_str(&format!("saved {}", info.created));
+                self.modal = Some(Modal::TextView(TextView::new(info.name.clone(), about, &content)));
+                self.set_primary(Some(LibKey::Doc(id)));
+            }
+            Err(e) => self.error = Some(e),
+        }
     }
 
     fn with_doc(&mut self, f: impl FnOnce(&mut OpenDoc, &AppSettings)) {
@@ -1071,7 +1179,11 @@ impl App {
             }
             Message::AskDelete(id) => {
                 if let Some(d) = self.library.iter().find(|d| d.id == id) {
-                    let mut detail = format!("{} · {} sequences · {} bp", d.kind.label(), canvas::group_digits(d.n_rows), canvas::group_digits(d.width));
+                    let mut detail = if d.kind == DocKind::Text {
+                        format!("Text document · saved {}", d.created)
+                    } else {
+                        format!("{} · {} sequences · {} bp", d.kind.label(), canvas::group_digits(d.n_rows), canvas::group_digits(d.width))
+                    };
                     if self.open.as_ref().is_some_and(|o| o.info.id == id) {
                         detail.push_str("\nThe document is open and will be closed.");
                     }
@@ -1351,10 +1463,12 @@ impl App {
                     None => {}
                 }
             }
-            Message::OpenSettings => self.modal = Some(Modal::Settings(SettingsDialog::new(&self.settings))),
+            Message::OpenSettings => self.modal = Some(Modal::Settings(SettingsDialog::new(&self.settings, &self.tool_status))),
             Message::Settings(m) => {
-                if let Some(Modal::Settings(d)) = self.modal.as_mut() {
-                    d.update(m);
+                if let Some(Modal::Settings(d)) = self.modal.as_mut()
+                    && let Some(task) = d.update(m)
+                {
+                    return task;
                 }
             }
             Message::SaveSettings => {
@@ -1362,7 +1476,57 @@ impl App {
                     d.apply(&mut self.settings);
                     self.save_settings();
                     self.after_selection_change();
+                    // Tool locations may have changed (or the tools themselves).
+                    return self.check_tools(tools::ALL);
                 }
+            }
+            Message::ToolChecked(id, cfg, status) => {
+                // A result for an outdated configuration is dropped.
+                if self.settings.tool_config(id) == cfg {
+                    self.tool_status.insert(id, status);
+                }
+            }
+            Message::OpenPrimersearch => self.open_primersearch(),
+            Message::Primersearch(m) => {
+                if let Some(Modal::Primersearch(d)) = self.modal.as_mut() {
+                    d.update(m, self.open.as_ref());
+                }
+            }
+            Message::RunPrimersearch => return self.run_primersearch(),
+            Message::PrimersearchDone(p) => return self.primersearch_done(p.take()),
+            Message::CancelToolRun => {
+                if let Some(r) = &self.tool_run {
+                    r.job.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.status = format!("Stopping {}…", r.name);
+                }
+            }
+            Message::TextView(m) => {
+                if let Some(Modal::TextView(v)) = self.modal.as_mut() {
+                    if matches!(m, TextViewMsg::Copy) {
+                        self.status = "Text copied to the clipboard".into();
+                    }
+                    if let Some(task) = v.update(m) {
+                        return task;
+                    }
+                }
+            }
+            Message::TextSavePicked(Some(path)) => {
+                if let Some(Modal::TextView(v)) = self.modal.as_ref() {
+                    match std::fs::write(&path, v.content.text()) {
+                        Ok(()) => self.status = format!("Saved {}", path.display()),
+                        Err(e) => self.error = Some(format!("Cannot write {}: {e}", path.display())),
+                    }
+                }
+            }
+            Message::TextSavePicked(None) => {}
+            Message::CloseRequested => return self.request_exit(),
+            Message::ConfirmExit => {
+                // Stop the tool before exiting; it would keep running otherwise.
+                if let Some(r) = &self.tool_run {
+                    r.job.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    r.handle.kill();
+                }
+                return iced::exit();
             }
             Message::Modal(m) => return self.on_modal(m),
             Message::CloseModal => self.modal = None,
@@ -1399,7 +1563,7 @@ impl App {
                     return Task::batch([iced::widget::operation::focus(SEARCH_INPUT), iced::widget::operation::select_all(SEARCH_INPUT)]);
                 }
             }
-            Message::Exit => return iced::exit(),
+            Message::Exit => return self.request_exit(),
         }
         Task::none()
     }
@@ -1949,22 +2113,7 @@ impl App {
             (true, Some(rc)) => Some(rc.is_base.clone()),
             _ => None,
         };
-        let rows: Vec<usize> = match d.rows {
-            ExportRows::All => (0..doc.rows.len()).filter(|&i| Some(i) != reference).collect(),
-            ExportRows::Selected => {
-                let mut v: Vec<usize> = od.selected_rows.iter().copied().collect();
-                v.sort();
-                v
-            }
-            ExportRows::Shown => od
-                .items
-                .iter()
-                .filter_map(|it| match it {
-                    crate::display::Item::Seq { row, .. } => Some(*row),
-                    _ => None,
-                })
-                .collect(),
-        };
+        let rows = row_set(od, d.rows);
         self.start_job(
             "Exporting FASTA",
             false,
@@ -2078,6 +2227,162 @@ impl App {
             },
             |r| Message::MapDone(Payload::new(r.unwrap_or_else(|| Err("Mapping failed unexpectedly".into())))),
         )
+    }
+
+    fn open_primersearch(&mut self) {
+        let version = match self.tool_status.get(tools::PRIMERSEARCH.id) {
+            Some(ToolStatus::Ready { version, .. }) => version.clone(),
+            _ => {
+                self.error = Some("primersearch is not available: set it up in Edit → Settings → External tools.".into());
+                return;
+            }
+        };
+        if self.tool_run.is_some() {
+            self.error = Some("primersearch is already running; wait for it to finish or stop it in the status bar.".into());
+            return;
+        }
+        let Some(od) = self.open.as_ref() else { return };
+        let Some(sel) = od.selection else {
+            self.error = Some("Select a column range first (drag across the alignment).".into());
+            return;
+        };
+        let d = PrimersearchDialog::new(od, sel.c0, sel.c1, &self.settings.primersearch, self.settings.primer.tm, &version);
+        self.modal = Some(Modal::Primersearch(d));
+    }
+
+    /// Starts primersearch on the dialog's input. It runs alongside other
+    /// work; the output is saved as a text document when it finishes.
+    fn run_primersearch(&mut self) -> Task<Message> {
+        let Some(Modal::Primersearch(d)) = self.modal.as_ref() else { return Task::none() };
+        let (Ok((params, conditions)), None) = (d.params(), d.problem()) else { return Task::none() };
+        let Some(ToolStatus::Ready { path, version }) = self.tool_status.get(tools::PRIMERSEARCH.id).cloned() else {
+            self.error = Some("primersearch is not available: set it up in Edit → Settings → External tools.".into());
+            return Task::none();
+        };
+        if self.tool_run.is_some() {
+            return Task::none();
+        }
+        let Some(od) = self.open.as_ref() else { return Task::none() };
+        let rows = chosen_rows(od, d.rows);
+        let rows_label = if od.reference.is_some() { format!("{}, without the reference", d.rows) } else { d.rows.to_string() };
+        let (c0, c1) = (d.c0, d.c1);
+        let only = od.kept_columns().map(<[bool]>::to_vec);
+        let doc = od.doc.clone();
+        let rc = od.ref_coords.clone();
+        let folder = od.info.folder;
+        let doc_name = od.info.name.clone();
+        let (name, range, collapsed) = (d.name.trim().to_string(), d.range.clone(), d.collapsed);
+        self.settings.primersearch = params.clone();
+        self.save_settings();
+        self.modal = None;
+        self.status = format!("primersearch is running on {range}; the result is saved in the library when it finishes");
+        let db_path = self.db_path.clone();
+        let handle = Arc::new(tools::run::Handle::default());
+        let h = handle.clone();
+        let (job, task) = job::spawn(
+            "primersearch",
+            true,
+            move |p| {
+                p.set(0.0, "Preparing the input");
+                let input = ps::Input::new(&doc, &rows, c0, c1, only.as_deref());
+                let stats = input.stats();
+                if stats.usable == 0 {
+                    return RunOutcome::Failed("No sequence is usable in the selected columns".into());
+                }
+                let file = tools::run::TempFile::new("fasta");
+                if let Err(e) = fasta::write_fasta(&file.path, &input.records()) {
+                    return RunOutcome::Failed(e);
+                }
+                let mut db = match Db::open(&db_path) {
+                    Ok(db) => db,
+                    Err(e) => return RunOutcome::Failed(e),
+                };
+                let started = db.now_local();
+                let clock = Instant::now();
+                let args = ps::args(&params, &conditions, &file.path);
+                let mut cmd = tools::run::command(&path);
+                cmd.args(&args);
+                p.set(0.0, "Starting");
+                let on_event = |ev: &serde_json::Value| {
+                    if let Some((fraction, message)) = ps::progress(ev) {
+                        match fraction {
+                            Some(f) => p.set(f, &message),
+                            None => p.set_message(&message),
+                        }
+                    }
+                };
+                let out = match tools::run::run(cmd, &h, &p.cancel, &on_event) {
+                    Ok(out) => out,
+                    Err(e) => return RunOutcome::Failed(e),
+                };
+                if out.cancelled {
+                    return RunOutcome::Cancelled;
+                }
+                if out.code != Some(0) {
+                    return RunOutcome::Failed(format!("primersearch stopped with an error:\n{}", out.failure()));
+                }
+                let seconds = clock.elapsed().as_secs_f64();
+                let finished = db.now_local();
+                let positions = ps::position_map(&input.columns, rc.as_ref());
+                let command = ps::command_line(&args);
+                let report = ps::Report {
+                    document: &doc_name,
+                    selection: &range,
+                    collapsed,
+                    rows: &rows_label,
+                    stats,
+                    version: &version,
+                    path: &path,
+                    command: &command,
+                    started: &started,
+                    finished: &finished,
+                    seconds,
+                    positions: &positions,
+                };
+                let took = ps::duration(seconds);
+                let description = format!(
+                    "primersearch {version} on {range} of “{doc_name}”: {} of {} sequences usable, {took}",
+                    canvas::group_digits(stats.usable),
+                    canvas::group_digits(stats.written)
+                );
+                match db.insert_text_document(&name, &report.text(&out.stdout), &description, folder) {
+                    Ok(id) => RunOutcome::Saved { id, status: format!("primersearch finished after {took}: saved “{name}” in the library") },
+                    Err(e) => RunOutcome::Failed(format!("The primersearch output could not be saved: {e}")),
+                }
+            },
+            |r| Message::PrimersearchDone(Payload::new(r.unwrap_or_else(|| RunOutcome::Failed("primersearch run failed unexpectedly".into())))),
+        );
+        self.tool_run = Some(ToolRun { name: "primersearch", job, handle, started: Instant::now() });
+        task
+    }
+
+    fn primersearch_done(&mut self, outcome: Option<RunOutcome>) -> Task<Message> {
+        self.tool_run = None;
+        // Results open on their own only when nothing else is in progress on screen.
+        let quiet = self.modal.is_none() && self.menu.is_none() && self.context.is_none() && self.drag.is_none() && self.split_drag.is_none();
+        match outcome {
+            Some(RunOutcome::Saved { id, status }) => {
+                self.reload_library();
+                let folder = self.library.iter().find(|d| d.id == id).and_then(|d| d.folder);
+                self.reveal_folder(folder);
+                self.status = status;
+                if quiet {
+                    self.lib_multi.clear();
+                    self.open_text(id);
+                }
+            }
+            Some(RunOutcome::Cancelled) => self.status = "primersearch run stopped; nothing was saved".into(),
+            Some(RunOutcome::Failed(e)) => {
+                self.status = "primersearch failed; nothing was saved".into();
+                if quiet {
+                    self.modal = Some(Modal::Info { title: "primersearch failed".into(), text: e });
+                } else {
+                    self.error = Some(e.replace('\n', " "));
+                }
+            }
+            None => self.error = Some("primersearch run failed unexpectedly".into()),
+        }
+        Task::none()
     }
 
     /// Saves the selected columns of all sequences (without the reference) as a
@@ -2228,7 +2533,34 @@ impl App {
     }
 }
 
-/// Range of columns `[c0, c1)` for messages: reference positions or columns.
+/// Rows of the open document for an export or a tool run: all sequences
+/// without the reference, those shown, or the selected rows.
+fn row_set(od: &OpenDoc, which: ExportRows) -> Vec<usize> {
+    match which {
+        ExportRows::All => (0..od.doc.rows.len()).filter(|&i| Some(i) != od.reference).collect(),
+        ExportRows::Selected => {
+            let mut v: Vec<usize> = od.selected_rows.iter().copied().collect();
+            v.sort();
+            v
+        }
+        ExportRows::Shown => od
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                crate::display::Item::Seq { row, .. } => Some(*row),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+/// `row_set` without the reference.
+fn chosen_rows(od: &OpenDoc, which: ExportRows) -> Vec<usize> {
+    let mut rows = row_set(od, which);
+    rows.retain(|&r| Some(r) != od.reference);
+    rows
+}
+
 /// How a sort is described in menus and the status bar ("by name (A→Z)").
 fn sort_phrase(od: &OpenDoc, key: &RowSort, descending: bool) -> String {
     match key {

@@ -6,3 +6,4 @@ old/
 *.md
 !README.md
 !CHANGELOG.md
+/assets

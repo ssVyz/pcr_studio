@@ -8,6 +8,7 @@ use crate::display::{Item, RowSort, SortKey};
 use crate::model::ConsensusThreshold;
 use crate::primer::{self, OligoSource, Orientation, PrimerReport};
 use crate::search::Scope;
+use crate::tools;
 use iced::widget::canvas::{self as cv, Frame, Geometry};
 use iced::widget::{
     Space, button, canvas, center, checkbox, column, container, mouse_area, opaque, pick_list, progress_bar, row, rule, scrollable, slider,
@@ -102,6 +103,16 @@ impl App {
                     Entry::item("Oligo report", "", report.then_some(Message::ShowPopup)),
                     Entry::item("Copy oligo", "Ctrl+C", report.then_some(Message::CopyOligo)),
                     Entry::item("Extract selection to library", "", (idle && selection).then_some(Message::ExtractSlice)),
+                ]);
+                // Only offered when primersearch is set up.
+                if self.tool_ready(tools::PRIMERSEARCH.id) {
+                    entries.push(Entry::item(
+                        "Find primers (primersearch)…",
+                        "",
+                        (selection && self.tool_run.is_none()).then_some(Message::OpenPrimersearch),
+                    ));
+                }
+                entries.extend([
                     Entry::Separator,
                     Entry::item("Clear selection", "Esc", selection.then_some(Message::ClearSelection)),
                     Entry::Separator,
@@ -277,11 +288,25 @@ impl App {
                 Entry::item("Map to reference…", "Ctrl+M", when(idle && doc, Message::OpenMapDialog)),
                 Entry::item("Metadata from sequence names…", "", when(doc, Message::OpenNameFields)),
                 Entry::Separator,
+                self.primersearch_entry(selection),
+                Entry::Separator,
                 Entry::item("Oligo report for selection", "", when(report, Message::ShowPopup)),
                 Entry::item("Find sequence…", "Ctrl+F", when(doc, Message::FocusSearch)),
                 Entry::item("Go to position…", "Ctrl+G", when(doc, Message::FocusJump)),
             ],
         }
+    }
+
+    /// Tools menu entry for primersearch; disabled (with the reason) when the
+    /// tool is not set up or already running.
+    fn primersearch_entry(&self, selection: bool) -> menu::Entry {
+        let ready = self.tool_ready(tools::PRIMERSEARCH.id);
+        let label = match (ready, self.tool_run.is_some()) {
+            (false, _) => "Find primers (primersearch not available)",
+            (true, true) => "Find primers (primersearch is running)",
+            (true, false) => "Find primers in selection (primersearch)…",
+        };
+        menu::Entry::item(label, "", (ready && selection && self.tool_run.is_none()).then_some(Message::OpenPrimersearch))
     }
 
     fn library_panel(&self, width: f32) -> Element<'_, Message> {
@@ -447,7 +472,11 @@ impl App {
         for d in self.library.iter().filter(|d| parent_of(d.folder) == parent) {
             let open = self.open.as_ref().is_some_and(|o| o.info.id == d.id);
             let kind = d.kind.label();
-            let subtitle = format!("{kind} · {} seqs · {} bp", group_digits(d.n_rows), group_digits(d.width));
+            let subtitle = if d.kind == crate::model::DocKind::Text {
+                format!("{kind} · {}", d.created)
+            } else {
+                format!("{kind} · {} seqs · {} bp", group_digits(d.n_rows), group_digits(d.width))
+            };
             let name = text(d.name.as_str()).size(13).font(if open {
                 Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT }
             } else {
@@ -783,22 +812,32 @@ impl App {
                 } else {
                     "Save these columns of all sequences (without the reference) as a new library document"
                 };
+                let mut actions = row![tooltip(
+                    button(text("Extract slice").size(12)).padding([4, 8]).style(button::secondary).on_press_maybe((!self.busy()).then_some(Message::ExtractSlice)),
+                    container(text(slice_tip).size(12)).padding(6).max_width(320).style(container::rounded_box),
+                    tooltip::Position::Bottom,
+                )]
+                .spacing(6);
+                // Only offered when primersearch is set up.
+                if self.tool_ready(tools::PRIMERSEARCH.id) {
+                    actions = actions.push(tooltip(
+                        button(text("Find primers…").size(12))
+                            .padding([4, 8])
+                            .style(button::secondary)
+                            .on_press_maybe(self.tool_run.is_none().then_some(Message::OpenPrimersearch)),
+                        container(text("Run primersearch on these columns; the result is saved in the library").size(12))
+                            .padding(6)
+                            .max_width(320)
+                            .style(container::rounded_box),
+                        tooltip::Position::Bottom,
+                    ));
+                }
+                actions = actions.push(button(text("Clear").size(12)).padding([4, 8]).style(button::text).on_press(Message::ClearSelection));
                 column![
                     section("Selection"),
                     text(format!("{} columns{hidden} ({}–{}){rr}", sel.len(), group_digits(sel.c0 + 1), group_digits(sel.c1))).size(12),
                     report_row,
-                    row![
-                        tooltip(
-                            button(text("Extract slice").size(12))
-                                .padding([4, 8])
-                                .style(button::secondary)
-                                .on_press_maybe((!self.busy()).then_some(Message::ExtractSlice)),
-                            container(text(slice_tip).size(12)).padding(6).max_width(320).style(container::rounded_box),
-                            tooltip::Position::Bottom,
-                        ),
-                        button(text("Clear").size(12)).padding([4, 8]).style(button::text).on_press(Message::ClearSelection),
-                    ]
-                    .spacing(6)
+                    actions,
                 ]
                 .spacing(6)
                 .into()
@@ -964,7 +1003,20 @@ impl App {
         } else {
             text(self.hover_text().unwrap_or_else(|| self.status.clone())).size(12).into()
         };
-        let right: Element<Message> = match &self.job {
+        let mut right = row![].spacing(18).align_y(Alignment::Center);
+        if let Some(t) = &self.tool_run {
+            let label = format!("{} · {} · {}", t.name, ellipsize_middle(&t.job.progress.message(), 80), clock(t.started.elapsed()));
+            right = right.push(
+                row![
+                    text(label).size(12),
+                    progress_bar(0.0..=1.0, t.job.progress.fraction()).length(140).girth(10),
+                    button(text("Stop").size(11)).padding([1, 8]).style(button::secondary).on_press(Message::CancelToolRun),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
+        match &self.job {
             Some(j) => {
                 let msg = j.progress.message();
                 let label = if msg.is_empty() { j.title.clone() } else { msg };
@@ -974,10 +1026,11 @@ impl App {
                 if j.cancellable {
                     r = r.push(button(text("Cancel").size(11)).padding([1, 8]).style(button::secondary).on_press(Message::CancelJob));
                 }
-                r.into()
+                right = right.push(r);
             }
-            None => text(self.selection_text().unwrap_or_default()).size(12).into(),
-        };
+            None if self.tool_run.is_none() => right = right.push(text(self.selection_text().unwrap_or_default()).size(12)),
+            None => {}
+        }
         container(row![left, Space::new().width(Fill), right].align_y(Alignment::Center).spacing(10))
             .padding([4, 12])
             .width(Fill)
@@ -1031,6 +1084,12 @@ impl App {
         }
         Some(s)
     }
+}
+
+/// Elapsed time as m:ss or h:mm:ss.
+fn clock(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
 }
 
 /// Shortens long sequences to `start…end` so they fit on one line.

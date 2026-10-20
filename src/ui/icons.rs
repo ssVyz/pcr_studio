@@ -18,6 +18,9 @@ const ALIGNMENT: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0
 /// Contig: reference on top, mapped reads staggered below.
 const CONTIG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><g fill="#000"><rect x="2" y="3.5" width="20" height="3.6" rx="1.8"/><rect x="3" y="9.6" width="11" height="2.8" rx="1.4" opacity="0.7"/><rect x="9" y="14.1" width="12" height="2.8" rx="1.4" opacity="0.7"/><rect x="5" y="18.6" width="10" height="2.8" rx="1.4" opacity="0.7"/></g></svg>"##;
 
+/// Text: a page with lines.
+const TEXT: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M5 3.5A1.5 1.5 0 0 1 6.5 2h8.3L19 6.2v14.3a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 20.5z" fill="#000" opacity="0.35"/><g fill="#000"><rect x="7.5" y="9" width="9" height="1.8" rx="0.9"/><rect x="7.5" y="12.6" width="9" height="1.8" rx="0.9"/><rect x="7.5" y="16.2" width="6" height="1.8" rx="0.9"/></g></svg>"##;
+
 const CHEVRON_RIGHT: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9 5.5l7 6.5-7 6.5" fill="none" stroke="#000" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 
 const CHEVRON_DOWN: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M5.5 9l6.5 7 6.5-7" fill="none" stroke="#000" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
@@ -31,6 +34,7 @@ static FOLDER_OPEN_H: LazyLock<Handle> = LazyLock::new(|| handle(FOLDER_OPEN));
 static SEQUENCES_H: LazyLock<Handle> = LazyLock::new(|| handle(SEQUENCES));
 static ALIGNMENT_H: LazyLock<Handle> = LazyLock::new(|| handle(ALIGNMENT));
 static CONTIG_H: LazyLock<Handle> = LazyLock::new(|| handle(CONTIG));
+static TEXT_H: LazyLock<Handle> = LazyLock::new(|| handle(TEXT));
 static CHEVRON_RIGHT_H: LazyLock<Handle> = LazyLock::new(|| handle(CHEVRON_RIGHT));
 static CHEVRON_DOWN_H: LazyLock<Handle> = LazyLock::new(|| handle(CHEVRON_DOWN));
 
@@ -60,6 +64,7 @@ pub fn document<'a, M: 'a>(kind: DocKind, dark: bool) -> Element<'a, M> {
         DocKind::Sequences => (&*SEQUENCES_H, Color::from_rgb8(58, 118, 214), Color::from_rgb8(110, 160, 240)),
         DocKind::Alignment => (&*ALIGNMENT_H, Color::from_rgb8(22, 150, 136), Color::from_rgb8(70, 190, 170)),
         DocKind::Contig => (&*CONTIG_H, Color::from_rgb8(140, 82, 204), Color::from_rgb8(180, 130, 240)),
+        DocKind::Text => (&*TEXT_H, Color::from_rgb8(96, 106, 122), Color::from_rgb8(170, 180, 196)),
     };
     icon(h, 17.0, if dark { darkc } else { light })
 }

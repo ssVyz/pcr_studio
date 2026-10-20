@@ -45,6 +45,12 @@ impl Progress {
                 *m = message.to_string();
             }
     }
+    pub fn set_message(&self, message: &str) {
+        if let Ok(mut m) = self.message.lock()
+            && m.as_str() != message {
+                *m = message.to_string();
+            }
+    }
     pub fn set_fraction(&self, fraction: f32) {
         self.fraction.store(fraction.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
@@ -87,4 +93,19 @@ where
         .expect("failed to spawn worker thread");
     let task = Task::perform(rx, move |r| done(r.ok().flatten()));
     (Job { title: title.to_string(), progress, cancellable }, task)
+}
+
+/// Runs `work` on a new thread without a progress display; `done` turns its
+/// result into a message (`None` if the work panicked).
+pub fn background<T, M>(work: impl FnOnce() -> T + Send + 'static, done: impl FnOnce(Option<T>) -> M + Send + 'static) -> Task<M>
+where
+    T: Send + 'static,
+    M: Send + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).ok();
+        let _ = tx.send(r);
+    });
+    Task::perform(rx, move |r| done(r.ok().flatten()))
 }

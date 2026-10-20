@@ -59,6 +59,10 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS texts (
+    doc_id      INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+    content     TEXT NOT NULL
+);
 ";
 
 fn meta_to_json(meta: &[(String, String)]) -> String {
@@ -147,6 +151,39 @@ impl Db {
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(id)
+    }
+
+    /// Stores a text document (no sequences); returns its id. A folder that no
+    /// longer exists is replaced by the top level.
+    pub fn insert_text_document(&mut self, name: &str, content: &str, description: &str, folder: Option<i64>) -> Result<i64, String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let folder = match folder {
+            Some(f) => tx.query_row("SELECT id FROM folders WHERE id = ?1", params![f], |r| r.get::<_, i64>(0)).optional().map_err(|e| e.to_string())?,
+            None => None,
+        };
+        tx.execute(
+            "INSERT INTO documents (name, kind, n_rows, width, reference, description, folder_id) VALUES (?1, ?2, 0, 0, NULL, ?3, ?4)",
+            params![name, DocKind::Text.as_str(), description, folder],
+        )
+        .map_err(|e| e.to_string())?;
+        let id = tx.last_insert_rowid();
+        tx.execute("INSERT INTO texts (doc_id, content) VALUES (?1, ?2)", params![id, content]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    /// Content of a text document.
+    pub fn text_content(&self, id: i64) -> Result<String, String> {
+        self.conn
+            .query_row("SELECT content FROM texts WHERE doc_id = ?1", params![id], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Text document {id} not found"))
+    }
+
+    /// Local date and time as the library records it (`YYYY-MM-DD HH:MM:SS`).
+    pub fn now_local(&self) -> String {
+        self.conn.query_row("SELECT datetime('now', 'localtime')", [], |r| r.get(0)).unwrap_or_default()
     }
 
     pub fn load_document(&self, id: i64, progress: &dyn Fn(f32)) -> Result<(DocInfo, Document, Vec<Annotation>), String> {
@@ -475,6 +512,16 @@ mod tests {
         assert!(db.reorder_rows(six, &[0, 1, 2], None).is_err());
         assert!(db.reorder_rows(six, &[0, 0, 1, 2, 3, 4], None).is_err());
         db.delete_document(six).unwrap();
+        // Text documents: stored with their content; a missing folder becomes the top level.
+        let text = db.insert_text_document("out", "line 1
+line 2", "tool output", Some(9999)).unwrap();
+        let info = db.document_info(text).unwrap().unwrap();
+        assert_eq!((info.kind, info.n_rows, info.folder), (DocKind::Text, 0, None));
+        assert_eq!(db.text_content(text).unwrap(), "line 1
+line 2");
+        assert_eq!(db.now_local().len(), 19);
+        db.delete_document(text).unwrap();
+        assert!(db.text_content(text).is_err());
         db.delete_document(id).unwrap();
         assert!(db.list_documents().unwrap().is_empty());
         assert!(db.annotations(id).unwrap().is_empty());

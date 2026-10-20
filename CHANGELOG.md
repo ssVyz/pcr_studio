@@ -7,6 +7,49 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.0.15] - 2026-10-20
+
+### Added
+
+- **External tools**: PCR Studio can run command-line programs for some features. Without a
+  tool everything else works; the features that need it are greyed out (Tools menu) or hidden
+  (right-click menu, selection panel).
+  - **Edit → Settings → External tools** sets each tool's location: bundled with PCR Studio
+    (default; `assets/tools/` next to the executable, or in the source tree for `cargo run`
+    and copies of the executable), from `PATH`, or a custom path (**Browse…**). **Test** checks
+    it (`--version`, minimum version); saving the settings and starting PCR Studio check all
+    tools in the background.
+  - Tool runs go on alongside other work (status bar: phase, progress, elapsed time, **Stop**),
+    one at a time. No console window opens. Exiting during a run asks first and stops the
+    tool, so it does not keep running.
+- **Find primers (primersearch)**: Tools menu, viewer right-click menu and **Find primers…** in
+  the selection panel (needs primersearch 0.1.1 or newer).
+  - Runs primersearch on the selected columns of all, the shown or the selected sequences
+    (never the reference); with Collapse gaps on, the columns with gaps in the reference are
+    left out, as for Extract slice.
+  - The dialog sets mode (no ambiguities, incremental, optimize by mismatch), fixed slice,
+    orientation, minimum Tm, conserved 3' bases, the mode's options, primer spacing and
+    threads; reaction conditions are prefilled from Settings (oligo nM → µM). It shows how many
+    sequences are usable: primersearch drops sequences with a gap, missing coverage or an
+    N/ambiguity code in the selection. The last parameters are remembered.
+  - The tool's text output is saved as a text document in the library (folder of the source
+    document) and shown when the run finishes. A header records document, selection,
+    sequences, tool version and path, command line, start/finish time, and maps the output's
+    positions (columns passed to primersearch) to reference positions and alignment columns.
+    Errors from the tool (e.g. search limits) are shown with its message.
+- **Text documents** in the library (new kind, own icon): double-click opens a read-only viewer
+  with **Copy all** and **Save as .txt…**. They can be renamed, moved and deleted like other
+  documents and are not offered as mapping references.
+- `tools` module (`ToolSpec`, `ToolConfig`, `check`, `run::run`, `primersearch`),
+  `Document::slice_rows` (slice of chosen rows with the alignment column of every slice column),
+  `Db::insert_text_document` / `text_content` (`texts` table), with tests; an ignored test runs
+  the bundled primersearch (`cargo test -- --ignored bundled_primersearch`).
+
+### Changed
+
+- Closing the window or File → Exit while a tool runs asks for confirmation.
+- `.gitignore`: `assets/` (bundled tool binaries are not committed).
+
 ## [0.0.14] - 2026-10-13
 
 ### Added
