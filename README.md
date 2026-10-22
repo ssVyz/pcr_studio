@@ -47,18 +47,20 @@ The menu bar holds all application commands:
 
 | Menu | Entries |
 |---|---|
-| File | New sequence… (Ctrl+N), Import FASTA… (Ctrl+O), Import metadata table…, Generate demo data, Export FASTA… (Ctrl+E), Extract selection to library, New folder, Close document (Ctrl+W), Exit |
+| File | New sequence… (Ctrl+N), Import FASTA… (Ctrl+O), Import FASTQ (linked)…, Import metadata table…, Generate demo data, Export FASTA… (Ctrl+E), Extract selection to library, New folder, Close document (Ctrl+W), Exit |
 | Edit | Edit sequence… (single-sequence documents), Add annotation from selection…, Annotation properties…, Delete annotation… (Del), Copy oligo (Ctrl+C), Copy oligo report, Clear selection (Esc), Set selected row as reference, Clear reference, Sort by name / length / bases in selection, Settings… (Ctrl+,) |
 | View | Display options panel (show/hide, Ctrl+Shift+D; showing restores the default width), Reset panel sizes |
 | Tools | Map to reference… (Ctrl+M), Metadata from sequence names…, Find primers in selection (primersearch)…, Oligo report for selection, Find sequence… (Ctrl+F), Go to position… (Ctrl+G) |
 
 Entries that do not apply (e.g. without an open document or selection) are disabled.
 
-1. **Import FASTA** (File menu or Ctrl+O). Aligned FASTA (gapped, or all sequences the
+1. **Import FASTA** (File menu or Ctrl+O; also gzip-compressed). After picking the files, choose
+   **Copy into the library** (the default) or **Link to the file** (see "Linked files" below).
+   Aligned FASTA (gapped, or all sequences the
    same length) becomes an alignment; anything else a sequence list. Leading/trailing
    gaps are treated as missing data, not deletions. `key=value` and `[key=value]`
    tokens in FASTA descriptions become metadata. **Demo data** adds a synthetic
-   35 kb × 2,000 genome set.
+   35 kb × 2,000 genome set. FASTQ files are always linked: **Import FASTQ (linked)…**.
    **New sequence** (File menu, Ctrl+N, or right-click free library space / a folder) creates
    a document from typed or pasted text: a plain sequence (spaces, line breaks and GenBank
    position numbers are ignored) or FASTA. A FASTA header fills in the name; several records
@@ -72,9 +74,10 @@ Entries that do not apply (e.g. without an open document or selection) are disab
    entries to move it to the top level (hovering a collapsed folder expands it, the list
    scrolls at its edges, Escape cancels, invalid targets are marked red). **Move to…** does
    the same from a list. The chevron or a double-click expands/collapses a folder (remembered).
-   **Right-click** an entry for Open / Edit sequence… / Rename… / Delete… (documents) or
+   **Right-click** an entry for Open / Edit sequence… / Rename… / Delete… (documents; linked
+   documents: Open / Linked files… / Rename… / Delete…) or
    Expand/Collapse / New sequence… / New subfolder / Rename… / Delete folder… (folders), or
-   free space for New sequence… / New folder / Import FASTA…; deleting always asks for confirmation and warns that it cannot be undone.
+   free space for New sequence… / New folder / Import FASTA… / Import FASTQ (linked)…; deleting always asks for confirmation and warns that it cannot be undone.
    **Ctrl+click** selects several entries; dragging one of them (or **Move to…**) moves all
    of them. Entries inside a selected folder move with it; a click on free space clears the
    selection. Deleting a folder keeps its contents (they move up one
@@ -122,6 +125,45 @@ Entries that do not apply (e.g. without an open document or selection) are disab
    and alignment columns. Double-click a text document to view it; **Copy all** and
    **Save as .txt…** export it. The last parameters are remembered.
 
+### Linked files (FASTQ read sets, FASTA)
+
+FASTQ files are too large to copy into the library, so they are **linked**: the library
+stores where the files are, what identifies them and a summary, and reads them from there.
+FASTA files can be linked too (Import FASTA → **Link to the file**). PCR Studio never changes a
+linked file.
+
+- **Import FASTQ (linked)…** (File menu, right-click free library space, or FASTQ files given
+  on the command line): pick files (`.fastq`, `.fq`, also `.gz`), or **Add folder…** (FASTQ
+  files in it and up to three levels of subfolders). The dialog proposes read sets, which can
+  be renamed before linking:
+  - **Pair R1/R2 files**: `_R1`/`_R2` anywhere in the name, or a final `_1`/`_2` when exactly
+    these two exist (SRA). Lanes of one sample (`Sample_S1_L001_R1_001`, `…_L002_…`) form one
+    paired read set. A file without its mate makes the set single-end.
+  - Grouping: one read set per sample (default; Nanopore chunk files such as
+    `FAX123_pass_barcode01_ab12cd34_0.fastq.gz`, `…_1…` are one sample), one per file or pair,
+    or all files in one.
+  - Linking reads every file once (in parallel, with progress and **Cancel**): reads, bases,
+    lengths (N50), mean quality, GC. R1 and R2 must have the same number of reads with the
+    same names, else that set is not linked (the others are). The technology (Illumina or
+    Nanopore) is detected from the read names, else from the lengths; it can be changed.
+- **Status**: every file is remembered by path, size, modification time and a fingerprint
+  (hash of the size and the first and last MiB; for gzip files that includes the checksum at
+  the end). At start-up, and when a linked document is opened or checked, a moved or deleted
+  file shows as **missing**, a modified one as **changed**: broken red chain icon and a red
+  note in the library.
+- **Linked files…** (right-click, or the button in the right panel): summary, every file with
+  its folder, size and state, **Check files**, **Open in viewer**, and **Locate…** for a missing
+  or changed file. Locate… accepts only the same file (size and fingerprint); files of this set,
+  and missing files of other linked documents, that were in the same folder are then looked
+  for in the new folder and linked too.
+- **Open** (double-click): read-only in the viewer. A FASTQ read set shows its first 1,000
+  reads (paired: 500 pairs, R1 and R2 alternating, metadata *Mate*); a FASTA file is shown
+  completely up to 100,000 sequences / 100 Mb. Sorting, the reference, annotations and
+  metadata cannot be saved; display options, search and the oligo report work. Map to
+  reference, Find primers, Extract and Export need all sequences, so they work for a
+  completely shown FASTA file but not for the first reads of a read set.
+- **Delete** removes only the link; the files stay on disk.
+
 ### Viewer
 
 | Action | How |
@@ -161,16 +203,17 @@ a delimiter.
 |---|---|
 | `model.rs` | Rows (start column + gapped data; outside = no coverage), documents, annotations, column statistics, consensus, identity/conservation, reference coordinates, shown-column map (collapsed gaps) |
 | `seq.rs` | Normalization, IUPAC masks, reverse complement, GC, ambiguity expansion |
-| `fasta.rs` | FASTA I/O (rust-bio), pasted sequence/FASTA text, description metadata, CSV/TSV tables |
+| `fasta.rs` | FASTA I/O (rust-bio, also gzip), pasted sequence/FASTA text, description metadata, CSV/TSV tables |
+| `linked/` | Linked files: `mod.rs` linked sets, file states, fingerprints, relinking, gzip-aware opening; `fastq.rs` FASTQ reader; `scan.rs` one pass per file (summary, R1/R2 check, technology) and the viewer preview; `group.rs` grouping picked FASTQ files into read sets |
 | `thermo.rs` | SantaLucia 1998 nearest-neighbor Tm, salt and Mg²⁺ correction (primer3 defaults, validated against primer3) |
 | `mapper/` | `index.rs` k-mer index, `align.rs` seed chaining (rust-bio `sdpkpp`) + DP gap filling (rust-bio pairwise), `contig.rs` insertion-aware merge and consensus target, `mod.rs` orchestration and fine tuning |
 | `primer.rs` | Oligo/selection evaluation |
 | `display.rs` | View sort, grouping, collapsing, filtering; sorting documents (name, length, bases) |
 | `search.rs` | Motif search |
-| `db.rs` | SQLite library (documents, rows and their order, annotations, folders, text documents, settings) |
+| `db.rs` | SQLite library (documents, rows and their order, annotations, folders, text documents, linked sets, settings) |
 | `tools/` | External tools: `mod.rs` tool list, locations (bundled / PATH / custom) and version check, `run.rs` child processes (no console window, JSON-lines progress on stderr, cancel), `primersearch.rs` arguments, progress, input slice and report header |
 | `demo.rs` | Synthetic data |
-| `ui/` | iced application: `mod.rs` state/messages/update, `menu.rs` menu bar and drop-downs, `view.rs` layout and panels, `canvas.rs` alignment renderer, `dialogs.rs` (incl. new/edit sequence, primersearch, text viewer), `state.rs` viewer state, `style.rs`, `icons.rs` library icons, `job.rs` background jobs |
+| `ui/` | iced application: `mod.rs` state/messages/update, `menu.rs` menu bar and drop-downs, `view.rs` layout and panels, `canvas.rs` alignment renderer, `dialogs.rs` (incl. new/edit sequence, primersearch, text viewer, import FASTA, link FASTQ, linked files), `state.rs` viewer state, `style.rs`, `icons.rs` library icons, `job.rs` background jobs |
 
 ### Map to reference
 

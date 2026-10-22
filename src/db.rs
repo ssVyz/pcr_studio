@@ -1,5 +1,6 @@
 //! SQLite document library, stored next to the executable (`pcr_studio.db`).
 
+use crate::linked::LinkedSet;
 use crate::model::{Annotation, AnnotationKind, DocInfo, DocKind, Document, Folder, Row};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
@@ -62,6 +63,10 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS texts (
     doc_id      INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
     content     TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS linked (
+    doc_id      INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+    data        TEXT NOT NULL
 );
 ";
 
@@ -170,6 +175,59 @@ impl Db {
         tx.execute("INSERT INTO texts (doc_id, content) VALUES (?1, ?2)", params![id, content]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(id)
+    }
+
+    /// Stores a linked document (files on disk, no sequences); returns its id.
+    /// A folder that no longer exists is replaced by the top level.
+    pub fn insert_linked_document(&mut self, name: &str, set: &LinkedSet, description: &str, folder: Option<i64>) -> Result<i64, String> {
+        let data = serde_json::to_string(set).map_err(|e| e.to_string())?;
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let folder = match folder {
+            Some(f) => tx.query_row("SELECT id FROM folders WHERE id = ?1", params![f], |r| r.get::<_, i64>(0)).optional().map_err(|e| e.to_string())?,
+            None => None,
+        };
+        tx.execute(
+            "INSERT INTO documents (name, kind, n_rows, width, reference, description, folder_id) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+            params![name, DocKind::Linked.as_str(), set.summary.records as i64, set.summary.width as i64, description, folder],
+        )
+        .map_err(|e| e.to_string())?;
+        let id = tx.last_insert_rowid();
+        tx.execute("INSERT INTO linked (doc_id, data) VALUES (?1, ?2)", params![id, data]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    /// The files a linked document points to.
+    pub fn linked_set(&self, id: i64) -> Result<LinkedSet, String> {
+        let data: String = self
+            .conn
+            .query_row("SELECT data FROM linked WHERE doc_id = ?1", params![id], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Linked document {id} not found"))?;
+        serde_json::from_str(&data).map_err(|e| format!("Linked document {id} is damaged: {e}"))
+    }
+
+    /// All linked documents (unreadable entries are left out).
+    pub fn list_linked(&self) -> Result<Vec<(i64, LinkedSet)>, String> {
+        let mut st = self.conn.prepare("SELECT doc_id, data FROM linked ORDER BY doc_id").map_err(|e| e.to_string())?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, data) = r.map_err(|e| e.to_string())?;
+            if let Ok(set) = serde_json::from_str(&data) {
+                out.push((id, set));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Saves a linked document's files after relinking, a new modification
+    /// time or a technology choice.
+    pub fn update_linked(&self, id: i64, set: &LinkedSet) -> Result<(), String> {
+        let data = serde_json::to_string(set).map_err(|e| e.to_string())?;
+        self.conn.execute("UPDATE linked SET data = ?2 WHERE doc_id = ?1", params![id, data]).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Content of a text document.
@@ -522,6 +580,32 @@ line 2");
         assert_eq!(db.now_local().len(), 19);
         db.delete_document(text).unwrap();
         assert!(db.text_content(text).is_err());
+        // Linked documents: the set is stored as is; deleting removes it.
+        let mut set = crate::linked::LinkedSet {
+            format: crate::linked::Format::Fastq,
+            layout: crate::linked::Layout::Single,
+            technology: crate::linked::Technology::Nanopore,
+            files: vec![crate::linked::LinkedFile {
+                path: "C:/reads/run.fastq.gz".into(),
+                role: crate::linked::Role::Single,
+                size: 10,
+                modified: Some(5),
+                fingerprint: u64::MAX,
+                content_hash: 7,
+                records: 3,
+                bases: 9000,
+            }],
+            summary: crate::linked::Summary { records: 3, width: 4000, ..Default::default() },
+        };
+        let linked = db.insert_linked_document("run", &set, "Linked", Some(9999)).unwrap();
+        let info = db.document_info(linked).unwrap().unwrap();
+        assert_eq!((info.kind, info.n_rows, info.width, info.folder), (DocKind::Linked, 3, 4000, None));
+        assert_eq!(db.linked_set(linked).unwrap(), set);
+        set.files[0].path = "D:/moved/run.fastq.gz".into();
+        db.update_linked(linked, &set).unwrap();
+        assert_eq!(db.list_linked().unwrap(), vec![(linked, set)]);
+        db.delete_document(linked).unwrap();
+        assert!(db.linked_set(linked).is_err() && db.list_linked().unwrap().is_empty());
         db.delete_document(id).unwrap();
         assert!(db.list_documents().unwrap().is_empty());
         assert!(db.annotations(id).unwrap().is_empty());

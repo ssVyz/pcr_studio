@@ -80,6 +80,8 @@ pub enum DocKind {
     Contig,
     /// Plain text (e.g. the output of an external tool); no sequences.
     Text,
+    /// Points to sequence files on disk (FASTQ read set, FASTA file); see `linked`.
+    Linked,
 }
 
 impl DocKind {
@@ -89,6 +91,7 @@ impl DocKind {
             DocKind::Alignment => "alignment",
             DocKind::Contig => "contig",
             DocKind::Text => "text",
+            DocKind::Linked => "linked",
         }
     }
 
@@ -97,6 +100,7 @@ impl DocKind {
             "alignment" => DocKind::Alignment,
             "contig" => DocKind::Contig,
             "text" => DocKind::Text,
+            "linked" => DocKind::Linked,
             _ => DocKind::Sequences,
         }
     }
@@ -107,7 +111,13 @@ impl DocKind {
             DocKind::Alignment => "Alignment",
             DocKind::Contig => "Contig",
             DocKind::Text => "Text",
+            DocKind::Linked => "Linked files",
         }
+    }
+
+    /// Whether the sequences are stored in the library (not text, not linked files).
+    pub fn has_rows(self) -> bool {
+        !matches!(self, DocKind::Text | DocKind::Linked)
     }
 }
 

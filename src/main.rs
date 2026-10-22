@@ -5,6 +5,7 @@ mod db;
 mod demo;
 mod display;
 mod fasta;
+mod linked;
 mod mapper;
 mod model;
 mod primer;

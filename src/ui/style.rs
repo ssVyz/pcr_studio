@@ -243,6 +243,16 @@ pub fn muted(theme: &Theme) -> iced::widget::text::Style {
     iced::widget::text::Style { color: Some(Color { a: 0.62, ..text }) }
 }
 
+/// Text in the danger color (missing files, failures).
+pub fn danger_text(theme: &Theme) -> iced::widget::text::Style {
+    iced::widget::text::Style { color: Some(theme.extended_palette().danger.base.color) }
+}
+
+/// Text in the success color (checked and fine).
+pub fn success_text(theme: &Theme) -> iced::widget::text::Style {
+    iced::widget::text::Style { color: Some(theme.extended_palette().success.base.color) }
+}
+
 /// Flat toolbar button.
 pub fn tool_button(theme: &Theme, status: button::Status) -> button::Style {
     let p = theme.extended_palette();

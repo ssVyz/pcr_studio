@@ -1,5 +1,6 @@
 //! Library icons (inline SVG, tinted per kind via the svg style color).
 
+use crate::linked::Format;
 use crate::model::DocKind;
 use iced::widget::svg::{self, Handle, Svg};
 use iced::{Color, Element, Theme};
@@ -21,6 +22,12 @@ const CONTIG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24
 /// Text: a page with lines.
 const TEXT: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M5 3.5A1.5 1.5 0 0 1 6.5 2h8.3L19 6.2v14.3a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 20.5z" fill="#000" opacity="0.35"/><g fill="#000"><rect x="7.5" y="9" width="9" height="1.8" rx="0.9"/><rect x="7.5" y="12.6" width="9" height="1.8" rx="0.9"/><rect x="7.5" y="16.2" width="6" height="1.8" rx="0.9"/></g></svg>"##;
 
+/// Linked files: two chain links.
+const LINKED: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><g fill="none" stroke="#000" stroke-width="2.5" stroke-linecap="round"><path d="M10.2 13.8a3.6 3.6 0 0 0 5.1 0l3.7-3.7a3.6 3.6 0 0 0-5.1-5.1l-1.4 1.4"/><path d="M13.8 10.2a3.6 3.6 0 0 0-5.1 0l-3.7 3.7a3.6 3.6 0 0 0 5.1 5.1l1.4-1.4"/></g></svg>"##;
+
+/// Linked files that are missing or changed: the chain is broken.
+const LINKED_BROKEN: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><g fill="none" stroke="#000" stroke-width="2.5" stroke-linecap="round"><path d="M13.6 5l1.4-1.4a3.6 3.6 0 0 1 5.1 5.1l-3.7 3.7"/><path d="M10.4 19l-1.4 1.4a3.6 3.6 0 0 1-5.1-5.1l3.7-3.7"/><path d="M9 3v3M3 9h3M15 21v-3M21 15h-3"/></g></svg>"##;
+
 const CHEVRON_RIGHT: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9 5.5l7 6.5-7 6.5" fill="none" stroke="#000" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 
 const CHEVRON_DOWN: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M5.5 9l6.5 7 6.5-7" fill="none" stroke="#000" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
@@ -35,6 +42,8 @@ static SEQUENCES_H: LazyLock<Handle> = LazyLock::new(|| handle(SEQUENCES));
 static ALIGNMENT_H: LazyLock<Handle> = LazyLock::new(|| handle(ALIGNMENT));
 static CONTIG_H: LazyLock<Handle> = LazyLock::new(|| handle(CONTIG));
 static TEXT_H: LazyLock<Handle> = LazyLock::new(|| handle(TEXT));
+static LINKED_H: LazyLock<Handle> = LazyLock::new(|| handle(LINKED));
+static LINKED_BROKEN_H: LazyLock<Handle> = LazyLock::new(|| handle(LINKED_BROKEN));
 static CHEVRON_RIGHT_H: LazyLock<Handle> = LazyLock::new(|| handle(CHEVRON_RIGHT));
 static CHEVRON_DOWN_H: LazyLock<Handle> = LazyLock::new(|| handle(CHEVRON_DOWN));
 
@@ -65,6 +74,21 @@ pub fn document<'a, M: 'a>(kind: DocKind, dark: bool) -> Element<'a, M> {
         DocKind::Alignment => (&*ALIGNMENT_H, Color::from_rgb8(22, 150, 136), Color::from_rgb8(70, 190, 170)),
         DocKind::Contig => (&*CONTIG_H, Color::from_rgb8(140, 82, 204), Color::from_rgb8(180, 130, 240)),
         DocKind::Text => (&*TEXT_H, Color::from_rgb8(96, 106, 122), Color::from_rgb8(170, 180, 196)),
+        DocKind::Linked => return linked(Format::Fastq, false, dark),
     };
     icon(h, 17.0, if dark { darkc } else { light })
+}
+
+/// Icon of a linked document: colored by format, a broken chain in the
+/// danger color when files are missing or changed.
+pub fn linked<'a, M: 'a>(format: Format, broken: bool, dark: bool) -> Element<'a, M> {
+    if broken {
+        let c = if dark { Color::from_rgb8(240, 110, 100) } else { Color::from_rgb8(200, 50, 40) };
+        return icon(&LINKED_BROKEN_H, 17.0, c);
+    }
+    let (light, darkc) = match format {
+        Format::Fastq => (Color::from_rgb8(214, 110, 20), Color::from_rgb8(240, 150, 70)),
+        Format::Fasta => (Color::from_rgb8(58, 118, 214), Color::from_rgb8(110, 160, 240)),
+    };
+    icon(&LINKED_H, 17.0, if dark { darkc } else { light })
 }

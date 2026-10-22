@@ -12,6 +12,8 @@ mod view;
 use crate::db::{self, Db};
 use crate::display::{self, RowSort, SortKey};
 use crate::fasta;
+use crate::linked::group::{self, Proposal};
+use crate::linked::{self, FileState, Format, Layout, LinkedSet, Role};
 use crate::mapper::{self, MapParams};
 use crate::model::{Annotation, AnnotationKind, ConsensusThreshold, DocInfo, DocKind, Document, Folder, Row};
 use crate::primer::{self, OligoSource, Orientation, PrimerOptions};
@@ -20,16 +22,16 @@ use crate::tools::primersearch as ps;
 use crate::tools::{self, ToolConfig, ToolSpec, ToolStatus};
 use canvas::ViewMsg;
 use dialogs::{
-    AnnotationDialog, EditTarget, ExportDialog, ExportRows, MapDialog, Modal, PrimersearchDialog, RefChoice, SequenceDialog, SettingsDialog, TextView,
-    TextViewMsg,
+    AnnotationDialog, EditTarget, ExportDialog, ExportRows, ImportFastaDialog, LinkFastqDialog, LinkedDialog, LinkedMsg, MapDialog, Modal,
+    PrimersearchDialog, RefChoice, SequenceDialog, SettingsDialog, TextView, TextViewMsg,
 };
 use iced::keyboard::{self, Key, key::Named};
 use iced::{Subscription, Task, Theme};
 use job::{Job, Payload};
 use serde::{Deserialize, Serialize};
-use state::{BASE_COL_W, Highlight, OpenDoc, Selection, ViewPrefs};
-use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use state::{BASE_COL_W, Highlight, LinkedView, OpenDoc, Selection, ViewPrefs};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -197,6 +199,23 @@ pub struct LoadedDoc {
     open: OpenDoc,
 }
 
+/// Result of opening a linked document.
+pub enum LinkedOpen {
+    Loaded(Box<LoadedDoc>),
+    /// Files are missing or changed (document id, state of every file).
+    Broken(i64, Vec<FileState>),
+}
+
+/// Result of linking files as library documents.
+#[derive(Default)]
+pub struct LinkOutcome {
+    pub ids: Vec<i64>,
+    /// Sets that were not linked, with the reason.
+    pub failed: Vec<String>,
+    pub fasta: bool,
+    pub cancelled: bool,
+}
+
 /// An external tool running alongside the regular jobs (one at a time).
 struct ToolRun {
     name: &'static str,
@@ -221,8 +240,31 @@ pub enum Message {
     OpenDocument(i64),
     DocLoaded(Payload<Result<LoadedDoc, String>>),
     ImportFasta,
+    /// FASTA files picked: import (copy) or link them.
+    FastaPicked(Option<Vec<PathBuf>>),
+    ImportFastaLink(bool),
+    RunImportFasta,
+    /// Imports FASTA files into the library (also files given on the command line).
     ImportPicked(Option<Vec<PathBuf>>),
     ImportDone(Payload<Result<Vec<i64>, String>>),
+    // Linked files
+    ImportFastq,
+    /// FASTQ files picked (or given on the command line): group them into read sets.
+    FastqPicked(Option<Vec<PathBuf>>),
+    FastqFolderPicked(Option<PathBuf>),
+    LinkFastq(dialogs::LinkFastqMsg),
+    RunLinkFastq,
+    LinkDone(Payload<Result<LinkOutcome, String>>),
+    /// Shows the files of a linked document.
+    LinkedFiles(i64),
+    Linked(LinkedMsg),
+    /// A file was picked for Locate… (document, file index).
+    LocatePicked(i64, usize, Option<PathBuf>),
+    /// Files linked again by Locate… (of this document, of others).
+    Relinked(Payload<Result<(usize, usize), String>>),
+    /// Results of checking linked files (by document id).
+    LinkStates(Payload<HashMap<i64, Vec<FileState>>>),
+    LinkedOpened(Payload<Result<LinkedOpen, String>>),
     /// New document from typed or pasted text (in the current folder).
     NewSequence,
     /// Edit the sequence of a single-sequence document.
@@ -376,6 +418,10 @@ pub struct App {
     db: Db,
     db_path: PathBuf,
     library: Vec<DocInfo>,
+    /// Files of the linked documents (by document id).
+    linked: HashMap<i64, LinkedSet>,
+    /// State of every file of a linked document at its last check (by document id).
+    link_states: HashMap<i64, Vec<FileState>>,
     library_selected: Option<i64>,
     folders: Vec<Folder>,
     /// Selected folder (mutually exclusive with `library_selected`).
@@ -420,16 +466,22 @@ impl App {
         };
         let settings: AppSettings = db.setting(SETTINGS_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let library = db.list_documents().unwrap_or_default();
+        let linked = db.list_linked().unwrap_or_default().into_iter().collect();
         let folders = db.list_folders().unwrap_or_default();
         let status = format!("Library: {} · {} document(s)", db_path.display(), library.len());
-        // FASTA files given on the command line ("Open with…") are imported right away.
+        // FASTA files given on the command line ("Open with…") are imported
+        // right away; FASTQ files open the dialog that links them.
         let paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).filter(|p| p.is_file()).collect();
-        let import = if paths.is_empty() { Task::none() } else { Task::done(Message::ImportPicked(Some(paths))) };
+        let (fastq, fasta): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| group::is_fastq(p));
+        let import = if fasta.is_empty() { Task::none() } else { Task::done(Message::ImportPicked(Some(fasta))) };
+        let link = if fastq.is_empty() { Task::none() } else { Task::done(Message::FastqPicked(Some(fastq))) };
         let size = iced::window::latest().and_then(iced::window::size).map(Message::WindowSize);
         let mut app = App {
             db,
             db_path,
             library,
+            linked,
+            link_states: HashMap::new(),
             library_selected: None,
             folders,
             folder_selected: None,
@@ -452,7 +504,8 @@ impl App {
             error,
         };
         let check = app.check_tools(tools::ALL);
-        (app, Task::batch([import, size, check]))
+        let links = app.check_links(None);
+        (app, Task::batch([import, link, size, check, links]))
     }
 
     fn title(&self) -> String {
@@ -682,6 +735,10 @@ impl App {
             Ok(l) => self.library = l,
             Err(e) => self.error = Some(e),
         }
+        match self.db.list_linked() {
+            Ok(l) => self.linked = l.into_iter().collect(),
+            Err(e) => self.error = Some(e),
+        }
         match self.db.list_folders() {
             Ok(f) => self.folders = f,
             Err(e) => self.error = Some(e),
@@ -772,9 +829,13 @@ impl App {
     }
 
     fn open_document(&mut self, id: i64) -> Task<Message> {
-        if self.library.iter().any(|d| d.id == id && d.kind == DocKind::Text) {
-            self.open_text(id);
-            return Task::none();
+        match self.library.iter().find(|d| d.id == id).map(|d| d.kind) {
+            Some(DocKind::Text) => {
+                self.open_text(id);
+                return Task::none();
+            }
+            Some(DocKind::Linked) => return self.open_linked(id),
+            _ => {}
         }
         if self.busy() {
             return Task::none();
@@ -813,6 +874,196 @@ impl App {
             }
             Err(e) => self.error = Some(e),
         }
+    }
+
+    /// Shows a loaded document in the viewer; the viewer keeps its size.
+    fn show_document(&mut self, mut loaded: LoadedDoc) {
+        if let Some(old) = &self.open {
+            loaded.open.vp.canvas = old.vp.canvas;
+            loaded.open.vp.seq_w = old.vp.seq_w;
+            loaded.open.vp.rows_h = old.vp.rows_h;
+        }
+        let mut od = loaded.open;
+        // The setting may have changed while loading.
+        if od.cols.is_subset() != (self.settings.view.collapse_gaps && od.reference.is_some()) {
+            od.update_columns(self.settings.view.collapse_gaps);
+        }
+        let rows = canvas::group_digits(od.doc.rows.len());
+        self.status = match &od.linked {
+            Some(l) if l.complete => format!("Opened “{}” (linked files, read-only): {rows} {}", od.info.name, l.set.unit()),
+            Some(l) => format!(
+                "Opened “{}” (linked files, read-only): showing the first {rows} of {} {}",
+                od.info.name,
+                canvas::group_digits(l.set.summary.records as usize),
+                l.set.unit()
+            ),
+            None => format!("Opened “{}”: {rows} sequences, {} columns", od.info.name, canvas::group_digits(od.doc.width)),
+        };
+        self.library_selected = Some(od.info.id);
+        self.open = Some(od);
+    }
+
+    /// Opens linked files read-only in the viewer: FASTQ with its first reads,
+    /// FASTA completely (up to a size limit). With missing or changed files the
+    /// linked files dialog opens instead.
+    fn open_linked(&mut self, id: i64) -> Task<Message> {
+        if self.busy() {
+            return Task::none();
+        }
+        self.library_selected = Some(id);
+        let path = self.db_path.clone();
+        let prefs = self.settings.view.clone();
+        let row_h = self.settings.row_height;
+        self.start_job(
+            "Opening linked files",
+            false,
+            move |p| {
+                let db = Db::open(&path)?;
+                let mut set = db.linked_set(id)?;
+                p.set(0.05, "Checking the files");
+                let (states, updated) = linked::check_set(&mut set);
+                if updated {
+                    db.update_linked(id, &set)?;
+                }
+                if states.iter().any(|&s| s != FileState::Ok) {
+                    return Ok(LinkedOpen::Broken(id, states));
+                }
+                p.set(0.2, "Reading the first records");
+                let preview = linked::scan::preview(&set)?;
+                p.set(0.8, "Computing consensus and statistics");
+                let mut info = db.document_info(id)?.ok_or_else(|| format!("Document {id} not found"))?;
+                info.kind = preview.kind;
+                info.n_rows = preview.doc.rows.len();
+                info.width = preview.doc.width;
+                let mut open = OpenDoc::new(info, preview.doc, Vec::new(), &prefs);
+                open.set_row_h(row_h);
+                open.linked = Some(LinkedView { set, complete: preview.complete });
+                Ok(LinkedOpen::Loaded(Box::new(LoadedDoc { open })))
+            },
+            |r| Message::LinkedOpened(Payload::new(r.unwrap_or_else(|| Err("Opening the linked files failed".into())))),
+        )
+    }
+
+    /// Shows the linked files dialog of document `id` (with the given file
+    /// states, else those of the last check).
+    fn show_linked(&mut self, id: i64, states: Option<Vec<FileState>>) {
+        let Some(d) = self.library.iter().find(|d| d.id == id) else { return };
+        let Some(set) = self.linked.get(&id).cloned() else {
+            self.error = Some(format!("The linked document “{}” is damaged", d.name));
+            return;
+        };
+        let info = format!("{} · linked {}", link_description(&set), d.created);
+        let states = states.or_else(|| self.link_states.get(&id).cloned());
+        self.modal = Some(Modal::Linked(LinkedDialog { id, name: d.name.clone(), info, set, states, busy: false, notice: None }));
+        self.set_primary(Some(LibKey::Doc(id)));
+        self.lib_multi.clear();
+    }
+
+    /// Checks linked files in the background (`None`: all linked documents).
+    fn check_links(&mut self, ids: Option<Vec<i64>>) -> Task<Message> {
+        let ids = ids.unwrap_or_else(|| self.linked.keys().copied().collect());
+        if ids.is_empty() {
+            return Task::none();
+        }
+        if let Some(Modal::Linked(d)) = self.modal.as_mut()
+            && ids.contains(&d.id)
+        {
+            d.busy = true;
+        }
+        let db_path = self.db_path.clone();
+        job::background(
+            move || {
+                let mut out = HashMap::new();
+                let Ok(db) = Db::open(&db_path) else { return out };
+                for id in ids {
+                    let Ok(mut set) = db.linked_set(id) else { continue };
+                    let (states, updated) = linked::check_set(&mut set);
+                    if updated {
+                        let _ = db.update_linked(id, &set);
+                    }
+                    out.insert(id, states);
+                }
+                out
+            },
+            |r| Message::LinkStates(Payload::new(r.unwrap_or_default())),
+        )
+    }
+
+    /// Adds FASTQ files to the link dialog, opening it if needed.
+    fn add_fastq(&mut self, paths: Vec<PathBuf>) {
+        if !matches!(self.modal, Some(Modal::LinkFastq(_))) {
+            self.modal = Some(Modal::LinkFastq(LinkFastqDialog::new(self.target_folder())));
+        }
+        if let Some(Modal::LinkFastq(d)) = self.modal.as_mut() {
+            d.add(paths);
+        }
+    }
+
+    /// Links files as library documents. Every file is read once (in
+    /// parallel) for its summary; sets that fail (unreadable file, R1 and R2
+    /// not matching) are reported, the others linked.
+    fn run_link(&mut self, sets: Vec<Proposal>, format: Format, folder: Option<i64>) -> Task<Message> {
+        let db_path = self.db_path.clone();
+        self.start_job(
+            &format!("Linking {} files", format.label()),
+            true,
+            move |p| {
+                let files: Vec<(PathBuf, Format)> = sets.iter().flat_map(|s| s.files.iter().map(|(f, _)| (f.clone(), format))).collect();
+                let total = files.iter().map(|(f, _)| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0)).sum::<u64>().max(1);
+                p.set(0.0, &format!("Reading {} file(s), {}", files.len(), linked::size_label(total)));
+                let scans = linked::scan::scan_files(&files, &p.cancel, &|read| p.set_fraction(read as f32 / total as f32));
+                if p.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(LinkOutcome { cancelled: true, ..Default::default() });
+                }
+                p.set(1.0, "Saving to library");
+                let mut db = Db::open(&db_path)?;
+                let mut out = LinkOutcome { fasta: format == Format::Fasta, ..Default::default() };
+                let mut scans = scans.into_iter();
+                for s in sets {
+                    let mine: Result<Vec<_>, String> = scans.by_ref().take(s.files.len()).collect();
+                    match mine.and_then(|scans| linked::scan::build_set(format, s.layout, &s.files, scans)) {
+                        Ok(set) => out.ids.push(db.insert_linked_document(&s.name, &set, &link_description(&set), folder)?),
+                        Err(e) => out.failed.push(format!("{}: {e}", s.name)),
+                    }
+                }
+                Ok(out)
+            },
+            |r| Message::LinkDone(Payload::new(r.unwrap_or_else(|| Err("Linking failed unexpectedly".into())))),
+        )
+    }
+
+    /// Refuses a change to a linked (read-only) document; `true` if refused.
+    fn refuse_read_only(&mut self, what: &str) -> bool {
+        if self.open.as_ref().is_some_and(|o| o.linked.is_some()) {
+            self.error = Some(format!("Linked files are read-only: {what} cannot be saved. Import the file into the library to change it."));
+            return true;
+        }
+        false
+    }
+
+    /// Refuses an action that needs all sequences while only the first reads
+    /// of linked files are shown; `true` if refused.
+    fn refuse_partial(&mut self) -> bool {
+        let Some(od) = self.open.as_ref() else { return false };
+        let Some(l) = od.linked.as_ref().filter(|l| !l.complete) else { return false };
+        self.error = Some(format!(
+            "The viewer shows only the first {} of {} {} of these linked files; this needs all of them.",
+            canvas::group_digits(od.doc.rows.len()),
+            canvas::group_digits(l.set.summary.records as usize),
+            l.set.unit()
+        ));
+        true
+    }
+
+    /// Whether the open document can be changed (linked files are read-only).
+    fn open_writable(&self) -> bool {
+        self.open.as_ref().is_some_and(|o| o.linked.is_none())
+    }
+
+    /// Whether the open document holds all its sequences (not only the first
+    /// reads of linked files).
+    fn open_complete(&self) -> bool {
+        self.open.as_ref().is_some_and(|o| o.linked.as_ref().is_none_or(|l| l.complete))
     }
 
     fn with_doc(&mut self, f: impl FnOnce(&mut OpenDoc, &AppSettings)) {
@@ -1065,26 +1316,7 @@ impl App {
             Message::DocLoaded(p) => {
                 self.job = None;
                 match p.take() {
-                    Some(Ok(mut loaded)) => {
-                        if let Some(old) = &self.open {
-                            loaded.open.vp.canvas = old.vp.canvas;
-                            loaded.open.vp.seq_w = old.vp.seq_w;
-                            loaded.open.vp.rows_h = old.vp.rows_h;
-                        }
-                        let mut od = loaded.open;
-                        // The setting may have changed while loading.
-                        if od.cols.is_subset() != (self.settings.view.collapse_gaps && od.reference.is_some()) {
-                            od.update_columns(self.settings.view.collapse_gaps);
-                        }
-                        self.status = format!(
-                            "Opened “{}”: {} sequences, {} columns",
-                            od.info.name,
-                            canvas::group_digits(od.doc.rows.len()),
-                            canvas::group_digits(od.doc.width)
-                        );
-                        self.library_selected = Some(od.info.id);
-                        self.open = Some(od);
-                    }
+                    Some(Ok(loaded)) => self.show_document(loaded),
                     Some(Err(e)) => self.error = Some(e),
                     None => {}
                 }
@@ -1096,11 +1328,213 @@ impl App {
                 return Task::perform(
                     rfd::AsyncFileDialog::new()
                         .set_title("Import FASTA")
-                        .add_filter("FASTA", &["fasta", "fa", "fas", "fna", "ffn", "faa", "aln", "mfa", "txt"])
+                        .add_filter("FASTA", &["fasta", "fa", "fas", "fna", "ffn", "faa", "aln", "mfa", "txt", "gz"])
                         .add_filter("All files", &["*"])
                         .pick_files(),
-                    |files| Message::ImportPicked(files.map(|v| v.into_iter().map(|f| f.path().to_path_buf()).collect())),
+                    |files| Message::FastaPicked(files.map(|v| v.into_iter().map(|f| f.path().to_path_buf()).collect())),
                 );
+            }
+            Message::FastaPicked(Some(paths)) if !paths.is_empty() => self.modal = Some(Modal::ImportFasta(ImportFastaDialog::new(paths))),
+            Message::FastaPicked(_) => {}
+            Message::ImportFastaLink(link) => {
+                if let Some(Modal::ImportFasta(d)) = self.modal.as_mut() {
+                    d.link = link;
+                }
+            }
+            Message::RunImportFasta => {
+                if self.busy() {
+                    self.error = Some("Wait for the current task to finish, then import.".into());
+                    return Task::none();
+                }
+                let Some(Modal::ImportFasta(d)) = self.modal.take() else { return Task::none() };
+                let paths: Vec<PathBuf> = d.files.into_iter().map(|(p, _)| p).collect();
+                if !d.link {
+                    return self.update(Message::ImportPicked(Some(paths)));
+                }
+                let sets = paths.iter().map(|p| Proposal { name: linked::stem(p), layout: Layout::Single, files: vec![(p.clone(), Role::Single)] }).collect();
+                let folder = self.target_folder();
+                return self.run_link(sets, Format::Fasta, folder);
+            }
+            Message::ImportFastq => {
+                if !self.busy() {
+                    return dialogs::pick_fastq_files();
+                }
+            }
+            Message::FastqPicked(Some(paths)) if !paths.is_empty() => self.add_fastq(paths),
+            Message::FastqPicked(_) => {}
+            Message::FastqFolderPicked(Some(dir)) => {
+                let files = group::fastq_files_in(&dir);
+                if files.is_empty() {
+                    self.error = Some(format!("No FASTQ files (.fastq, .fq, also .gz) in {} or its subfolders", dir.display()));
+                } else {
+                    self.add_fastq(files);
+                }
+            }
+            Message::FastqFolderPicked(None) => {}
+            Message::LinkFastq(m) => {
+                if let Some(Modal::LinkFastq(d)) = self.modal.as_mut()
+                    && let Some(task) = d.update(m)
+                {
+                    return task;
+                }
+            }
+            Message::RunLinkFastq => {
+                if !matches!(&self.modal, Some(Modal::LinkFastq(d)) if d.problem().is_none()) {
+                    return Task::none();
+                }
+                if self.busy() {
+                    self.error = Some("Wait for the current task to finish, then link the files.".into());
+                    return Task::none();
+                }
+                let Some(Modal::LinkFastq(d)) = self.modal.take() else { return Task::none() };
+                let sets = d
+                    .sets
+                    .into_iter()
+                    .map(|mut s| {
+                        s.name = s.name.trim().to_string();
+                        s
+                    })
+                    .collect();
+                return self.run_link(sets, Format::Fastq, d.folder);
+            }
+            Message::LinkDone(p) => {
+                self.job = None;
+                match p.take() {
+                    Some(Ok(out)) if out.cancelled => self.status = "Linking cancelled; nothing was linked".into(),
+                    Some(Ok(out)) => {
+                        self.reload_library();
+                        let what = if out.fasta { "FASTA file(s)" } else { "read set(s)" };
+                        self.status = format!("Linked {} {what}", out.ids.len());
+                        if let Some(&last) = out.ids.last() {
+                            let folder = self.library.iter().find(|d| d.id == last).and_then(|d| d.folder);
+                            self.reveal_folder(folder);
+                            self.set_primary(Some(LibKey::Doc(last)));
+                            self.lib_multi.clear();
+                        }
+                        if !out.failed.is_empty() {
+                            let mut text = if out.ids.is_empty() { String::new() } else { format!("Linked {} {what}.\n\n", out.ids.len()) };
+                            text.push_str("Not linked:\n");
+                            for f in &out.failed {
+                                text.push_str(&format!("• {f}\n"));
+                            }
+                            self.modal = Some(Modal::Info { title: "Linking files".into(), text });
+                        } else if let Some(&last) = out.ids.last() {
+                            if out.fasta {
+                                return Task::batch([self.check_links(Some(out.ids)), self.open_linked(last)]);
+                            }
+                            if out.ids.len() == 1 {
+                                self.show_linked(last, None);
+                            }
+                        }
+                        return self.check_links(Some(out.ids));
+                    }
+                    Some(Err(e)) => self.error = Some(e),
+                    None => {}
+                }
+            }
+            Message::LinkedFiles(id) => {
+                self.show_linked(id, None);
+                return self.check_links(Some(vec![id]));
+            }
+            Message::Linked(m) => {
+                let Some(Modal::Linked(d)) = self.modal.as_mut() else { return Task::none() };
+                let id = d.id;
+                match m {
+                    LinkedMsg::Check => {
+                        d.notice = None;
+                        return self.check_links(Some(vec![id]));
+                    }
+                    LinkedMsg::Open => {
+                        self.modal = None;
+                        return self.open_linked(id);
+                    }
+                    LinkedMsg::Technology(t) => {
+                        let saved = self.db.linked_set(id).and_then(|mut set| {
+                            set.technology = t;
+                            self.db.update_linked(id, &set).map(|()| set)
+                        });
+                        match saved {
+                            Ok(set) => {
+                                d.set.technology = t;
+                                self.linked.insert(id, set);
+                            }
+                            Err(e) => d.notice = Some((true, e)),
+                        }
+                    }
+                    LinkedMsg::Locate(i) => {
+                        let Some(f) = d.set.files.get(i) else { return Task::none() };
+                        let mut picker = rfd::AsyncFileDialog::new().set_title(format!("Locate {}", f.file_name()));
+                        if let Some(dir) = f.path.parent().filter(|p| p.is_dir()) {
+                            picker = picker.set_directory(dir);
+                        }
+                        return Task::perform(picker.pick_file(), move |f| Message::LocatePicked(id, i, f.map(|f| f.path().to_path_buf())));
+                    }
+                }
+            }
+            Message::LocatePicked(id, idx, Some(path)) => {
+                if let Some(Modal::Linked(d)) = self.modal.as_mut() {
+                    d.busy = true;
+                    d.notice = None;
+                }
+                let db_path = self.db_path.clone();
+                return job::background(move || relink_in_library(&db_path, id, idx, &path), |r| {
+                    Message::Relinked(Payload::new(r.unwrap_or_else(|| Err("Locate failed unexpectedly".into()))))
+                });
+            }
+            Message::LocatePicked(..) => {}
+            Message::Relinked(p) => {
+                let result = p.take().unwrap_or_else(|| Err("Locate failed unexpectedly".into()));
+                self.reload_library();
+                let notice = match &result {
+                    Ok((n, others)) => {
+                        let mut s = if *n == 1 { "The file is linked again.".to_string() } else { format!("{n} files are linked again.") };
+                        if *others > 0 {
+                            s.push_str(&format!(" {others} file(s) of other linked documents were in the same folder and are linked again too."));
+                        }
+                        (false, s)
+                    }
+                    Err(e) => (true, e.clone()),
+                };
+                if let Some(Modal::Linked(d)) = self.modal.as_mut() {
+                    if let Some(set) = self.linked.get(&d.id) {
+                        d.set = set.clone();
+                    }
+                    d.busy = false;
+                    d.notice = Some(notice.clone());
+                }
+                if result.is_ok() {
+                    self.status = notice.1;
+                    return self.check_links(None);
+                }
+            }
+            Message::LinkStates(p) => {
+                let states = p.take().unwrap_or_default();
+                if let Some(Modal::Linked(d)) = self.modal.as_mut() {
+                    if let Some(s) = states.get(&d.id) {
+                        d.states = Some(s.clone());
+                    }
+                    d.busy = false;
+                }
+                self.link_states.extend(states);
+            }
+            Message::LinkedOpened(p) => {
+                self.job = None;
+                match p.take() {
+                    Some(Ok(LinkedOpen::Loaded(loaded))) => {
+                        if let Some(l) = &loaded.open.linked {
+                            self.link_states.insert(loaded.open.info.id, vec![FileState::Ok; l.set.files.len()]);
+                        }
+                        self.show_document(*loaded);
+                    }
+                    Some(Ok(LinkedOpen::Broken(id, states))) => {
+                        let what = linked::problem_label(&states).unwrap_or_default();
+                        self.status = format!("“{}” cannot be opened: {what}", self.lib_name(LibKey::Doc(id)));
+                        self.link_states.insert(id, states.clone());
+                        self.show_linked(id, Some(states));
+                    }
+                    Some(Err(e)) => self.error = Some(e),
+                    None => {}
+                }
             }
             Message::ImportPicked(Some(paths)) if !paths.is_empty() => {
                 let db_path = self.db_path.clone();
@@ -1179,15 +1613,21 @@ impl App {
             }
             Message::AskDelete(id) => {
                 if let Some(d) = self.library.iter().find(|d| d.id == id) {
-                    let mut detail = if d.kind == DocKind::Text {
-                        format!("Text document · saved {}", d.created)
-                    } else {
-                        format!("{} · {} sequences · {} bp", d.kind.label(), canvas::group_digits(d.n_rows), canvas::group_digits(d.width))
+                    let mut detail = match (d.kind, self.linked.get(&id)) {
+                        (DocKind::Text, _) => format!("Text document · saved {}", d.created),
+                        (DocKind::Linked, Some(s)) => format!(
+                            "Linked {} · {} {} · {}",
+                            s.kind_label(),
+                            canvas::group_digits(s.summary.records as usize),
+                            s.unit(),
+                            link_description(s)
+                        ),
+                        _ => format!("{} · {} sequences · {} bp", d.kind.label(), canvas::group_digits(d.n_rows), canvas::group_digits(d.width)),
                     };
                     if self.open.as_ref().is_some_and(|o| o.info.id == id) {
                         detail.push_str("\nThe document is open and will be closed.");
                     }
-                    self.modal = Some(Modal::ConfirmDelete { id, name: d.name.clone(), detail });
+                    self.modal = Some(Modal::ConfirmDelete { id, name: d.name.clone(), detail, linked: d.kind == DocKind::Linked });
                 }
             }
             Message::ConfirmDelete(id) => {
@@ -1203,6 +1643,7 @@ impl App {
                 if self.library_selected == Some(id) {
                     self.library_selected = None;
                 }
+                self.link_states.remove(&id);
                 self.reload_library();
             }
             Message::View(m) => return self.on_view(m),
@@ -1348,6 +1789,9 @@ impl App {
                 }
             }
             Message::NewAnnotation => {
+                if self.refuse_read_only("annotations") {
+                    return Task::none();
+                }
                 let Some(od) = self.open.as_ref() else { return Task::none() };
                 let Some(sel) = od.selection else {
                     self.error = Some("Select columns first (drag across the alignment).".into());
@@ -1397,7 +1841,7 @@ impl App {
                 }
             }
             Message::ImportMetadata => {
-                if self.open.is_none() {
+                if self.open.is_none() || self.refuse_read_only("metadata") {
                     return Task::none();
                 }
                 return Task::perform(
@@ -1412,11 +1856,14 @@ impl App {
             Message::MetadataPicked(Some(path)) => self.import_metadata(&path),
             Message::MetadataPicked(None) => {}
             Message::OpenNameFields => {
-                if self.open.is_some() {
+                if self.open.is_some() && !self.refuse_read_only("metadata") {
                     self.modal = Some(Modal::NameFields { delimiter: "|".into(), keys: String::new() });
                 }
             }
             Message::OpenExport => {
+                if self.refuse_partial() {
+                    return Task::none();
+                }
                 if let Some(od) = &self.open {
                     self.modal = Some(Modal::Export(ExportDialog::new(od)));
                 }
@@ -1438,6 +1885,9 @@ impl App {
                 }
             }
             Message::OpenMapDialog => {
+                if self.refuse_partial() {
+                    return Task::none();
+                }
                 if let Some(od) = &self.open {
                     self.modal = Some(Modal::Map(MapDialog::new(od, &self.settings.map, &self.library)));
                 } else {
@@ -1869,7 +2319,7 @@ impl App {
     /// Sorts all sequences of the open document (the reference goes first)
     /// and saves the order. Repeating the last sort reverses it.
     fn sort_rows(&mut self, key: RowSort) {
-        if self.busy() {
+        if self.busy() || self.refuse_read_only("a new sequence order") {
             return;
         }
         let Some(od) = self.open.as_mut() else { return };
@@ -1894,6 +2344,9 @@ impl App {
     }
 
     fn set_reference(&mut self, reference: Option<usize>) {
+        if self.refuse_read_only("the reference") {
+            return;
+        }
         let prefs = self.settings.view.clone();
         let opts = self.settings.primer;
         let Some(od) = self.open.as_mut() else { return };
@@ -1965,6 +2418,9 @@ impl App {
 
     /// Adds the annotation of the properties dialog, or saves its changes.
     fn save_annotation(&mut self) {
+        if self.refuse_read_only("annotations") {
+            return;
+        }
         let Some(Modal::Annotation(d)) = self.modal.as_ref() else { return };
         let (Ok((c0, c1)), None) = (d.range(), d.problem()) else { return };
         let (id, name, kind) = (d.id, d.name.trim().to_string(), d.kind);
@@ -1997,6 +2453,9 @@ impl App {
     }
 
     fn apply_metadata(&mut self, f: impl FnOnce(&mut [Row]) -> String) {
+        if self.refuse_read_only("metadata") {
+            return;
+        }
         let Some(od) = self.open.as_mut() else { return };
         let doc = Arc::make_mut(&mut od.doc);
         let msg = f(&mut doc.rows);
@@ -2230,6 +2689,9 @@ impl App {
     }
 
     fn open_primersearch(&mut self) {
+        if self.refuse_partial() {
+            return;
+        }
         let version = match self.tool_status.get(tools::PRIMERSEARCH.id) {
             Some(ToolStatus::Ready { version, .. }) => version.clone(),
             _ => {
@@ -2388,7 +2850,7 @@ impl App {
     /// Saves the selected columns of all sequences (without the reference) as a
     /// new library document next to the open one.
     fn extract_slice(&mut self) -> Task<Message> {
-        if self.busy() {
+        if self.busy() || self.refuse_partial() {
             return Task::none();
         }
         let Some(od) = self.open.as_ref() else { return Task::none() };
@@ -2431,7 +2893,7 @@ impl App {
     /// document, or the open one when nothing is selected.
     fn editable_sequence(&self) -> Option<i64> {
         let id = self.library_selected.or_else(|| self.open.as_ref().map(|o| o.info.id))?;
-        self.library.iter().find(|d| d.id == id && d.n_rows == 1).map(|d| d.id)
+        self.library.iter().find(|d| d.id == id && d.n_rows == 1 && d.kind.has_rows()).map(|d| d.id)
     }
 
     /// Creates the document of the sequence dialog, or saves the edited sequence.
@@ -2531,6 +2993,41 @@ impl App {
             |r| Message::ImportDone(Payload::new(r.unwrap_or_else(|| Err("Demo generation failed".into())))),
         )
     }
+}
+
+/// Where the files of a linked set are: "2 files in C:\data\run1".
+fn link_description(set: &LinkedSet) -> String {
+    let dirs: BTreeSet<&Path> = set.files.iter().filter_map(|f| f.path.parent()).collect();
+    let files = if set.files.len() == 1 { "1 file".to_string() } else { format!("{} files", set.files.len()) };
+    match dirs.first() {
+        Some(dir) if dirs.len() == 1 => format!("{files} in {}", dir.display()),
+        _ => format!("{files} in {} folders", dirs.len()),
+    }
+}
+
+/// Links file `idx` of linked document `id` to `path` if it is the same file,
+/// and saves it. Missing files from the same old folder are looked for in the
+/// new folder, also those of other linked documents. Returns how many files
+/// were linked again (of this document, of others).
+fn relink_in_library(db_path: &Path, id: i64, idx: usize, path: &Path) -> Result<(usize, usize), String> {
+    let db = Db::open(db_path)?;
+    let mut set = db.linked_set(id)?;
+    let old_dir = set.files.get(idx).and_then(|f| f.path.parent()).map(Path::to_path_buf);
+    let n = linked::relink(&mut set, idx, path)?;
+    db.update_linked(id, &set)?;
+    let mut others = 0;
+    if let (Some(old), Some(new)) = (old_dir, path.parent()) {
+        for (other, mut s) in db.list_linked()? {
+            if other != id {
+                let k = linked::relink_folder(&mut s, &old, new);
+                if k > 0 {
+                    db.update_linked(other, &s)?;
+                    others += k;
+                }
+            }
+        }
+    }
+    Ok((n, others))
 }
 
 /// Rows of the open document for an export or a tool run: all sequences

@@ -1,6 +1,7 @@
 //! State of the open document and the viewer.
 
 use crate::display::{self, DisplayOptions, Item, RowSort};
+use crate::linked::LinkedSet;
 use crate::model::{Annotation, ColumnMap, ColumnStats, ConsensusThreshold, DocInfo, Document, RefCoords};
 use crate::primer::{OligoSource, PrimerOptions, PrimerReport};
 use crate::search::{Hit, Scope};
@@ -217,6 +218,15 @@ pub struct OpenDoc {
     pub annotation_kind: crate::model::AnnotationKind,
     /// Last permanent sort and whether it was descending (repeating it reverses).
     pub last_sort: Option<(RowSort, bool)>,
+    /// Set for linked files: the document is read-only (nothing is saved).
+    pub linked: Option<LinkedView>,
+}
+
+/// A linked document in the viewer.
+pub struct LinkedView {
+    pub set: LinkedSet,
+    /// All records of the files are shown, not only the first ones.
+    pub complete: bool,
 }
 
 impl OpenDoc {
@@ -251,6 +261,7 @@ impl OpenDoc {
             selected_annotation: None,
             annotation_kind: crate::model::AnnotationKind::ForwardPrimer,
             last_sort: None,
+            linked: None,
         };
         od.recompute_stats(prefs);
         od.rebuild_items();

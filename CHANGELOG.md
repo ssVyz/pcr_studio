@@ -7,6 +7,53 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.0.16] - 2026-10-22
+
+### Added
+
+- **Linked files**: a new library document kind that points to sequence files on disk instead of
+  holding the sequences (for FASTQ files, which are too large for the library). PCR Studio never
+  changes a linked file. Own icon (chain), colored by format.
+  - **File → Import FASTQ (linked)…** (also the welcome screen, right-click on free library
+    space, and FASTQ files given on the command line): pick `.fastq`/`.fq` files (also `.gz`) or
+    **Add folder…**. The dialog proposes read sets that can be renamed: R1/R2 files are paired
+    (`_R1`/`_R2`, or `_1`/`_2` when exactly these two exist), lanes of one sample form one paired
+    set, Nanopore chunk files of one run one set. Options: pair R1/R2 files; one read set per
+    sample, per file or pair, or all files together.
+  - Linking reads every file once, in parallel (progress, **Cancel**): reads, bases, lengths and
+    N50, mean quality, GC and N share; R1 and R2 must have the same reads (count and names) or the
+    set is not linked. The technology (Illumina / Nanopore) is detected from the read names, else
+    the lengths, and can be changed.
+  - **Import FASTA…** now asks whether to **copy the sequences into the library** (default, as
+    before) or **link the file**.
+  - Every file is remembered by path, size, modification time and a fingerprint (hash of size and
+    first and last MiB). Missing (moved, deleted, unreachable) and changed files are found at
+    start-up and when a linked document is opened or checked, and marked in the library (broken
+    chain, red note).
+  - **Linked files…** dialog (right-click, or the button in the right panel): summary, files with
+    folder, size and state, **Check files**, **Open in viewer**, **Locate…** for a missing or
+    changed file. Locate… accepts only the same file (size and fingerprint) and then also finds
+    the other missing files from the same folder, including those of other linked documents.
+  - Opening a linked document shows it read-only in the viewer: the first 1,000 reads of a read
+    set (pairs: R1 and R2 alternating, metadata *Mate*), a FASTA file completely (up to 100,000
+    sequences / 100 Mb). Sorting, the reference, annotations and metadata cannot be saved (menu
+    entries disabled, the right panel explains it). Map to reference, Find primers, Extract and
+    Export need all sequences: enabled for a completely shown FASTA file, disabled for the first
+    reads of a read set.
+  - Deleting a linked document removes only the link; the confirmation says so.
+- `linked` module (`LinkedSet`, file states, fingerprints, relinking, gzip-aware `open`; `fastq`
+  reader that also takes wrapped records and empty reads; `scan` summary pass, R1/R2 check,
+  technology detection, preview; `group` file grouping), `linked` table and
+  `Db::insert_linked_document` / `linked_set` / `list_linked` / `update_linked`,
+  `fasta::read_rows`, `DocKind::Linked`, with tests.
+- Dependencies: `flate2` (gzip), `xxhash-rust` (file fingerprints).
+
+### Changed
+
+- FASTA import reads gzip-compressed files, and picking a FASTQ file there explains that FASTQ
+  files are linked. The import dialog's filter includes `.gz`.
+- Map to reference no longer offers linked documents as the reference (as for text documents).
+
 ## [0.0.15] - 2026-10-20
 
 ### Added

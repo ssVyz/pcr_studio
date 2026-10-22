@@ -6,6 +6,8 @@ use super::job;
 use super::state::OpenDoc;
 use super::{AppSettings, Message, style};
 use crate::fasta::{self, PastedRecord};
+use crate::linked::group::{self, Grouping, Proposal};
+use crate::linked::{self, FileState, Layout, LinkedSet, Technology};
 use crate::mapper::{MapParams, Sensitivity};
 use crate::model::{AnnotationKind, DocInfo, DocKind, RefCoords, Row};
 use crate::primer::Orientation;
@@ -13,10 +15,10 @@ use crate::seq::{self, GAP};
 use crate::thermo::TmConditions;
 use crate::tools::primersearch::{self as ps, Criterion, InputStats, Mode};
 use crate::tools::{self, ToolConfig, ToolSource, ToolSpec, ToolStatus};
-use iced::widget::{Space, button, checkbox, column, container, pick_list, row, rule, scrollable, text, text_editor, text_input};
+use iced::widget::{Space, button, checkbox, column, container, pick_list, radio, row, rule, scrollable, text, text_editor, text_input};
 use iced::{Element, Fill, Font, Length, Task};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Id of the rename text field, focused when the dialog opens.
 pub const RENAME_INPUT: &str = "rename-input";
@@ -50,7 +52,8 @@ pub enum Modal {
     Export(ExportDialog),
     Settings(SettingsDialog),
     Rename { id: i64, text: String, folder: bool },
-    ConfirmDelete { id: i64, name: String, detail: String },
+    /// `linked`: only the link is deleted, not the files.
+    ConfirmDelete { id: i64, name: String, detail: String, linked: bool },
     ConfirmDeleteFolder { id: i64, name: String, documents: usize, subfolders: usize },
     NameFields { delimiter: String, keys: String },
     Info { title: String, text: String },
@@ -58,6 +61,9 @@ pub enum Modal {
     TextView(TextView),
     /// Exit requested while a tool runs; `detail` describes the run.
     ConfirmExit { detail: String },
+    ImportFasta(ImportFastaDialog),
+    LinkFastq(LinkFastqDialog),
+    Linked(LinkedDialog),
 }
 
 #[derive(Debug, Clone)]
@@ -577,7 +583,7 @@ impl MapDialog {
             reference: RefChoice::ThisDocument(reference),
             ref_filter: String::new(),
             candidates: Vec::new(),
-            docs: library.iter().filter(|x| x.id != od.info.id && x.kind != DocKind::Text).map(|x| DocOption { id: x.id, name: x.name.clone() }).collect(),
+            docs: library.iter().filter(|x| x.id != od.info.id && x.kind.has_rows()).map(|x| DocOption { id: x.id, name: x.name.clone() }).collect(),
             sensitivity: last.sensitivity,
             word_len: last.word_len.to_string(),
             repeats: last.max_word_repeats.to_string(),
@@ -1492,6 +1498,368 @@ impl PrimersearchDialog {
     }
 }
 
+// ---------------------------------------------------------------- import FASTA / link FASTQ
+
+fn file_name(p: &Path) -> String {
+    p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string())
+}
+
+/// Picked FASTA files: copy them into the library (the default) or link them.
+pub struct ImportFastaDialog {
+    pub files: Vec<(PathBuf, Option<u64>)>,
+    pub link: bool,
+}
+
+impl ImportFastaDialog {
+    pub fn new(paths: Vec<PathBuf>) -> ImportFastaDialog {
+        let files = paths
+            .into_iter()
+            .map(|p| {
+                let size = std::fs::metadata(&p).ok().map(|m| m.len());
+                (p, size)
+            })
+            .collect();
+        ImportFastaDialog { files, link: false }
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let mut list = column![].spacing(2);
+        for (p, size) in self.files.iter().take(8) {
+            list = list.push(row![
+                text(file_name(p)).size(13).width(Fill),
+                text(size.map(linked::size_label).unwrap_or_default()).size(12).style(style::muted),
+            ]);
+        }
+        if self.files.len() > 8 {
+            list = list.push(text(format!("… and {} more", self.files.len() - 8)).size(12).style(style::muted));
+        }
+        let selected = self.link;
+        let choice = move |link: bool, label: &'static str, about: &'static str| -> Element<'static, Message> {
+            column![
+                radio(label, link, Some(selected), Message::ImportFastaLink).size(16).text_size(14),
+                container(text(about).size(12).style(style::muted)).padding(iced::Padding { left: 26.0, ..Default::default() }),
+            ]
+            .spacing(2)
+            .into()
+        };
+        let body = column![
+            list,
+            rule::horizontal(1),
+            choice(
+                false,
+                "Copy into the library",
+                "The sequences are stored in the library; the file is not needed afterwards. They can be sorted, annotated and edited."
+            ),
+            choice(
+                true,
+                "Link to the file",
+                "The file stays where it is and is read from there; nothing is copied. The document is read-only. \
+                 Moving or deleting the file breaks the link (Locate… repairs it)."
+            ),
+        ]
+        .spacing(12);
+        let buttons = row![
+            Space::new().width(Fill),
+            button("Cancel").on_press(Message::CloseModal).style(button::secondary),
+            button(if self.link { "Link" } else { "Import" }).on_press(Message::RunImportFasta).style(button::primary),
+        ]
+        .spacing(10);
+        dialog_frame("Import FASTA", body.into(), buttons.into(), 540.0)
+    }
+}
+
+/// File dialog for FASTQ files (File → Import FASTQ and the link dialog).
+pub fn pick_fastq_files() -> Task<Message> {
+    Task::perform(
+        rfd::AsyncFileDialog::new()
+            .set_title("Import FASTQ (linked)")
+            .add_filter("FASTQ", &["fastq", "fq", "gz"])
+            .add_filter("All files", &["*"])
+            .pick_files(),
+        |files| Message::FastqPicked(files.map(|v| v.into_iter().map(|f| f.path().to_path_buf()).collect())),
+    )
+}
+
+/// Groups picked FASTQ files into read sets to link.
+pub struct LinkFastqDialog {
+    pub files: Vec<PathBuf>,
+    sizes: HashMap<PathBuf, u64>,
+    pub pair: bool,
+    pub grouping: Grouping,
+    pub sets: Vec<Proposal>,
+    /// Library folder for the new documents.
+    pub folder: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LinkFastqMsg {
+    Pair(bool),
+    Grouping(Grouping),
+    Name(usize, String),
+    AddFiles,
+    AddFolder,
+}
+
+impl LinkFastqDialog {
+    pub fn new(folder: Option<i64>) -> LinkFastqDialog {
+        LinkFastqDialog { files: Vec::new(), sizes: HashMap::new(), pair: true, grouping: Grouping::BySample, sets: Vec::new(), folder }
+    }
+
+    /// Adds files (each once) and groups them again.
+    pub fn add(&mut self, paths: Vec<PathBuf>) {
+        for p in paths {
+            if !self.files.contains(&p) {
+                if let Ok(m) = std::fs::metadata(&p) {
+                    self.sizes.insert(p.clone(), m.len());
+                }
+                self.files.push(p);
+            }
+        }
+        self.regroup();
+    }
+
+    /// Proposes the read sets again; names typed for sets that stay the same are kept.
+    fn regroup(&mut self) {
+        let key = |s: &Proposal| s.files.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>();
+        let names: HashMap<Vec<PathBuf>, String> = self.sets.iter().map(|s| (key(s), s.name.clone())).collect();
+        self.sets = group::propose(&self.files, self.pair, self.grouping);
+        for s in &mut self.sets {
+            if let Some(n) = names.get(&key(s)) {
+                s.name = n.clone();
+            }
+        }
+    }
+
+    pub fn update(&mut self, m: LinkFastqMsg) -> Option<Task<Message>> {
+        match m {
+            LinkFastqMsg::Pair(b) => {
+                self.pair = b;
+                self.regroup();
+            }
+            LinkFastqMsg::Grouping(g) => {
+                self.grouping = g;
+                self.regroup();
+            }
+            LinkFastqMsg::Name(i, s) => {
+                if let Some(set) = self.sets.get_mut(i) {
+                    set.name = s;
+                }
+            }
+            LinkFastqMsg::AddFiles => return Some(pick_fastq_files()),
+            LinkFastqMsg::AddFolder => {
+                return Some(Task::perform(rfd::AsyncFileDialog::new().set_title("Add a folder with FASTQ files").pick_folder(), |f| {
+                    Message::FastqFolderPicked(f.map(|f| f.path().to_path_buf()))
+                }));
+            }
+        }
+        None
+    }
+
+    pub fn problem(&self) -> Option<&'static str> {
+        if self.sets.is_empty() {
+            Some("Add FASTQ files or a folder with FASTQ files.")
+        } else if self.sets.iter().any(|s| s.name.trim().is_empty()) {
+            Some("Every read set needs a name.")
+        } else {
+            None
+        }
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let l = Message::LinkFastq;
+        let mut list = column![].spacing(10);
+        if self.sets.is_empty() {
+            list = list.push(text("No files yet: Add files… or Add folder….").size(13).style(style::muted));
+        }
+        for (i, s) in self.sets.iter().enumerate() {
+            let what = match (s.layout, s.files.len()) {
+                (Layout::Paired, n) if n > 2 => format!("Paired-end · {} lanes", n / 2),
+                (Layout::Paired, _) => "Paired-end".to_string(),
+                (Layout::Single, 1) => "Single-end".to_string(),
+                (Layout::Single, n) => format!("Single-end · {n} files"),
+            };
+            let mut files = column![].spacing(1);
+            for (p, role) in s.files.iter().take(12) {
+                files = files.push(
+                    row![
+                        text(role.label()).size(11).width(34).font(Font::MONOSPACE),
+                        text(file_name(p)).size(12).width(Fill),
+                        text(self.sizes.get(p).map(|&b| linked::size_label(b)).unwrap_or_default()).size(11).style(style::muted),
+                    ]
+                    .spacing(6),
+                );
+            }
+            if s.files.len() > 12 {
+                files = files.push(text(format!("… and {} more files", s.files.len() - 12)).size(11).style(style::muted));
+            }
+            let head = row![
+                text_input("Name", &s.name).on_input(move |t| l(LinkFastqMsg::Name(i, t))).padding(5).size(13).width(Fill),
+                text(what).size(12).style(style::muted),
+            ]
+            .spacing(10)
+            .align_y(iced::Center);
+            list = list.push(container(column![head, files].spacing(6)).padding(10).width(Fill).style(container::bordered_box));
+        }
+        let total: u64 = self.files.iter().filter_map(|p| self.sizes.get(p)).sum();
+        let options = row![
+            checkbox(self.pair).label("Pair R1/R2 files").on_toggle(move |b| l(LinkFastqMsg::Pair(b))).text_size(13),
+            Space::new().width(Fill),
+            pick_list(&Grouping::ALL[..], Some(self.grouping), move |g| l(LinkFastqMsg::Grouping(g))).text_size(12).padding(4),
+        ]
+        .spacing(10)
+        .align_y(iced::Center);
+        let mut body = column![
+            text(
+                "FASTQ files are linked, not copied: they stay where they are and the library remembers where. \
+                 Moving or deleting a file breaks the link; Locate… repairs it."
+            )
+            .size(12)
+            .style(style::muted),
+            options,
+            scrollable(list).height(Length::Fixed(380.0)),
+            text(format!("{} file(s) · {} · {} read set(s)", self.files.len(), linked::size_label(total), self.sets.len())).size(12),
+            text("Linking reads every file once: reads, bases, lengths and qualities are counted, and R1 and R2 are checked to belong together.")
+                .size(11)
+                .style(style::muted),
+        ]
+        .spacing(10);
+        if let (Some(p), false) = (self.problem(), self.sets.is_empty()) {
+            body = body.push(text(p).size(12).style(style::danger_text));
+        }
+        let n = self.sets.len();
+        let buttons = row![
+            button("Add files…").on_press(l(LinkFastqMsg::AddFiles)).style(button::secondary),
+            button("Add folder…").on_press(l(LinkFastqMsg::AddFolder)).style(button::secondary),
+            Space::new().width(Fill),
+            button("Cancel").on_press(Message::CloseModal).style(button::secondary),
+            button(text(if n == 1 { "Link 1 read set".to_string() } else { format!("Link {n} read sets") }))
+                .on_press_maybe(self.problem().is_none().then_some(Message::RunLinkFastq))
+                .style(button::primary),
+        ]
+        .spacing(10);
+        dialog_frame("Import FASTQ (linked)", body.into(), buttons.into(), 760.0)
+    }
+}
+
+/// The files of a linked document: what they hold, whether they are still
+/// where they were, and Locate… for moved ones.
+pub struct LinkedDialog {
+    pub id: i64,
+    pub name: String,
+    pub info: String,
+    pub set: LinkedSet,
+    /// File states of the last check (`None` until checked).
+    pub states: Option<Vec<FileState>>,
+    /// A check or relink is running.
+    pub busy: bool,
+    /// Outcome of the last Locate… (`true`: an error).
+    pub notice: Option<(bool, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LinkedMsg {
+    Locate(usize),
+    Check,
+    Technology(Technology),
+    Open,
+}
+
+impl LinkedDialog {
+    pub fn problems(&self) -> bool {
+        self.states.as_ref().is_some_and(|s| s.iter().any(|&x| x != FileState::Ok))
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let m = Message::Linked;
+        let set = &self.set;
+        let s = &set.summary;
+        let fastq = set.format == linked::Format::Fastq;
+        let kv = |label: &'static str, value: String| -> Element<'static, Message> {
+            row![text(label).size(13).width(Length::Fixed(130.0)), text(value).size(13)].into()
+        };
+        let mut records = format!("{} {}", group_digits(s.records as usize), set.unit());
+        if set.layout == Layout::Paired {
+            records.push_str(&format!(" ({} pairs)", group_digits((s.records / 2) as usize)));
+        }
+        let lengths = if s.min_len == s.max_len {
+            format!("{} bp", group_digits(s.max_len as usize))
+        } else {
+            format!("{}–{} bp · N50 {} bp", group_digits(s.min_len as usize), group_digits(s.max_len as usize), group_digits(s.n50 as usize))
+        };
+        let mut facts = column![
+            kv(if fastq { "Reads" } else { "Sequences" }, records),
+            kv("Bases", linked::bases_label(s.bases)),
+            kv(if fastq { "Read length" } else { "Length" }, lengths),
+        ]
+        .spacing(3);
+        if let Some(q) = s.mean_quality {
+            facts = facts.push(kv("Mean quality", format!("Q{q:.1}")));
+        }
+        facts = facts.push(kv("GC", format!("{:.1}% · N and other codes {:.2}%", s.gc_percent, s.n_percent)));
+        if !fastq {
+            facts = facts.push(kv("Type", (if s.aligned { "Alignment" } else { "Unaligned sequences" }).to_string()));
+        }
+        let mut head = column![text(set.kind_label()).size(14), text(self.info.as_str()).size(12).style(style::muted)].spacing(2);
+        if fastq {
+            head = head.push(
+                row![
+                    text("Technology").size(13).width(Length::Fixed(130.0)),
+                    pick_list(&Technology::ALL[..], Some(set.technology), move |t| m(LinkedMsg::Technology(t))).text_size(12).padding(4),
+                ]
+                .align_y(iced::Center),
+            );
+        }
+        let mut files = column![text("Files").size(15)].spacing(6);
+        for (i, f) in set.files.iter().enumerate() {
+            let state = self.states.as_ref().and_then(|s| s.get(i)).copied();
+            let state_text: Element<Message> = match state {
+                None => text(if self.busy { "Checking…" } else { "Not checked" }).size(12).style(style::muted).into(),
+                Some(FileState::Ok) => text("✓ OK").size(12).style(style::success_text).into(),
+                Some(st) => text(format!("✕ {}", st.label())).size(12).style(style::danger_text).into(),
+            };
+            let mut line = row![
+                text(f.role.label()).size(11).width(30).font(Font::MONOSPACE),
+                text(f.file_name()).size(13).width(Fill),
+                text(linked::size_label(f.size)).size(11).style(style::muted),
+                state_text,
+            ]
+            .spacing(8)
+            .align_y(iced::Center);
+            if state.is_some_and(|st| st != FileState::Ok) {
+                line = line.push(
+                    button(text("Locate…").size(11)).padding([2, 8]).style(button::secondary).on_press_maybe((!self.busy).then_some(m(LinkedMsg::Locate(i)))),
+                );
+            }
+            let dir = f.path.parent().map(|d| d.display().to_string()).unwrap_or_default();
+            files = files.push(column![
+                line,
+                row![Space::new().width(38), text(dir).size(11).style(style::muted).wrapping(text::Wrapping::WordOrGlyph)],
+            ]);
+        }
+        let files_h = if set.files.len() > 5 { Length::Fixed(260.0) } else { Length::Shrink };
+        let mut body = column![head, facts, rule::horizontal(1), scrollable(files).height(files_h)].spacing(12);
+        if let Some((error, msg)) = &self.notice {
+            body = body.push(text(msg.as_str()).size(12).style(if *error { style::danger_text } else { style::success_text }));
+        }
+        body = body.push(
+            text(
+                "PCR Studio only reads these files and never changes them. If they move, Locate… links them again; \
+                 other files from the same folder are then found automatically.",
+            )
+            .size(11)
+            .style(style::muted),
+        );
+        let buttons = row![
+            button("Check files").on_press_maybe((!self.busy).then_some(m(LinkedMsg::Check))).style(button::secondary),
+            button("Open in viewer").on_press_maybe((!self.busy && !self.problems()).then_some(m(LinkedMsg::Open))).style(button::secondary),
+            Space::new().width(Fill),
+            button("Close").on_press(Message::CloseModal).style(button::primary),
+        ]
+        .spacing(10);
+        dialog_frame(self.name.as_str(), body.into(), buttons.into(), 760.0)
+    }
+}
+
 // ---------------------------------------------------------------- text viewer
 
 /// Shows a text document (read-only; text can be selected and copied).
@@ -1632,11 +2000,15 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
             .spacing(10);
             dialog_frame(if *folder { "Rename folder" } else { "Rename document" }, body.into(), buttons.into(), 420.0)
         }
-        Modal::ConfirmDelete { id, name, detail } => {
+        Modal::ConfirmDelete { id, name, detail, linked } => {
             let body = column![
                 text(format!("Delete “{name}” from the library?")).size(14),
                 text(detail.as_str()).size(12).style(style::muted),
-                irreversible("The document, its sequences and its annotations are removed permanently."),
+                irreversible(if *linked {
+                    "The link is removed permanently. The files on disk are not changed."
+                } else {
+                    "The document, its sequences and its annotations are removed permanently."
+                }),
             ]
             .spacing(10);
             let buttons = row![
@@ -1711,6 +2083,9 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
             .spacing(10);
             dialog_frame("Exit PCR Studio?", body.into(), buttons.into(), 460.0)
         }
+        Modal::ImportFasta(d) => d.view(),
+        Modal::LinkFastq(d) => d.view(),
+        Modal::Linked(d) => d.view(),
     }
 }
 

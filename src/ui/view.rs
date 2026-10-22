@@ -5,7 +5,8 @@ use super::dialogs::{self, ModalMsg};
 use super::state::{BASE_COL_W, GraphMode, Highlight, OpenDoc};
 use super::{App, ContextTarget, DropTarget, FolderChoice, GroupChoice, JUMP_INPUT, LIB_SCROLL, LibKey, Message, SEARCH_INPUT, Split, icons, menu, style};
 use crate::display::{Item, RowSort, SortKey};
-use crate::model::ConsensusThreshold;
+use crate::linked;
+use crate::model::{ConsensusThreshold, DocKind};
 use crate::primer::{self, OligoSource, Orientation, PrimerReport};
 use crate::search::Scope;
 use crate::tools;
@@ -92,6 +93,7 @@ impl App {
                 let od = self.open.as_ref();
                 let selection = od.is_some_and(|o| o.selection.is_some());
                 let report = od.is_some_and(|o| o.report.is_some());
+                let (writable, complete) = (self.open_writable(), self.open_complete());
                 let mut entries = Vec::new();
                 if let Some(id) = annotation {
                     entries.push(Entry::item("Annotation properties…", "", Some(Message::AnnotationProperties(id))));
@@ -99,17 +101,17 @@ impl App {
                     entries.push(Entry::Separator);
                 }
                 entries.extend([
-                    Entry::item("Add annotation…", "", selection.then_some(Message::NewAnnotation)),
+                    Entry::item("Add annotation…", "", (selection && writable).then_some(Message::NewAnnotation)),
                     Entry::item("Oligo report", "", report.then_some(Message::ShowPopup)),
                     Entry::item("Copy oligo", "Ctrl+C", report.then_some(Message::CopyOligo)),
-                    Entry::item("Extract selection to library", "", (idle && selection).then_some(Message::ExtractSlice)),
+                    Entry::item("Extract selection to library", "", (idle && selection && complete).then_some(Message::ExtractSlice)),
                 ]);
                 // Only offered when primersearch is set up.
                 if self.tool_ready(tools::PRIMERSEARCH.id) {
                     entries.push(Entry::item(
                         "Find primers (primersearch)…",
                         "",
-                        (selection && self.tool_run.is_none()).then_some(Message::OpenPrimersearch),
+                        (selection && complete && self.tool_run.is_none()).then_some(Message::OpenPrimersearch),
                     ));
                 }
                 entries.extend([
@@ -126,12 +128,20 @@ impl App {
                     Entry::item("New folder", "", Some(Message::NewFolder)),
                     Entry::Separator,
                     Entry::item("Import FASTA…", "Ctrl+O", idle.then_some(Message::ImportFasta)),
+                    Entry::item("Import FASTQ (linked)…", "", idle.then_some(Message::ImportFastq)),
                 ];
             }
         };
         match key {
+            LibKey::Doc(id) if self.library.iter().any(|d| d.id == id && d.kind == DocKind::Linked) => vec![
+                Entry::item("Open", "", idle.then_some(Message::OpenDocument(id))),
+                Entry::item("Linked files…", "", Some(Message::LinkedFiles(id))),
+                Entry::item("Rename…", "", Some(Message::AskRename(id))),
+                Entry::Separator,
+                Entry::danger("Delete…", idle.then_some(Message::AskDelete(id))),
+            ],
             LibKey::Doc(id) => {
-                let single = self.library.iter().any(|d| d.id == id && d.n_rows == 1);
+                let single = self.library.iter().any(|d| d.id == id && d.n_rows == 1 && d.kind.has_rows());
                 vec![
                     Entry::item("Open", "", idle.then_some(Message::OpenDocument(id))),
                     Entry::item("Edit sequence…", "", (idle && single).then_some(Message::EditSequence(id))),
@@ -162,7 +172,7 @@ impl App {
         let Some(od) = self.open.as_ref() else {
             return ["Sort by name", "Sort by length", "Sort by bases in selection"].map(|l| Entry::item(l, "", None)).into();
         };
-        let ok = !self.busy() && od.doc.rows.len() >= 2 + od.reference.is_some() as usize;
+        let ok = !self.busy() && od.linked.is_none() && od.doc.rows.len() >= 2 + od.reference.is_some() as usize;
         let entry = |key: RowSort, in_selection: bool| {
             let descending = od.next_sort_descending(&key);
             let label = match &key {
@@ -240,16 +250,20 @@ impl App {
         let selection = od.is_some_and(|o| o.selection.is_some());
         let report = od.is_some_and(|o| o.report.is_some());
         let annotation = od.and_then(|o| o.selected_annotation);
+        // Linked files are read-only; tools that need all sequences are off
+        // while only the first reads are shown.
+        let (writable, complete) = (self.open_writable(), self.open_complete());
         let when = |ok: bool, m: Message| ok.then_some(m);
         match id {
             menu::MenuId::File => vec![
                 Entry::item("New sequence…", "Ctrl+N", when(idle, Message::NewSequence)),
                 Entry::item("Import FASTA…", "Ctrl+O", when(idle, Message::ImportFasta)),
-                Entry::item("Import metadata table…", "", when(idle && doc, Message::ImportMetadata)),
+                Entry::item("Import FASTQ (linked)…", "", when(idle, Message::ImportFastq)),
+                Entry::item("Import metadata table…", "", when(idle && writable, Message::ImportMetadata)),
                 Entry::item("Generate demo data", "", when(idle, Message::DemoData)),
                 Entry::Separator,
-                Entry::item("Export FASTA…", "Ctrl+E", when(idle && doc, Message::OpenExport)),
-                Entry::item("Extract selection to library", "", when(idle && selection, Message::ExtractSlice)),
+                Entry::item("Export FASTA…", "Ctrl+E", when(idle && complete, Message::OpenExport)),
+                Entry::item("Extract selection to library", "", when(idle && selection && complete, Message::ExtractSlice)),
                 Entry::Separator,
                 Entry::item("New folder", "", Some(Message::NewFolder)),
                 Entry::item("Close document", "Ctrl+W", when(doc, Message::CloseDocument)),
@@ -259,7 +273,7 @@ impl App {
             menu::MenuId::Edit => vec![
                 Entry::item("Edit sequence…", "", self.editable_sequence().filter(|_| idle).map(Message::EditSequence)),
                 Entry::Separator,
-                Entry::item("Add annotation from selection…", "", when(selection, Message::NewAnnotation)),
+                Entry::item("Add annotation from selection…", "", when(selection && writable, Message::NewAnnotation)),
                 Entry::item("Annotation properties…", "", annotation.map(Message::AnnotationProperties)),
                 Entry::item("Delete annotation…", "Del", annotation.map(Message::AskDeleteAnnotation)),
                 Entry::Separator,
@@ -270,9 +284,9 @@ impl App {
                 Entry::item(
                     "Set selected row as reference",
                     "",
-                    when(od.is_some_and(|o| o.selected_rows.len() == 1), Message::SetReferenceFromSelection),
+                    when(writable && od.is_some_and(|o| o.selected_rows.len() == 1), Message::SetReferenceFromSelection),
                 ),
-                Entry::item("Clear reference", "", when(od.is_some_and(|o| o.reference.is_some()), Message::ClearReference)),
+                Entry::item("Clear reference", "", when(writable && od.is_some_and(|o| o.reference.is_some()), Message::ClearReference)),
                 Entry::Separator,
             ]
             .into_iter()
@@ -285,10 +299,10 @@ impl App {
                 Entry::item("Reset panel sizes", "", Some(Message::ResetPanels)),
             ],
             menu::MenuId::Tools => vec![
-                Entry::item("Map to reference…", "Ctrl+M", when(idle && doc, Message::OpenMapDialog)),
-                Entry::item("Metadata from sequence names…", "", when(doc, Message::OpenNameFields)),
+                Entry::item("Map to reference…", "Ctrl+M", when(idle && complete, Message::OpenMapDialog)),
+                Entry::item("Metadata from sequence names…", "", when(writable, Message::OpenNameFields)),
                 Entry::Separator,
-                self.primersearch_entry(selection),
+                self.primersearch_entry(selection && complete),
                 Entry::Separator,
                 Entry::item("Oligo report for selection", "", when(report, Message::ShowPopup)),
                 Entry::item("Find sequence…", "Ctrl+F", when(doc, Message::FocusSearch)),
@@ -316,7 +330,9 @@ impl App {
         self.push_tree(&mut entries, None, 0, &known, &selection);
         let dragging = self.drag.as_ref().is_some_and(|d| d.active);
         if self.library.is_empty() && self.folders.is_empty() {
-            entries.push(text("No documents yet. Import FASTA files, create a sequence (Ctrl+N) or generate demo data.").size(12).style(style::muted).into());
+            entries.push(
+                text("No documents yet. Import FASTA or FASTQ files, create a sequence (Ctrl+N) or generate demo data.").size(12).style(style::muted).into(),
+            );
         }
         // Free space below the entries: the top-level drop zone.
         let root_target = dragging && self.drop_target() == Some(DropTarget::Root);
@@ -373,9 +389,14 @@ impl App {
         let info: Option<Element<Message>> = if selection.len() > 1 {
             Some(text(format!("{} items selected · drag one of them to move all", selection.len())).size(11).style(style::muted).into())
         } else if let Some(d) = self.library_selected.and_then(|id| self.library.iter().find(|d| d.id == id)) {
+            // Linked files: where they are now (they may have been located elsewhere).
+            let description = match self.linked.get(&d.id) {
+                Some(set) => super::link_description(set),
+                None => d.description.clone(),
+            };
             Some(
                 column![
-                    text(d.description.as_str()).size(11).style(style::muted).wrapping(text::Wrapping::WordOrGlyph),
+                    text(description).size(11).style(style::muted).wrapping(text::Wrapping::WordOrGlyph),
                     text(format!("Created {}", d.created)).size(11).style(style::muted)
                 ]
                 .spacing(2)
@@ -472,20 +493,29 @@ impl App {
         for d in self.library.iter().filter(|d| parent_of(d.folder) == parent) {
             let open = self.open.as_ref().is_some_and(|o| o.info.id == d.id);
             let kind = d.kind.label();
-            let subtitle = if d.kind == crate::model::DocKind::Text {
-                format!("{kind} · {}", d.created)
-            } else {
-                format!("{kind} · {} seqs · {} bp", group_digits(d.n_rows), group_digits(d.width))
+            let mut problem = None;
+            let (icon, subtitle) = match (d.kind, self.linked.get(&d.id)) {
+                (DocKind::Text, _) => (icons::document(d.kind, dark), format!("{kind} · {}", d.created)),
+                (DocKind::Linked, Some(set)) => {
+                    problem = self.link_states.get(&d.id).and_then(|s| linked::problem_label(s));
+                    let records = format!("{} {}", group_digits(set.summary.records as usize), set.unit());
+                    (icons::linked(set.format, problem.is_some(), dark), format!("Linked {} · {records}", set.kind_label()))
+                }
+                _ => (icons::document(d.kind, dark), format!("{kind} · {} seqs · {} bp", group_digits(d.n_rows), group_digits(d.width))),
             };
             let name = text(d.name.as_str()).size(13).font(if open {
                 Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT }
             } else {
                 Font::DEFAULT
             });
+            let mut info = column![name, text(subtitle).size(11).style(style::muted)].spacing(1).width(Fill);
+            if let Some(p) = problem {
+                info = info.push(text(p).size(11).style(style::danger_text));
+            }
             let content = row![
                 Space::new().width(20),
-                icons::document(d.kind, dark),
-                column![name, text(subtitle).size(11).style(style::muted)].spacing(1).width(Fill),
+                icon,
+                info,
             ]
             .spacing(5)
             .align_y(Alignment::Center);
@@ -541,12 +571,14 @@ impl App {
             text("Sequence alignment viewer for PCR design and inclusivity evaluation").size(15).style(style::muted),
             Space::new().height(12),
             text("1. Import FASTA files (aligned or unaligned) or paste a sequence — they are stored in the library.").size(14),
+            text("    FASTQ files (also .gz) are linked: they stay on disk and the library points to them.").size(14),
             text("2. Open a document from the library (double-click it or press Open).").size(14),
             text("3. Map sequences to a reference, or view an existing alignment.").size(14),
             text("4. Drag across columns to evaluate a primer or probe against all sequences.").size(14),
             Space::new().height(12),
             row![
                 button("Import FASTA…").on_press_maybe((!self.busy()).then_some(Message::ImportFasta)).style(button::primary),
+                button("Import FASTQ…").on_press_maybe((!self.busy()).then_some(Message::ImportFastq)).style(button::secondary),
                 button("New sequence…").on_press_maybe((!self.busy()).then_some(Message::NewSequence)).style(button::secondary),
                 button("Generate demo data").on_press_maybe((!self.busy()).then_some(Message::DemoData)).style(button::secondary),
             ]
@@ -624,33 +656,54 @@ impl App {
         let kind = od.info.kind.label();
         let ref_name = od.reference.map(|r| doc.rows[r].name.clone()).unwrap_or_else(|| "none".into());
         let one_selected = (od.selected_rows.len() == 1).then(|| *od.selected_rows.iter().next().unwrap());
+        let complete = self.open_complete();
 
-        let doc_info = column![
-            section("Document"),
-            text(od.info.name.as_str()).size(14),
-            text(format!("{kind} · {} sequences · {} columns", group_digits(doc.rows.len()), group_digits(doc.width))).size(12).style(style::muted),
-            text(format!("Reference: {ref_name}")).size(12),
+        let mut doc_info = column![section("Document"), text(od.info.name.as_str()).size(14)].spacing(6);
+        match &od.linked {
+            Some(l) => {
+                let unit = l.set.unit();
+                let shown = if l.complete {
+                    format!("{} {unit} · {} columns", group_digits(doc.rows.len()), group_digits(doc.width))
+                } else {
+                    format!("Showing the first {} of {} {unit}", group_digits(doc.rows.len()), group_digits(l.set.summary.records as usize))
+                };
+                doc_info = doc_info.extend([
+                    text(format!("Linked {}", l.set.kind_label())).size(12).style(style::muted).into(),
+                    text(shown).size(12).into(),
+                    text("Read-only: the sequences are read from the linked files; sorting, the reference, annotations and metadata cannot be saved.")
+                        .size(11)
+                        .style(style::muted)
+                        .into(),
+                    button(text("Linked files…").size(12)).padding([4, 8]).style(button::secondary).on_press(Message::LinkedFiles(od.info.id)).into(),
+                ]);
+            }
+            None => {
+                doc_info = doc_info.extend([
+                    text(format!("{kind} · {} sequences · {} columns", group_digits(doc.rows.len()), group_digits(doc.width))).size(12).style(style::muted).into(),
+                    text(format!("Reference: {ref_name}")).size(12).into(),
+                    row![
+                        button(text("Set selected row as reference").size(12))
+                            .padding([4, 8])
+                            .style(button::secondary)
+                            .on_press_maybe(one_selected.map(|_| Message::SetReferenceFromSelection)),
+                        button(text("Clear").size(12)).padding([4, 8]).style(button::text).on_press_maybe(od.reference.map(|_| Message::ClearReference)),
+                    ]
+                    .spacing(6)
+                    .into(),
+                ]);
+            }
+        }
+        let doc_info = doc_info.push(if od.selected_rows.is_empty() {
+            Element::from(text("Click names to select rows (Ctrl/Shift for several).").size(11).style(style::muted))
+        } else {
             row![
-                button(text("Set selected row as reference").size(12))
-                    .padding([4, 8])
-                    .style(button::secondary)
-                    .on_press_maybe(one_selected.map(|_| Message::SetReferenceFromSelection)),
-                button(text("Clear").size(12)).padding([4, 8]).style(button::text).on_press_maybe(od.reference.map(|_| Message::ClearReference)),
+                text(format!("{} row(s) selected", od.selected_rows.len())).size(12),
+                button(text("Clear").size(11)).padding([2, 6]).style(button::text).on_press(Message::ClearRowSelection)
             ]
-            .spacing(6),
-            if od.selected_rows.is_empty() {
-                Element::from(text("Click names to select rows (Ctrl/Shift for several).").size(11).style(style::muted))
-            } else {
-                row![
-                    text(format!("{} row(s) selected", od.selected_rows.len())).size(12),
-                    button(text("Clear").size(11)).padding([2, 6]).style(button::text).on_press(Message::ClearRowSelection)
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center)
-                .into()
-            },
-        ]
-        .spacing(6);
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .into()
+        });
 
         let display = column![
             section("Display"),
@@ -725,8 +778,10 @@ impl App {
                 .align_y(Alignment::Center),
             checkbox(od.display.collapse_identical).label("Collapse identical sequences").on_toggle(Message::Collapse).text_size(13),
             text(format!("{} rows shown", group_digits(shown))).size(11).style(style::muted),
-            if od.meta_keys.is_empty() {
+            if od.meta_keys.is_empty() && od.linked.is_none() {
                 Element::from(text("No metadata yet: import a table (File menu) or split names into fields (Tools menu).").size(11).style(style::muted))
+            } else if od.meta_keys.is_empty() {
+                Element::from(Space::new().height(0))
             } else {
                 text(format!("Metadata: {}", od.meta_keys.join(", "))).size(11).style(style::muted).into()
             },
@@ -735,7 +790,9 @@ impl App {
 
         let mut anns = column![section("Annotations")].spacing(4);
         anns = anns.push(
-            text(if od.annotations.is_empty() {
+            text(if od.linked.is_some() {
+                "Linked files are read-only: annotations cannot be added."
+            } else if od.annotations.is_empty() {
                 "Select columns, then right-click → Add annotation… (or the Edit menu)."
             } else {
                 "Click to select; drag the edges in the viewer to resize; double-click or right-click for properties."
@@ -813,7 +870,10 @@ impl App {
                     "Save these columns of all sequences (without the reference) as a new library document"
                 };
                 let mut actions = row![tooltip(
-                    button(text("Extract slice").size(12)).padding([4, 8]).style(button::secondary).on_press_maybe((!self.busy()).then_some(Message::ExtractSlice)),
+                    button(text("Extract slice").size(12))
+                        .padding([4, 8])
+                        .style(button::secondary)
+                        .on_press_maybe((!self.busy() && complete).then_some(Message::ExtractSlice)),
                     container(text(slice_tip).size(12)).padding(6).max_width(320).style(container::rounded_box),
                     tooltip::Position::Bottom,
                 )]
@@ -824,7 +884,7 @@ impl App {
                         button(text("Find primers…").size(12))
                             .padding([4, 8])
                             .style(button::secondary)
-                            .on_press_maybe(self.tool_run.is_none().then_some(Message::OpenPrimersearch)),
+                            .on_press_maybe((self.tool_run.is_none() && complete).then_some(Message::OpenPrimersearch)),
                         container(text("Run primersearch on these columns; the result is saved in the library").size(12))
                             .padding(6)
                             .max_width(320)
@@ -976,7 +1036,7 @@ impl App {
                 button(text("Extract slice").size(12))
                     .padding([4, 8])
                     .style(button::secondary)
-                    .on_press_maybe((!self.busy()).then_some(Message::ExtractSlice)),
+                    .on_press_maybe((!self.busy() && self.open_complete()).then_some(Message::ExtractSlice)),
                 Space::new().width(Fill),
                 button(text("Copy oligo").size(12)).padding([4, 8]).style(button::secondary).on_press(Message::CopyOligo),
                 button(text("Copy report").size(12)).padding([4, 8]).style(button::secondary).on_press(Message::CopyReport),

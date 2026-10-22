@@ -2,6 +2,7 @@
 
 use crate::model::{DocKind, Document, Row};
 use crate::seq;
+use bio::io::fasta::FastaRead;
 use std::io::{BufRead, BufReader, BufWriter};
 use std::path::Path;
 use std::sync::Arc;
@@ -14,42 +15,63 @@ pub struct Imported {
     pub document: Document,
 }
 
-/// Reads a FASTA file. Headers are split into id and description;
-/// `key=value` tokens (optionally in square brackets) in the description
-/// become row metadata. Gapped files, or files whose sequences all have the
-/// same length, are imported as alignments.
+/// Reads a FASTA file (also gzip-compressed). Headers are split into id and
+/// description; `key=value` tokens (optionally in square brackets) in the
+/// description become row metadata. Gapped files, or files whose sequences all
+/// have the same length, are imported as alignments.
 pub fn read_fasta(path: &Path, progress: &dyn Fn(f32)) -> Result<Imported, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
-    let total = file.metadata().map(|m| m.len()).unwrap_or(0).max(1);
+    let total = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0).max(1);
     let read = Arc::new(AtomicU64::new(0));
-    let reader = bio::io::fasta::Reader::new(CountingReader { inner: file, read: read.clone() });
+    let mut reader = crate::linked::open(path, read.clone(), None)?;
+    let first = reader.fill_buf().map_err(|e| format!("Cannot read {}: {e}", path.display()))?.iter().find(|b| !b.is_ascii_whitespace()).copied();
+    if first == Some(b'@') {
+        return Err(format!("{} is a FASTQ file. FASTQ files are linked, not imported: use File → Import FASTQ (linked)…", path.display()));
+    }
+    let mut last_report = 0u64;
+    let (rows, any_gap, _) = read_rows(reader, usize::MAX, u64::MAX, &mut || {
+        let done = read.load(Ordering::Relaxed);
+        if done > last_report {
+            last_report = done;
+            progress(done as f32 / total as f32);
+        }
+    })
+    .map_err(|e| format!("Invalid FASTA in {}: {e}", path.display()))?;
+    if rows.is_empty() {
+        return Err(format!("{} contains no FASTA records", path.display()));
+    }
+    let kind = alignment_kind(any_gap, &rows.iter().map(Row::end).collect::<Vec<_>>());
+    Ok(Imported { name: crate::linked::stem(path), kind, document: Document::new(rows) })
+}
+
+/// Reads FASTA records as rows (see [`read_fasta`]) until `max_rows` rows or
+/// at least `max_bases` bases are read; `tick` runs every 256 records.
+/// Returns the rows, whether any has a gap, and whether records are left.
+pub fn read_rows(reader: impl BufRead, max_rows: usize, max_bases: u64, tick: &mut dyn FnMut()) -> Result<(Vec<Row>, bool, bool), String> {
+    let mut reader = bio::io::fasta::Reader::from_bufread(reader);
+    let mut rec = bio::io::fasta::Record::new();
     let mut rows = Vec::new();
     let mut any_gap = false;
-    let mut records = reader.records();
-    let mut last_report = 0u64;
+    let mut bases = 0u64;
     loop {
-        let Some(rec) = records.next() else { break };
-        let rec = rec.map_err(|e| format!("Invalid FASTA in {}: {e}", path.display()))?;
+        if rows.len() >= max_rows || bases >= max_bases {
+            reader.read(&mut rec).map_err(|e| e.to_string())?;
+            return Ok((rows, any_gap, !rec.is_empty()));
+        }
+        reader.read(&mut rec).map_err(|e| e.to_string())?;
+        if rec.is_empty() {
+            return Ok((rows, any_gap, false));
+        }
         let data = seq::normalize(rec.seq());
         any_gap |= data.contains(&seq::GAP);
         let desc = rec.desc().unwrap_or("").to_string();
         let mut row = Row::from_gapped(rec.id().to_string(), desc.clone(), data);
         row.meta = parse_description_meta(&desc);
+        bases += row.ungapped_len() as u64;
         rows.push(row);
         if rows.len() % 256 == 0 {
-            let done = read.load(Ordering::Relaxed);
-            if done > last_report {
-                last_report = done;
-                progress(done as f32 / total as f32);
-            }
+            tick();
         }
     }
-    if rows.is_empty() {
-        return Err(format!("{} contains no FASTA records", path.display()));
-    }
-    let kind = alignment_kind(any_gap, &rows.iter().map(Row::end).collect::<Vec<_>>());
-    let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Imported".into());
-    Ok(Imported { name, kind, document: Document::new(rows) })
 }
 
 /// Aligned FASTA: gapped, or several sequences that all share one length.
@@ -132,19 +154,6 @@ pub fn document_from_pasted(records: &[PastedRecord], name: &str, description: &
         })
         .collect();
     (pasted_kind(records), Document::new(rows))
-}
-
-struct CountingReader<R> {
-    inner: R,
-    read: Arc<AtomicU64>,
-}
-
-impl<R: std::io::Read> std::io::Read for CountingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.read.fetch_add(n as u64, Ordering::Relaxed);
-        Ok(n)
-    }
 }
 
 /// Extracts `key=value` pairs from a FASTA description, e.g.
@@ -307,6 +316,30 @@ mod tests {
         let imp = read_fasta(&p, &|_| {}).unwrap();
         assert_eq!(imp.kind, DocKind::Sequences);
         let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn gzip_limits_and_fastq() {
+        let p = tmp("seqs.fasta.gz");
+        let mut e = flate2::write::GzEncoder::new(std::fs::File::create(&p).unwrap(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut e, b">a\nACGT\n>b\nACGTTT\n>c\nA\n").unwrap();
+        e.finish().unwrap();
+        let imp = read_fasta(&p, &|_| {}).unwrap();
+        assert!(imp.name.ends_with("_seqs"));
+        assert_eq!(imp.document.rows[1].data, b"ACGTTT");
+        let rows = |max_rows, max_bases| read_rows(crate::linked::open_plain(&p).unwrap(), max_rows, max_bases, &mut || {}).unwrap();
+        let (r, _, more) = rows(2, u64::MAX);
+        assert_eq!((r.len(), more), (2, true));
+        // Stops once the bases reach the limit (4 + 6 ≥ 5).
+        let (r, _, more) = rows(10, 5);
+        assert_eq!((r.len(), more), (2, true));
+        let (r, any_gap, more) = rows(3, u64::MAX);
+        assert_eq!((r.len(), any_gap, more), (3, false, false));
+        let q = tmp("reads.fastq");
+        std::fs::write(&q, "@r\nACGT\n+\nIIII\n").unwrap();
+        assert!(read_fasta(&q, &|_| {}).err().unwrap().contains("is a FASTQ file"));
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(q);
     }
 
     #[test]
