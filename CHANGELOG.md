@@ -7,6 +7,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.1.0] - 2026-10-23
+
+### Changed
+
+- Version `0.1.0` (minor bump on request): first minor release, no functional changes since `0.0.17`.
+
 ## [0.0.17] - 2026-10-23
 
 ### Added
