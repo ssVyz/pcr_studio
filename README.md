@@ -48,7 +48,7 @@ The menu bar holds all application commands:
 | Menu | Entries |
 |---|---|
 | File | New sequence… (Ctrl+N), Import FASTA… (Ctrl+O), Import FASTQ (linked)…, Import metadata table…, Generate demo data, Export FASTA… (Ctrl+E), Extract selection to library, New folder, Close document (Ctrl+W), Exit |
-| Edit | Edit sequence… (single-sequence documents), Add annotation from selection…, Annotation properties…, Delete annotation… (Del), Copy oligo (Ctrl+C), Copy oligo report, Clear selection (Esc), Set selected row as reference, Clear reference, Sort by name / length / bases in selection, Settings… (Ctrl+,) |
+| Edit | Edit sequence… (single-sequence documents), Add annotation from selection…, Serial annotation…, Annotation properties…, Delete annotation… (Del), Copy oligo (Ctrl+C), Copy oligo report, Clear selection (Esc), Set selected row as reference, Clear reference, Sort by name / length / bases in selection, Settings… (Ctrl+,) |
 | View | Display options panel (show/hide, Ctrl+Shift+D; showing restores the default width), Reset panel sizes |
 | Tools | Map to reference… (Ctrl+M), Metadata from sequence names…, Find primers in selection (primersearch)…, Oligo report for selection, Find sequence… (Ctrl+F), Go to position… (Ctrl+G) |
 
@@ -101,6 +101,15 @@ Entries that do not apply (e.g. without an open document or selection) are disab
    it. Double-click it, right-click it or use ✎ in the side panel for the properties
    dialog: name, type and range (reference positions, or columns without a reference).
    Delete via right-click, the Delete key, the Edit menu or ✕; deleting asks for confirmation.
+   **Serial annotation…** (Edit menu or right-click the viewer) annotates many oligos at once:
+   paste FASTA records (header = annotation name, records without one become “Oligo N”). Each
+   oligo is placed where it has the fewest mismatches on either strand of the reference, or of
+   the consensus without one (a single sequence is its own consensus); plus-strand matches
+   become forward primers, minus-strand matches reverse primers. Mismatches only, no indels;
+   IUPAC codes in the oligo match the bases they include, an N in the template is a mismatch.
+   A live preview lists position, strand and mismatches per oligo; oligos above **Max.
+   mismatches** (default 3) are not found, names that already exist are skipped, and oligos that
+   fit several positions equally well are flagged (the leftmost is used).
 6. **Extract slice** (selection panel or oligo report): saves the selected columns of all
    sequences, without the reference and with the original names, as a new library document
    next to the source. Sequences without bases in the range and empty columns are dropped.
@@ -180,7 +189,7 @@ linked file.
 | Select rows | Click names; Ctrl/Shift for several. Used for "Set selected row as reference", export and mapping subsets |
 | Groups | Group by any metadata field; click a group header to fold it |
 | Annotations | Click to select, drag an edge to resize, double-click for properties, Delete key to delete (with confirmation) |
-| Right-click | Viewer menu: annotation properties/delete (on an annotation), add annotation, oligo report, copy, extract, find primers (when primersearch is set up), clear selection |
+| Right-click | Viewer menu: annotation properties/delete (on an annotation), add annotation, serial annotation, oligo report, copy, extract, find primers (when primersearch is set up), clear selection |
 | Escape | Close dialog/report, then clear the selection |
 
 Display options (right panel): consensus row and its threshold (majority or 50–100 %), graph
@@ -209,7 +218,7 @@ a delimiter.
 | `mapper/` | `index.rs` k-mer index, `align.rs` seed chaining (rust-bio `sdpkpp`) + DP gap filling (rust-bio pairwise), `contig.rs` insertion-aware merge and consensus target, `mod.rs` orchestration and fine tuning |
 | `primer.rs` | Oligo/selection evaluation |
 | `display.rs` | View sort, grouping, collapsing, filtering; sorting documents (name, length, bases) |
-| `search.rs` | Motif search |
+| `search.rs` | Motif search; best placement of an oligo (serial annotation) |
 | `db.rs` | SQLite library (documents, rows and their order, annotations, folders, text documents, linked sets, settings) |
 | `tools/` | External tools: `mod.rs` tool list, locations (bundled / PATH / custom) and version check, `run.rs` child processes (no console window, JSON-lines progress on stderr, cancel), `primersearch.rs` arguments, progress, input slice and report header |
 | `demo.rs` | Synthetic data |

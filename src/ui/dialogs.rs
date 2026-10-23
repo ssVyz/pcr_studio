@@ -10,14 +10,15 @@ use crate::linked::group::{self, Grouping, Proposal};
 use crate::linked::{self, FileState, Layout, LinkedSet, Technology};
 use crate::mapper::{MapParams, Sensitivity};
 use crate::model::{AnnotationKind, DocInfo, DocKind, RefCoords, Row};
-use crate::primer::Orientation;
+use crate::primer::{OligoSource, Orientation};
+use crate::search::{self, Placement};
 use crate::seq::{self, GAP};
 use crate::thermo::TmConditions;
 use crate::tools::primersearch::{self as ps, Criterion, InputStats, Mode};
 use crate::tools::{self, ToolConfig, ToolSource, ToolSpec, ToolStatus};
 use iced::widget::{Space, button, checkbox, column, container, pick_list, radio, row, rule, scrollable, text, text_editor, text_input};
 use iced::{Element, Fill, Font, Length, Task};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Id of the rename text field, focused when the dialog opens.
@@ -48,6 +49,7 @@ pub enum Modal {
     Sequence(SequenceDialog),
     Annotation(AnnotationDialog),
     ConfirmDeleteAnnotation { id: i64, name: String, detail: String },
+    SerialAnnotation(SerialAnnotationDialog),
     Map(MapDialog),
     Export(ExportDialog),
     Settings(SettingsDialog),
@@ -486,6 +488,289 @@ impl AnnotationDialog {
             button(if self.id.is_some() { "Save" } else { "Add" }).on_press_maybe(ok.then_some(Message::SaveAnnotation)).style(button::primary),
         );
         dialog_frame(if self.id.is_some() { "Annotation properties" } else { "New annotation" }, body.into(), buttons.into(), 520.0)
+    }
+}
+
+// ---------------------------------------------------------------- serial annotation
+
+/// Id of the text box of the serial annotation dialog.
+pub const SERIAL_INPUT: &str = "serial-input";
+
+/// Focuses the serial annotation text box (ready for pasting).
+pub fn focus_serial<T: Send + 'static>() -> Task<T> {
+    iced::widget::operation::focus(SERIAL_INPUT)
+}
+
+/// Places pasted oligos (FASTA) on the reference, or the consensus without
+/// one, and adds a primer annotation for each: forward on the plus strand,
+/// reverse on the minus strand.
+pub struct SerialAnnotationDialog {
+    pub content: text_editor::Content,
+    pub max_mismatches: String,
+    /// What the oligos are placed on ("the reference “x”").
+    template_label: String,
+    template: search::Template,
+    coords: Option<RefCoords>,
+    /// Names of the document's annotations; records with these names are skipped.
+    existing: HashSet<String>,
+    /// Mismatch limit of the preview (the last valid field value).
+    max: usize,
+    /// Placements of the oligos in the text for `max`, so an edit only
+    /// searches the records it changed.
+    cache: HashMap<Vec<u8>, Option<Placement>>,
+    /// The parsed records, refreshed on edits.
+    pub rows: Vec<SerialRow>,
+    /// Characters that are not nucleotide codes (read as N).
+    unknown: usize,
+}
+
+pub struct SerialRow {
+    pub name: String,
+    pub outcome: SerialOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerialOutcome {
+    Placed(Placement),
+    /// No position within the mismatch limit.
+    NotFound,
+    /// The document already has an annotation with this name.
+    NameExists,
+    /// An earlier record has the same name.
+    Duplicate,
+    Empty,
+}
+
+#[derive(Debug, Clone)]
+pub enum SerialMsg {
+    Edit(text_editor::Action),
+    MaxMismatches(String),
+}
+
+const SERIAL_MAX_MISMATCHES: usize = 3;
+
+impl SerialAnnotationDialog {
+    pub fn new(od: &OpenDoc) -> SerialAnnotationDialog {
+        let others = od.doc.rows.len() - od.reference.is_some() as usize;
+        let template_label = match od.reference {
+            Some(r) => format!("the reference “{}”", od.doc.rows[r].name),
+            None if others == 1 => format!("the sequence “{}”", od.doc.rows[0].name),
+            None => format!("the consensus of {} sequences", group_digits(others)),
+        };
+        SerialAnnotationDialog {
+            content: text_editor::Content::new(),
+            max_mismatches: SERIAL_MAX_MISMATCHES.to_string(),
+            template_label,
+            template: search::Template::new(&od.template_row(OligoSource::Reference)),
+            coords: od.ref_coords.clone(),
+            existing: od.annotations.iter().map(|a| a.name.clone()).collect(),
+            max: SERIAL_MAX_MISMATCHES,
+            cache: HashMap::new(),
+            rows: Vec::new(),
+            unknown: 0,
+        }
+    }
+
+    pub fn update(&mut self, m: SerialMsg) {
+        match m {
+            SerialMsg::Edit(action) => {
+                let edit = action.is_edit();
+                self.content.perform(action);
+                if edit {
+                    self.refresh();
+                }
+            }
+            SerialMsg::MaxMismatches(s) => {
+                self.max_mismatches = s;
+                if let Ok(max) = self.parse_max()
+                    && max != self.max
+                {
+                    self.max = max;
+                    self.cache.clear();
+                    self.refresh();
+                }
+            }
+        }
+    }
+
+    fn parse_max(&self) -> Result<usize, String> {
+        self.max_mismatches.trim().parse().map_err(|_| "Max. mismatches must be a whole number.".to_string())
+    }
+
+    /// Re-parses the text and places every record. The FASTA header is the
+    /// name; records without one become “Oligo N”.
+    fn refresh(&mut self) {
+        let records = fasta::parse_pasted(&self.content.text());
+        self.unknown = records.iter().map(|r| r.unknown).sum();
+        let mut old = std::mem::take(&mut self.cache);
+        let mut taken: HashSet<String> = HashSet::new();
+        let mut next = self.existing.len() + 1;
+        self.rows = records
+            .into_iter()
+            .map(|r| {
+                let name = match r.id {
+                    Some(id) if r.description.is_empty() => id,
+                    Some(id) => format!("{id} {}", r.description),
+                    None => loop {
+                        let n = format!("Oligo {next}");
+                        next += 1;
+                        if !self.existing.contains(&n) && !taken.contains(&n) {
+                            break n;
+                        }
+                    },
+                };
+                let oligo = seq::ungap(&r.seq);
+                let outcome = if oligo.is_empty() {
+                    SerialOutcome::Empty
+                } else if self.existing.contains(&name) {
+                    SerialOutcome::NameExists
+                } else if !taken.insert(name.clone()) {
+                    SerialOutcome::Duplicate
+                } else {
+                    let placement = match self.cache.get(&oligo) {
+                        Some(p) => *p,
+                        None => {
+                            let p = old.remove(&oligo).unwrap_or_else(|| search::best_placement(&self.template, &oligo, self.max));
+                            self.cache.insert(oligo, p);
+                            p
+                        }
+                    };
+                    placement.map_or(SerialOutcome::NotFound, SerialOutcome::Placed)
+                };
+                SerialRow { name, outcome }
+            })
+            .collect();
+    }
+
+    /// Records that get an annotation: name and placement.
+    pub fn placements(&self) -> Vec<(String, Placement)> {
+        self.rows
+            .iter()
+            .filter_map(|r| match r.outcome {
+                SerialOutcome::Placed(p) => Some((r.name.clone(), p)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Records not found within the mismatch limit, and records skipped
+    /// (name taken, no sequence).
+    pub fn not_placed(&self) -> (usize, usize) {
+        let not_found = self.rows.iter().filter(|r| r.outcome == SerialOutcome::NotFound).count();
+        let skipped = self.rows.iter().filter(|r| !matches!(r.outcome, SerialOutcome::Placed(_) | SerialOutcome::NotFound)).count();
+        (not_found, skipped)
+    }
+
+    /// Why the dialog cannot be confirmed yet.
+    pub fn problem(&self) -> Option<String> {
+        if self.rows.is_empty() {
+            return Some("Paste one or more FASTA records.".into());
+        }
+        if let Err(e) = self.parse_max() {
+            return Some(e);
+        }
+        if !self.rows.iter().any(|r| matches!(r.outcome, SerialOutcome::Placed(_))) {
+            return Some("No oligo can be placed.".into());
+        }
+        None
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let s = Message::SerialAnnotation;
+        let intro = format!(
+            "Each oligo is placed on {} where it has the fewest mismatches, on either strand. \
+             Plus-strand matches become forward primers, minus-strand matches reverse primers.",
+            self.template_label
+        );
+        let mut body = column![
+            text(intro).size(13),
+            text_editor(&self.content)
+                .id(SERIAL_INPUT)
+                .placeholder("Paste FASTA records, one oligo each: >name, then the sequence")
+                .on_action(move |a| s(SerialMsg::Edit(a)))
+                .font(Font::MONOSPACE)
+                .size(13)
+                .padding(8)
+                .height(Length::Fixed(200.0))
+                .wrapping(text::Wrapping::WordOrGlyph),
+            row![
+                text("Max. mismatches").size(13),
+                text_input("", &self.max_mismatches).on_input(move |v| s(SerialMsg::MaxMismatches(v))).padding(5).width(60),
+                text("IUPAC codes in the oligos match the bases they include; N in the template counts as a mismatch.")
+                    .size(12)
+                    .style(style::muted)
+                    .width(Fill),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        ]
+        .spacing(10);
+
+        let head = |t: &'static str, w: Length| text(t).size(12).style(style::muted).width(w);
+        let (w_kind, w_pos, w_mm, w_note) = (Length::Fixed(64.0), Length::Fixed(150.0), Length::Fixed(64.0), Length::Fixed(190.0));
+        let mut list = column![
+            row![head("Name", Fill), head("Primer", w_kind), head("Position", w_pos), head("Mismatches", w_mm), head("", w_note)].spacing(8)
+        ]
+        .spacing(3);
+        for r in &self.rows {
+            let none = || "–".to_string();
+            let (kind, pos, mm, note, warn) = match r.outcome {
+                SerialOutcome::Placed(p) => (
+                    if p.reverse { "Reverse" } else { "Forward" },
+                    super::range_label(self.coords.as_ref(), p.c0, p.c1),
+                    p.mismatches.to_string(),
+                    match p.others {
+                        0 => String::new(),
+                        1 => "also fits 1 other position".into(),
+                        n => format!("also fits {} other positions", group_digits(n)),
+                    },
+                    true,
+                ),
+                SerialOutcome::NotFound => ("–", none(), none(), format!("not found (> {} mismatches)", self.max), true),
+                SerialOutcome::NameExists => ("–", none(), none(), "name exists, skipped".into(), false),
+                SerialOutcome::Duplicate => ("–", none(), none(), "duplicate name, skipped".into(), false),
+                SerialOutcome::Empty => ("–", none(), none(), "no sequence, skipped".into(), false),
+            };
+            list = list.push(
+                row![
+                    text(r.name.as_str()).size(12).width(Fill).wrapping(text::Wrapping::WordOrGlyph),
+                    text(kind).size(12).width(w_kind),
+                    text(pos).size(12).width(w_pos),
+                    text(mm).size(12).width(w_mm),
+                    text(note).size(12).width(w_note).style(if warn { style::danger_text } else { style::muted }),
+                ]
+                .spacing(8),
+            );
+        }
+        let list_h = if self.rows.len() > 8 { Length::Fixed(220.0) } else { Length::Shrink };
+        body = body.push(scrollable(list.padding(iced::Padding { right: 12.0, ..Default::default() })).height(list_h));
+
+        let (not_found, skipped) = self.not_placed();
+        let placed = self.rows.len() - not_found - skipped;
+        let mut summary = format!("{} oligo(s) · {placed} to annotate", self.rows.len());
+        if not_found > 0 {
+            summary.push_str(&format!(" · {not_found} not found"));
+        }
+        if skipped > 0 {
+            summary.push_str(&format!(" · {skipped} skipped"));
+        }
+        body = body.push(text(summary).size(13).font(Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT }));
+        if self.unknown > 0 {
+            body = body.push(
+                text(format!("{} character(s) that are not nucleotide codes are read as N.", group_digits(self.unknown))).size(12).style(style::danger_text),
+            );
+        }
+
+        let problem = self.problem();
+        let confirm = if placed == 1 { "Create 1 annotation".to_string() } else { format!("Create {placed} annotations") };
+        let buttons = row![
+            text(problem.clone().unwrap_or_default()).size(12).style(style::muted).width(Fill),
+            button("Cancel").on_press(Message::CloseModal).style(button::secondary),
+            button(text(confirm)).on_press_maybe(problem.is_none().then_some(Message::CreateSerialAnnotations)).style(button::primary),
+        ]
+        .spacing(10)
+        .align_y(iced::Center);
+        dialog_frame("Serial annotation", body.into(), buttons.into(), 780.0)
     }
 }
 
@@ -1968,6 +2253,7 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
     match modal {
         Modal::Sequence(d) => d.view(),
         Modal::Annotation(d) => d.view(),
+        Modal::SerialAnnotation(d) => d.view(),
         Modal::ConfirmDeleteAnnotation { id, name, detail } => {
             let body = column![
                 text(format!("Delete the annotation “{name}”?")).size(14),

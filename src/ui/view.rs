@@ -102,6 +102,7 @@ impl App {
                 }
                 entries.extend([
                     Entry::item("Add annotation…", "", (selection && writable).then_some(Message::NewAnnotation)),
+                    Entry::item("Serial annotation…", "", writable.then_some(Message::OpenSerialAnnotation)),
                     Entry::item("Oligo report", "", report.then_some(Message::ShowPopup)),
                     Entry::item("Copy oligo", "Ctrl+C", report.then_some(Message::CopyOligo)),
                     Entry::item("Extract selection to library", "", (idle && selection && complete).then_some(Message::ExtractSlice)),
@@ -274,6 +275,7 @@ impl App {
                 Entry::item("Edit sequence…", "", self.editable_sequence().filter(|_| idle).map(Message::EditSequence)),
                 Entry::Separator,
                 Entry::item("Add annotation from selection…", "", when(selection && writable, Message::NewAnnotation)),
+                Entry::item("Serial annotation…", "", when(writable, Message::OpenSerialAnnotation)),
                 Entry::item("Annotation properties…", "", annotation.map(Message::AnnotationProperties)),
                 Entry::item("Delete annotation…", "Del", annotation.map(Message::AskDeleteAnnotation)),
                 Entry::Separator,

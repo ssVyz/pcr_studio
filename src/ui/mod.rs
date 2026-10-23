@@ -23,7 +23,7 @@ use crate::tools::{self, ToolConfig, ToolSpec, ToolStatus};
 use canvas::ViewMsg;
 use dialogs::{
     AnnotationDialog, EditTarget, ExportDialog, ExportRows, ImportFastaDialog, LinkFastqDialog, LinkedDialog, LinkedMsg, MapDialog, Modal,
-    PrimersearchDialog, RefChoice, SequenceDialog, SettingsDialog, TextView, TextViewMsg,
+    PrimersearchDialog, RefChoice, SequenceDialog, SerialAnnotationDialog, SettingsDialog, TextView, TextViewMsg,
 };
 use iced::keyboard::{self, Key, key::Named};
 use iced::{Subscription, Task, Theme};
@@ -366,6 +366,10 @@ pub enum Message {
     AskDeleteAnnotation(i64),
     /// Deletion confirmed.
     DeleteAnnotation(i64),
+    /// Annotations from pasted oligos placed on the reference or consensus.
+    OpenSerialAnnotation,
+    SerialAnnotation(dialogs::SerialMsg),
+    CreateSerialAnnotations,
     // Metadata
     ImportMetadata,
     MetadataPicked(Option<PathBuf>),
@@ -1840,6 +1844,20 @@ impl App {
                     self.status = format!("Deleted annotation “{}”", a.name);
                 }
             }
+            Message::OpenSerialAnnotation => {
+                if self.refuse_read_only("annotations") {
+                    return Task::none();
+                }
+                let Some(od) = self.open.as_ref() else { return Task::none() };
+                self.modal = Some(Modal::SerialAnnotation(SerialAnnotationDialog::new(od)));
+                return dialogs::focus_serial();
+            }
+            Message::SerialAnnotation(m) => {
+                if let Some(Modal::SerialAnnotation(d)) = self.modal.as_mut() {
+                    d.update(m);
+                }
+            }
+            Message::CreateSerialAnnotations => self.create_serial_annotations(),
             Message::ImportMetadata => {
                 if self.open.is_none() || self.refuse_read_only("metadata") {
                     return Task::none();
@@ -2450,6 +2468,46 @@ impl App {
         self.status = format!("Annotation “{}” {} ({range})", a.name, if id.is_some() { "saved" } else { "added" });
         self.modal = None;
         self.select_annotation(a.id, false, popup);
+    }
+
+    /// Adds the annotations placed by the serial annotation dialog.
+    fn create_serial_annotations(&mut self) {
+        if self.refuse_read_only("annotations") {
+            return;
+        }
+        let Some(Modal::SerialAnnotation(d)) = self.modal.as_ref() else { return };
+        if d.problem().is_some() {
+            return;
+        }
+        let (placements, (not_found, skipped)) = (d.placements(), d.not_placed());
+        let source = self.settings.primer.source;
+        let Some(od) = self.open.as_mut() else { return };
+        let mut added = 0usize;
+        for (name, p) in placements {
+            let kind = if p.reverse { AnnotationKind::ReversePrimer } else { AnnotationKind::ForwardPrimer };
+            let note = od.oligo(source, kind, p.c0, p.c1);
+            let mut a = Annotation { id: 0, name, kind, start: p.c0, end: p.c1, note };
+            match self.db.add_annotation(od.info.id, &a) {
+                Ok(id) => {
+                    a.id = id;
+                    od.annotations.push(a);
+                    added += 1;
+                }
+                Err(e) => {
+                    self.error = Some(e);
+                    break;
+                }
+            }
+        }
+        od.annotations.sort_by_key(|a| (a.start, a.end));
+        self.modal = None;
+        self.status = format!("Added {added} annotation(s) from sequences");
+        if not_found > 0 {
+            self.status.push_str(&format!("; {not_found} not found"));
+        }
+        if skipped > 0 {
+            self.status.push_str(&format!("; {skipped} skipped"));
+        }
     }
 
     fn apply_metadata(&mut self, f: impl FnOnce(&mut [Row]) -> String) {
@@ -3078,7 +3136,12 @@ fn sort_phrase(od: &OpenDoc, key: &RowSort, descending: bool) -> String {
 }
 
 fn annotation_range_label(od: &OpenDoc, c0: usize, c1: usize) -> String {
-    match od.ref_range(c0, c1) {
+    range_label(od.ref_coords.as_ref(), c0, c1)
+}
+
+/// Columns `[c0, c1)` as reference positions ("ref 101–120") or columns.
+fn range_label(coords: Option<&crate::model::RefCoords>, c0: usize, c1: usize) -> String {
+    match coords.and_then(|rc| rc.range(c0, c1)) {
         Some((a, b)) => format!("ref {}–{}", canvas::group_digits(a as usize), canvas::group_digits(b as usize)),
         None => format!("columns {}–{}", canvas::group_digits(c0 + 1), canvas::group_digits(c1)),
     }

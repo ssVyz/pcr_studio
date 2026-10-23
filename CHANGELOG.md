@@ -7,6 +7,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.0.17] - 2026-10-23
+
+### Added
+
+- **Serial annotation…** (Edit menu, and right-click in the viewer): annotates many oligos at once.
+  Paste FASTA records; the header becomes the annotation name (records without one become
+  “Oligo N”). Each oligo is placed where it has the fewest mismatches on either strand of the
+  reference, or of the consensus without a reference (a single sequence is its own consensus).
+  Plus-strand matches become forward primers, minus-strand matches reverse primers.
+  - Ungapped matching (mismatches only, no indels); matches may span alignment gaps. IUPAC codes
+    in the oligo match the bases they include; an N in the template counts as a mismatch, so N
+    runs do not attract oligos.
+  - **Max. mismatches** (default 3): oligos whose best position has more are listed as not found.
+  - Live preview while pasting: position (reference positions, or columns), strand and mismatches
+    per oligo. Oligos that fit several positions equally well are flagged; the leftmost (plus
+    strand first) is used.
+  - Records named like an existing annotation, or like an earlier record, are skipped.
+  - Not available for linked (read-only) documents.
+
 ## [0.0.16] - 2026-10-22
 
 ### Added
