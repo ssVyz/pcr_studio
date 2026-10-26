@@ -9,7 +9,7 @@ use crate::model::{DocKind, Document, Row};
 use crate::seq;
 use bio::io::fasta::FastaRead;
 use rayon::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -301,17 +301,24 @@ pub struct Preview {
     pub kind: DocKind,
     /// All records of the set are in `doc`.
     pub complete: bool,
+    /// Phred qualities of the bases of each row (FASTQ; empty for FASTA).
+    pub qual: Vec<Vec<u8>>,
 }
 
+/// The first records: FASTQ reads (pairs alternating R1, R2), or a FASTA file
+/// completely up to a size limit.
 pub fn preview(set: &LinkedSet) -> Result<Preview, String> {
-    let rows = match set.format {
-        Format::Fastq => preview_fastq(set)?,
+    let (rows, qual) = match set.format {
+        Format::Fastq => {
+            let first: Vec<u64> = (0..sample_size(set).min(units(set)?)).collect();
+            fastq_rows(set, &first, &AtomicBool::new(false), &|_| {})?
+        }
         Format::Fasta => {
             let path = &set.files.first().ok_or("No file is linked")?.path;
             let reader = super::open_plain(path)?;
             let (rows, _, _) =
                 fasta::read_rows(reader, PREVIEW_SEQUENCES, PREVIEW_BASES, &mut || {}).map_err(|e| format!("Invalid FASTA in {}: {e}", path.display()))?;
-            rows
+            (rows, Vec::new())
         }
     };
     let complete = rows.len() as u64 == set.summary.records;
@@ -319,51 +326,172 @@ pub fn preview(set: &LinkedSet) -> Result<Preview, String> {
         Format::Fastq => DocKind::Sequences,
         Format::Fasta => fasta::alignment_kind(rows.iter().any(|r| r.data.contains(&seq::GAP)), &rows.iter().map(Row::end).collect::<Vec<_>>()),
     };
-    Ok(Preview { doc: Document::new(rows), kind, complete })
+    Ok(Preview { doc: Document::new(rows), kind, complete, qual })
 }
 
-fn read_row(rec: &fastq::Record) -> Row {
-    Row::from_gapped(
-        String::from_utf8_lossy(rec.id()).to_string(),
-        String::from_utf8_lossy(rec.desc()).to_string(),
-        seq::normalize(&rec.seq),
-    )
+/// A random sample of the reads of a FASTQ set, as many as [`preview`] shows,
+/// drawn evenly from all files and shown in file order. Reads the files (in
+/// parallel) up to the last drawn read; `progress` gets the share of their
+/// bytes read so far.
+pub fn sample(set: &LinkedSet, seed: u64, cancel: &AtomicBool, progress: &(dyn Fn(f32) + Sync)) -> Result<Preview, String> {
+    if set.format != Format::Fastq {
+        return Err("Only FASTQ reads can be sampled".into());
+    }
+    let picks = draw(units(set)?, sample_size(set), seed);
+    let (rows, qual) = fastq_rows(set, &picks, cancel, progress)?;
+    let complete = rows.len() as u64 == set.summary.records;
+    Ok(Preview { doc: Document::new(rows), kind: DocKind::Sequences, complete, qual })
 }
 
-/// First reads: of the first R1/R2 pair alternating (metadata "Mate"), else
-/// from the files in order (metadata "File" with several files).
-fn preview_fastq(set: &LinkedSet) -> Result<Vec<Row>, String> {
-    let mut rows = Vec::new();
-    let invalid = |p: &Path, e: String| format!("{} is not a valid FASTQ file ({e})", p.display());
-    if set.layout == Layout::Paired {
-        let [f1, f2, ..] = set.files.as_slice() else { return Err("A paired read set needs R1 and R2".into()) };
-        let mut r1 = fastq::Reader::new(super::open_plain(&f1.path)?);
-        let mut r2 = fastq::Reader::new(super::open_plain(&f2.path)?);
-        let (mut a, mut b) = (fastq::Record::default(), fastq::Record::default());
-        while rows.len() < PREVIEW_READS && r1.next(&mut a).map_err(|e| invalid(&f1.path, e))? && r2.next(&mut b).map_err(|e| invalid(&f2.path, e))? {
-            for (rec, mate) in [(&a, "R1"), (&b, "R2")] {
-                let mut row = read_row(rec);
-                row.set_meta("Mate", mate.into());
+/// Reads (pairs for paired sets) the viewer shows at once.
+fn sample_size(set: &LinkedSet) -> u64 {
+    match set.layout {
+        Layout::Paired => PREVIEW_READS as u64 / 2,
+        Layout::Single => PREVIEW_READS as u64,
+    }
+}
+
+/// Where the reads of a FASTQ set come from: single files, or the R1 and R2
+/// files of each lane.
+fn sources(set: &LinkedSet) -> Result<Vec<&[LinkedFile]>, String> {
+    match set.layout {
+        Layout::Paired if set.files.len() < 2 || !set.files.len().is_multiple_of(2) => Err("A paired read set needs R1 and R2 files".into()),
+        Layout::Paired => Ok(set.files.chunks(2).collect()),
+        Layout::Single => Ok(set.files.chunks(1).collect()),
+    }
+}
+
+/// Number of reads (pairs) of a FASTQ set.
+fn units(set: &LinkedSet) -> Result<u64, String> {
+    Ok(sources(set)?.iter().map(|files| files[0].records).sum())
+}
+
+/// SplitMix64: small and good enough to draw a sample.
+struct SplitMix(u64);
+
+impl SplitMix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A number below `n`.
+    fn below(&mut self, n: u64) -> u64 {
+        ((self.next() as u128 * n as u128) >> 64) as u64
+    }
+}
+
+/// `k` different numbers below `n` (all of them if `n <= k`), each equally
+/// likely (Floyd's algorithm), ascending.
+fn draw(n: u64, k: u64, seed: u64) -> Vec<u64> {
+    if n <= k {
+        return (0..n).collect();
+    }
+    let mut rng = SplitMix(seed);
+    let mut picked = HashSet::with_capacity(k as usize);
+    for j in n - k..n {
+        let t = rng.below(j + 1);
+        if !picked.insert(t) {
+            picked.insert(j);
+        }
+    }
+    let mut picks: Vec<u64> = picked.into_iter().collect();
+    picks.sort_unstable();
+    picks
+}
+
+/// A read as a viewer row, with the Phred qualities (Phred+33) of its bases.
+fn read_row(rec: &fastq::Record) -> (Row, Vec<u8>) {
+    let mut data = Vec::with_capacity(rec.seq.len());
+    let mut qual = Vec::with_capacity(rec.seq.len());
+    for (&b, &q) in rec.seq.iter().zip(&rec.qual) {
+        if let Some(b) = seq::normalize_byte(b) {
+            data.push(b);
+            qual.push(q.saturating_sub(33));
+        }
+    }
+    let row = Row::from_gapped(String::from_utf8_lossy(rec.id()).to_string(), String::from_utf8_lossy(rec.desc()).to_string(), data);
+    // Leading and trailing gaps are not part of the row.
+    let qual = qual[row.start..row.start + row.data.len()].to_vec();
+    (row, qual)
+}
+
+/// The reads with the given numbers (ascending; counted over all files, pairs
+/// for paired sets) as rows with their qualities, pairs alternating R1, R2
+/// (metadata "Mate"); metadata "File" with several files or lanes. The files
+/// (lanes) are read in parallel, each up to its last wanted read; `progress`
+/// gets the share of their bytes read so far.
+fn fastq_rows(set: &LinkedSet, picks: &[u64], cancel: &AtomicBool, progress: &(dyn Fn(f32) + Sync)) -> Result<(Vec<Row>, Vec<Vec<u8>>), String> {
+    let sources = sources(set)?;
+    let several = sources.len() > 1;
+    // The wanted reads of each source, counted within it.
+    let mut jobs: Vec<(&[LinkedFile], Vec<u64>)> = Vec::new();
+    let (mut offset, mut rest) = (0, picks);
+    for files in sources {
+        let n = files[0].records;
+        let (mine, after) = rest.split_at(rest.partition_point(|&p| p < offset + n));
+        if !mine.is_empty() {
+            jobs.push((files, mine.iter().map(|p| p - offset).collect()));
+        }
+        (offset, rest) = (offset + n, after);
+    }
+    let total = jobs.iter().flat_map(|(files, _)| files.iter()).map(|f| f.size).sum::<u64>().max(1);
+    let read = Arc::new(AtomicU64::new(0));
+    let report = || progress(read.load(Ordering::Relaxed) as f32 / total as f32);
+    let parts = jobs.par_iter().map(|(files, wanted)| read_source(files, wanted, several, &read, cancel, &report)).collect::<Result<Vec<_>, String>>()?;
+    let (mut rows, mut qual) = (Vec::new(), Vec::new());
+    for (r, q) in parts {
+        rows.extend(r);
+        qual.extend(q);
+    }
+    Ok((rows, qual))
+}
+
+/// The wanted reads (ascending numbers) of one file or R1/R2 pair of files.
+fn read_source(
+    files: &[LinkedFile],
+    wanted: &[u64],
+    several: bool,
+    read: &Arc<AtomicU64>,
+    cancel: &AtomicBool,
+    report: &(dyn Fn() + Sync),
+) -> Result<(Vec<Row>, Vec<Vec<u8>>), String> {
+    let mut readers = files.iter().map(|f| super::open(&f.path, read.clone(), None).map(fastq::Reader::new)).collect::<Result<Vec<_>, String>>()?;
+    let mut recs = vec![fastq::Record::default(); files.len()];
+    let (mut rows, mut qual) = (Vec::new(), Vec::new());
+    let (mut i, mut w) = (0u64, 0usize);
+    'reads: while w < wanted.len() {
+        for ((r, rec), f) in readers.iter_mut().zip(recs.iter_mut()).zip(files) {
+            if !r.next(rec).map_err(|e| format!("{} is not a valid FASTQ file ({e})", f.path.display()))? {
+                break 'reads;
+            }
+        }
+        if i == wanted[w] {
+            w += 1;
+            for (mate, (rec, f)) in recs.iter().zip(files).enumerate() {
+                let (mut row, q) = read_row(rec);
+                if files.len() == 2 {
+                    row.set_meta("Mate", ["R1", "R2"][mate].into());
+                }
+                if several {
+                    row.set_meta("File", f.file_name());
+                }
                 rows.push(row);
+                qual.push(q);
             }
         }
-        return Ok(rows);
-    }
-    let mut rec = fastq::Record::default();
-    for f in &set.files {
-        let mut r = fastq::Reader::new(super::open_plain(&f.path)?);
-        while rows.len() < PREVIEW_READS && r.next(&mut rec).map_err(|e| invalid(&f.path, e))? {
-            let mut row = read_row(&rec);
-            if set.files.len() > 1 {
-                row.set_meta("File", f.file_name());
+        i += 1;
+        if i.is_multiple_of(REPORT_EVERY) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Cancelled".into());
             }
-            rows.push(row);
-        }
-        if rows.len() >= PREVIEW_READS {
-            break;
+            report();
         }
     }
-    Ok(rows)
+    Ok((rows, qual))
 }
 
 #[cfg(test)]
@@ -440,6 +568,78 @@ mod tests {
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         std::fs::write(&many, fastq(&refs, &vec!["ACGT"; 5000])).unwrap();
         assert_eq!(scan_files(&[(many, Format::Fastq)], &cancel, &|_| {})[0].as_ref().unwrap_err(), "Cancelled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn qualities_follow_the_bases() {
+        // '1' is dropped, the leading and trailing gaps are not part of the row.
+        let rec = fastq::Record { head: b"r x".to_vec(), seq: b".AC1G-".to_vec(), qual: b"!#+5?I".to_vec() };
+        let (row, qual) = read_row(&rec);
+        assert_eq!((row.start, row.data.as_slice(), qual.as_slice()), (1, &b"ACG"[..], &[2, 10, 30][..]));
+        let rec = fastq::Record { head: b"e".to_vec(), seq: b"--".to_vec(), qual: b"II".to_vec() };
+        assert!(read_row(&rec).1.is_empty());
+    }
+
+    #[test]
+    fn draws_distinct_numbers_evenly() {
+        assert_eq!(draw(3, 5, 1), [0, 1, 2]);
+        let a = draw(10_000, 1000, 7);
+        assert_eq!(a.len(), 1000);
+        assert!(a.windows(2).all(|w| w[0] < w[1]) && *a.last().unwrap() < 10_000);
+        assert_eq!(a, draw(10_000, 1000, 7));
+        assert_ne!(a, draw(10_000, 1000, 8));
+        // About half of them in each half.
+        let low = a.iter().filter(|&&x| x < 5000).count();
+        assert!((400..600).contains(&low), "{low}");
+    }
+
+    #[test]
+    fn samples_reads_from_all_lanes() {
+        let dir = scratch("sample");
+        let mut files = Vec::new();
+        let mut paths = Vec::new();
+        for (lane, n) in [(1, 600), (2, 700)] {
+            let names: Vec<String> = (0..n).map(|i| format!("L{lane}:{i}")).collect();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            for (role, seq) in [(Role::R1, "ACGT"), (Role::R2, "GGCCA")] {
+                let p = dir.join(format!("s_L00{lane}_{}.fastq", role.label()));
+                std::fs::write(&p, fastq(&refs, &vec![seq; n])).unwrap();
+                files.push((p.clone(), role));
+                paths.push((p, Format::Fastq));
+            }
+        }
+        let set = build_set(Format::Fastq, Layout::Paired, &files, scan(&paths)).unwrap();
+        let cancel = AtomicBool::new(false);
+        let p = sample(&set, 42, &cancel, &|_| {}).unwrap();
+        let rows = &p.doc.rows;
+        assert!(!p.complete && rows.len() == PREVIEW_READS && p.qual.len() == rows.len());
+        // Mates stay together, in file order, from both lanes.
+        for pair in rows.chunks(2) {
+            assert_eq!((pair[0].meta_value("Mate"), pair[1].meta_value("Mate")), (Some("R1"), Some("R2")));
+            assert_eq!(pair[0].name, pair[1].name);
+            assert_eq!(pair[1].data, b"GGCCA");
+        }
+        assert!(rows.iter().all(|r| r.meta_value("File").is_some()));
+        assert!(rows.iter().any(|r| r.name.starts_with("L1:")) && rows.iter().any(|r| r.name.starts_with("L2:")));
+        assert!(p.qual.iter().zip(rows).all(|(q, r)| q.len() == r.data.len() && q.iter().all(|&x| x == 40)));
+        let other = sample(&set, 43, &cancel, &|_| {}).unwrap();
+        assert_ne!(rows.iter().map(|r| &r.name).collect::<Vec<_>>(), other.doc.rows.iter().map(|r| &r.name).collect::<Vec<_>>());
+        // The first reads: all from the first lane.
+        let first = preview(&set).unwrap();
+        assert_eq!((first.doc.rows[0].name.as_str(), first.doc.rows[999].name.as_str()), ("L1:0", "L1:499"));
+        // Single files: the whole set when it is small, and cancelling.
+        let one = &files[..1];
+        let set = build_set(Format::Fastq, Layout::Single, &[(one[0].0.clone(), Role::Single)], scan(&paths[..1])).unwrap();
+        let p = sample(&set, 1, &cancel, &|_| {}).unwrap();
+        assert!(p.complete && p.doc.rows.len() == 600 && p.doc.rows[0].meta.is_empty());
+        let many = dir.join("many.fastq");
+        let names: Vec<String> = (0..10_000).map(|i| format!("r{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        std::fs::write(&many, fastq(&refs, &vec!["ACGT"; 10_000])).unwrap();
+        let set = build_set(Format::Fastq, Layout::Single, &[(many.clone(), Role::Single)], scan(&[(many, Format::Fastq)])).unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(sample(&set, 1, &cancel, &|_| {}).err().as_deref(), Some("Cancelled"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

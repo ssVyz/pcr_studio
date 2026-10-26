@@ -29,7 +29,7 @@ use iced::keyboard::{self, Key, key::Named};
 use iced::{Subscription, Task, Theme};
 use job::{Job, Payload};
 use serde::{Deserialize, Serialize};
-use state::{BASE_COL_W, Highlight, LinkedView, OpenDoc, Selection, ViewPrefs};
+use state::{BASE_COL_W, Highlight, LinkedView, OpenDoc, ReadDisplay, Selection, ViewPrefs};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -265,6 +265,8 @@ pub enum Message {
     /// Results of checking linked files (by document id).
     LinkStates(Payload<HashMap<i64, Vec<FileState>>>),
     LinkedOpened(Payload<Result<LinkedOpen, String>>),
+    /// Shows a new random sample of the reads of the open linked FASTQ document.
+    SampleReads,
     /// New document from typed or pasted text (in the current folder).
     NewSequence,
     /// Edit the sequence of a single-sequence document.
@@ -335,6 +337,7 @@ pub enum Message {
     ToggleColors(bool),
     SetGraph(state::GraphMode),
     SetThreshold(ConsensusThreshold),
+    SetReadDisplay(ReadDisplay),
     // Rows
     SortBy(SortKey),
     /// Sorts all sequences of the document and saves the order.
@@ -886,15 +889,26 @@ impl App {
             loaded.open.vp.canvas = old.vp.canvas;
             loaded.open.vp.seq_w = old.vp.seq_w;
             loaded.open.vp.rows_h = old.vp.rows_h;
+            // A new sample of the reads keeps how the document is shown.
+            if old.info.id == loaded.open.info.id && loaded.open.linked.as_ref().is_some_and(|l| l.random) {
+                loaded.open.keep_view(old);
+            }
         }
         let mut od = loaded.open;
         // The setting may have changed while loading.
         if od.cols.is_subset() != (self.settings.view.collapse_gaps && od.reference.is_some()) {
             od.update_columns(self.settings.view.collapse_gaps);
         }
+        od.set_read_display(self.settings.view.read_display);
         let rows = canvas::group_digits(od.doc.rows.len());
         self.status = match &od.linked {
             Some(l) if l.complete => format!("Opened “{}” (linked files, read-only): {rows} {}", od.info.name, l.set.unit()),
+            Some(l) if l.random => format!(
+                "“{}”: a new random sample of {rows} of {} {}",
+                od.info.name,
+                canvas::group_digits(l.set.summary.records as usize),
+                l.set.unit()
+            ),
             Some(l) => format!(
                 "Opened “{}” (linked files, read-only): showing the first {rows} of {} {}",
                 od.info.name,
@@ -911,6 +925,20 @@ impl App {
     /// FASTA completely (up to a size limit). With missing or changed files the
     /// linked files dialog opens instead.
     fn open_linked(&mut self, id: i64) -> Task<Message> {
+        self.load_linked(id, None)
+    }
+
+    /// Replaces the reads of the open linked FASTQ document by a random sample
+    /// of all its reads (a full pass over the files; cancellable).
+    fn sample_reads(&mut self) -> Task<Message> {
+        let Some(id) = self.open.as_ref().filter(|o| o.linked.as_ref().is_some_and(can_sample)).map(|o| o.info.id) else { return Task::none() };
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or_default();
+        self.load_linked(id, Some(seed))
+    }
+
+    /// Reads linked document `id` for the viewer: the first records, or with
+    /// `sample` (a seed) a random sample of the reads.
+    fn load_linked(&mut self, id: i64, sample: Option<u64>) -> Task<Message> {
         if self.busy() {
             return Task::none();
         }
@@ -918,9 +946,10 @@ impl App {
         let path = self.db_path.clone();
         let prefs = self.settings.view.clone();
         let row_h = self.settings.row_height;
+        let title = if sample.is_some() { "Drawing a random sample of reads" } else { "Opening linked files" };
         self.start_job(
-            "Opening linked files",
-            false,
+            title,
+            sample.is_some(),
             move |p| {
                 let db = Db::open(&path)?;
                 let mut set = db.linked_set(id)?;
@@ -932,16 +961,25 @@ impl App {
                 if states.iter().any(|&s| s != FileState::Ok) {
                     return Ok(LinkedOpen::Broken(id, states));
                 }
-                p.set(0.2, "Reading the first records");
-                let preview = linked::scan::preview(&set)?;
-                p.set(0.8, "Computing consensus and statistics");
+                let preview = match sample {
+                    None => {
+                        p.set(0.2, "Reading the first records");
+                        linked::scan::preview(&set)?
+                    }
+                    Some(seed) => {
+                        let size: u64 = set.files.iter().map(|f| f.size).sum();
+                        p.set(0.0, &format!("Reading the files ({}) for a random sample", linked::size_label(size)));
+                        linked::scan::sample(&set, seed, &p.cancel, &|f| p.set_fraction(0.9 * f))?
+                    }
+                };
+                p.set(0.9, "Computing consensus and statistics");
                 let mut info = db.document_info(id)?.ok_or_else(|| format!("Document {id} not found"))?;
                 info.kind = preview.kind;
                 info.n_rows = preview.doc.rows.len();
                 info.width = preview.doc.width;
                 let mut open = OpenDoc::new(info, preview.doc, Vec::new(), &prefs);
                 open.set_row_h(row_h);
-                open.linked = Some(LinkedView { set, complete: preview.complete });
+                open.linked = Some(LinkedView { set, complete: preview.complete, random: sample.is_some(), qual: preview.qual });
                 Ok(LinkedOpen::Loaded(Box::new(LoadedDoc { open })))
             },
             |r| Message::LinkedOpened(Payload::new(r.unwrap_or_else(|| Err("Opening the linked files failed".into())))),
@@ -1536,10 +1574,12 @@ impl App {
                         self.link_states.insert(id, states.clone());
                         self.show_linked(id, Some(states));
                     }
+                    Some(Err(e)) if e == "Cancelled" => self.status = "Cancelled: the reads shown are unchanged".into(),
                     Some(Err(e)) => self.error = Some(e),
                     None => {}
                 }
             }
+            Message::SampleReads => return self.sample_reads(),
             Message::ImportPicked(Some(paths)) if !paths.is_empty() => {
                 let db_path = self.db_path.clone();
                 let folder = self.target_folder();
@@ -1708,6 +1748,10 @@ impl App {
             Message::ToggleOverview(b) => self.set_pref(|p| p.show_overview = b),
             Message::ToggleColors(b) => self.set_pref(|p| p.color_bases = b),
             Message::SetGraph(g) => self.set_pref(|p| p.graph = g),
+            Message::SetReadDisplay(m) => {
+                self.set_pref(|p| p.read_display = m);
+                self.with_doc(|od, _| od.set_read_display(m));
+            }
             Message::SetThreshold(t) => {
                 self.set_pref(|p| p.threshold = t);
                 let prefs = self.settings.view.clone();
@@ -3051,6 +3095,11 @@ impl App {
             |r| Message::ImportDone(Payload::new(r.unwrap_or_else(|| Err("Demo generation failed".into())))),
         )
     }
+}
+
+/// Whether a new random sample can be drawn: FASTQ reads not all shown.
+fn can_sample(l: &LinkedView) -> bool {
+    l.set.format == Format::Fastq && !l.complete
 }
 
 /// Where the files of a linked set are: "2 files in C:\data\run1".

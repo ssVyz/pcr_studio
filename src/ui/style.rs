@@ -48,6 +48,21 @@ pub struct Palette {
     pub ann_rev: Color,
     pub ann_probe: Color,
     pub ann_region: Color,
+    /// Base quality Q0..=Q40: red, neutral gray at Q20, blue ([`quality_scale`]).
+    pub quality: [Color; QUALITY_MAX as usize + 1],
+}
+
+/// Highest Phred quality with its own color; higher ones look the same.
+pub const QUALITY_MAX: u8 = 40;
+
+/// Diverging scale for base qualities: `low` at Q0, `mid` at Q20, `high` from Q40.
+fn quality_scale(low: Color, mid: Color, high: Color) -> [Color; QUALITY_MAX as usize + 1] {
+    let half = QUALITY_MAX as f32 / 2.0;
+    let mix = |a: Color, b: Color, t: f32| Color { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t, a: 1.0 };
+    std::array::from_fn(|q| {
+        let q = q as f32;
+        if q <= half { mix(low, mid, q / half) } else { mix(mid, high, (q - half) / half) }
+    })
 }
 
 impl Palette {
@@ -86,6 +101,7 @@ impl Palette {
             ann_rev: rgb(242, 130, 64),
             ann_probe: rgb(160, 104, 220),
             ann_region: rgb(120, 190, 150),
+            quality: quality_scale(rgb(190, 40, 45), rgb(226, 225, 221), rgb(28, 92, 171)),
         }
     }
 
@@ -124,6 +140,7 @@ impl Palette {
             ann_rev: rgb(220, 112, 50),
             ann_probe: rgb(140, 90, 200),
             ann_region: rgb(90, 160, 120),
+            quality: quality_scale(rgb(230, 103, 103), rgb(72, 72, 70), rgb(109, 167, 236)),
         }
     }
 
@@ -136,6 +153,19 @@ impl Palette {
             b'T' => self.base_t,
             _ => self.base_other,
         }
+    }
+
+    #[inline]
+    pub fn quality(&self, q: u8) -> Color {
+        self.quality[q.min(QUALITY_MAX) as usize]
+    }
+
+    /// Text on a cell of quality `q`: dark or light, whichever contrasts more.
+    pub fn quality_text(&self, q: u8) -> Color {
+        let c = self.quality(q);
+        let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+        let luminance = 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+        if luminance > 0.2 { rgb(20, 22, 28) } else { rgb(245, 246, 248) }
     }
 
     pub fn identity(&self, id: f32) -> Color {

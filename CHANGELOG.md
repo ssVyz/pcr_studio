@@ -7,6 +7,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.1.1] - 2026-10-26
+
+### Added
+
+- **Base qualities of linked FASTQ reads**: the viewer shows reads as **Sequence** (default),
+  **Sequence + quality** (a quality lane under each read) or **Quality**. Chosen in the right
+  panel (Display → Reads) or the View menu, and remembered like the other display settings.
+  - Each base's Phred score (Phred+33) shades its cell from red (Q0) through gray (Q20) to blue
+    (Q40 and higher), in light and dark mode. Zoomed in far enough, the score is written in the
+    cell; zoomed out, a pixel shows the mean quality of its columns. The panel shows the scale.
+  - Hovering a base adds its quality to the status bar (“read: A (Q37)”).
+- **New random sample** (right panel, View menu) for linked FASTQ documents: replaces the reads
+  shown by as many reads drawn at random from all files of the set (R1/R2 pairs stay together,
+  shown in file order). Every sample reads through the files (in parallel, with progress and
+  **Cancel**); a read may show up again in a later sample. Sort, grouping, filter and zoom are
+  kept. Not offered when all reads are shown; opening the document shows the first reads again.
+
+### Changed
+
+- The reads shown for a paired read set with several lanes carry the metadata **File** (the
+  read's file), as single-end sets with several files already did.
+
 ## [0.1.0] - 2026-10-23
 
 ### Changed

@@ -2,7 +2,7 @@
 
 use super::canvas::{AlignmentView, group_digits};
 use super::dialogs::{self, ModalMsg};
-use super::state::{BASE_COL_W, GraphMode, Highlight, OpenDoc};
+use super::state::{BASE_COL_W, GraphMode, Highlight, OpenDoc, ReadDisplay};
 use super::{App, ContextTarget, DropTarget, FolderChoice, GroupChoice, JUMP_INPUT, LIB_SCROLL, LibKey, Message, SEARCH_INPUT, Split, icons, menu, style};
 use crate::display::{Item, RowSort, SortKey};
 use crate::linked;
@@ -295,11 +295,23 @@ impl App {
             .chain(self.sort_entries(None, true))
             .chain([Entry::Separator, Entry::item("Settings…", "Ctrl+,", Some(Message::OpenSettings))])
             .collect(),
-            menu::MenuId::View => vec![
-                Entry::check("Display options panel", "Ctrl+Shift+D", self.settings.show_options, Some(Message::ToggleOptionsPanel)),
-                Entry::Separator,
-                Entry::item("Reset panel sizes", "", Some(Message::ResetPanels)),
-            ],
+            menu::MenuId::View => {
+                // Reads with base qualities (linked FASTQ).
+                let reads = od.is_some_and(|o| o.qualities().is_some());
+                let shown = self.settings.view.read_display;
+                let mode = |label: &'static str, m: ReadDisplay| Entry::check(label, "", reads && shown == m, when(reads, Message::SetReadDisplay(m)));
+                let sample = idle && od.and_then(|o| o.linked.as_ref()).is_some_and(super::can_sample);
+                vec![
+                    Entry::check("Display options panel", "Ctrl+Shift+D", self.settings.show_options, Some(Message::ToggleOptionsPanel)),
+                    Entry::Separator,
+                    mode("Reads: sequence", ReadDisplay::Sequence),
+                    mode("Reads: sequence + quality", ReadDisplay::SequenceQuality),
+                    mode("Reads: quality", ReadDisplay::Quality),
+                    Entry::item("New random sample of reads", "", when(sample, Message::SampleReads)),
+                    Entry::Separator,
+                    Entry::item("Reset panel sizes", "", Some(Message::ResetPanels)),
+                ]
+            }
             menu::MenuId::Tools => vec![
                 Entry::item("Map to reference…", "Ctrl+M", when(idle && complete, Message::OpenMapDialog)),
                 Entry::item("Metadata from sequence names…", "", when(writable, Message::OpenNameFields)),
@@ -664,14 +676,31 @@ impl App {
         match &od.linked {
             Some(l) => {
                 let unit = l.set.unit();
+                let total = group_digits(l.set.summary.records as usize);
                 let shown = if l.complete {
                     format!("{} {unit} · {} columns", group_digits(doc.rows.len()), group_digits(doc.width))
+                } else if l.random {
+                    format!("Showing {} random {unit} of {total}", group_digits(doc.rows.len()))
                 } else {
-                    format!("Showing the first {} of {} {unit}", group_digits(doc.rows.len()), group_digits(l.set.summary.records as usize))
+                    format!("Showing the first {} of {total} {unit}", group_digits(doc.rows.len()))
                 };
+                let sample = super::can_sample(l).then(|| {
+                    tooltip(
+                        button(text("New random sample").size(12))
+                            .padding([4, 8])
+                            .style(button::secondary)
+                            .on_press_maybe((!self.busy()).then_some(Message::SampleReads)),
+                        container(text("Reads through all files and shows reads drawn at random from all of them (pairs stay together).").size(12))
+                            .padding(6)
+                            .max_width(320)
+                            .style(container::rounded_box),
+                        tooltip::Position::Bottom,
+                    )
+                });
                 doc_info = doc_info.extend([
                     text(format!("Linked {}", l.set.kind_label())).size(12).style(style::muted).into(),
                     text(shown).size(12).into(),
+                    sample.into(),
                     text("Read-only: the sequences are read from the linked files; sorting, the reference, annotations and metadata cannot be saved.")
                         .size(11)
                         .style(style::muted)
@@ -707,8 +736,32 @@ impl App {
             .into()
         });
 
+        let reads = od.qualities().map(|_| {
+            let pal = self.palette();
+            let mut scale = row![text("Q0").size(10).style(style::muted)].spacing(1).align_y(Alignment::Center);
+            for q in (0..=style::QUALITY_MAX).step_by(5) {
+                let c = pal.quality(q);
+                scale = scale.push(container(Space::new().width(14).height(10)).style(move |_t: &Theme| container::Style {
+                    background: Some(c.into()),
+                    ..Default::default()
+                }));
+            }
+            let scale = scale.push(text(format!("Q{}+", style::QUALITY_MAX)).size(10).style(style::muted));
+            column![
+                row![
+                    text("Reads").size(12).width(80),
+                    pick_list(&ReadDisplay::ALL[..], Some(prefs.read_display), Message::SetReadDisplay).text_size(12).padding(4).width(Fill)
+                ]
+                .align_y(Alignment::Center),
+                (prefs.read_display != ReadDisplay::Sequence).then(|| {
+                    column![scale, text("Base quality (Phred): Q20 = 1 error in 100 bases, Q30 = 1 in 1,000.").size(11).style(style::muted)].spacing(4)
+                }),
+            ]
+            .spacing(6)
+        });
         let display = column![
             section("Display"),
+            reads,
             checkbox(prefs.show_consensus).label("Consensus").on_toggle(Message::ToggleConsensus).text_size(13),
             row![
                 text("Threshold").size(12).width(80),
@@ -1128,6 +1181,9 @@ impl App {
             let rw = &od.doc.rows[r];
             let b = rw.at(h.col).map(|b| (b as char).to_string()).unwrap_or_else(|| "no coverage".into());
             s.push_str(&format!(" · {}: {b}", rw.name));
+            if let Some(q) = od.quality_at(r, h.col) {
+                s.push_str(&format!(" (Q{q})"));
+            }
             if let Some(Item::Seq { count, .. }) = h.item.and_then(|i| od.items.get(i))
                 && *count > 1 && !h.on_reference {
                     s.push_str(&format!(" (×{count})"));

@@ -47,6 +47,30 @@ impl std::fmt::Display for GraphMode {
     }
 }
 
+/// How reads with base qualities (FASTQ) are shown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReadDisplay {
+    #[default]
+    Sequence,
+    /// A sequence lane and a quality lane under it.
+    SequenceQuality,
+    Quality,
+}
+
+impl ReadDisplay {
+    pub const ALL: [ReadDisplay; 3] = [ReadDisplay::Sequence, ReadDisplay::SequenceQuality, ReadDisplay::Quality];
+}
+
+impl std::fmt::Display for ReadDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ReadDisplay::Sequence => "Sequence",
+            ReadDisplay::SequenceQuality => "Sequence + quality",
+            ReadDisplay::Quality => "Quality",
+        })
+    }
+}
+
 /// Persisted display preferences.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -67,6 +91,8 @@ pub struct ViewPrefs {
     pub auto_report: bool,
     /// Hide the columns where the reference has a gap (or no coverage).
     pub collapse_gaps: bool,
+    /// Sequence and/or base qualities of FASTQ reads.
+    pub read_display: ReadDisplay,
 }
 
 impl Default for ViewPrefs {
@@ -85,6 +111,7 @@ impl Default for ViewPrefs {
             graph: GraphMode::Conservation,
             auto_report: true,
             collapse_gaps: false,
+            read_display: ReadDisplay::Sequence,
         }
     }
 }
@@ -95,6 +122,8 @@ pub const NAME_W_MAX: f32 = 600.0;
 
 /// Zoom level where letters are comfortable; shown as 100%.
 pub const BASE_COL_W: f32 = 12.0;
+/// Space under each read shown with sequence and quality lanes.
+const READ_GAP: f32 = 3.0;
 pub const MAX_COL_W: f32 = 32.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -220,6 +249,8 @@ pub struct OpenDoc {
     pub last_sort: Option<(RowSort, bool)>,
     /// Set for linked files: the document is read-only (nothing is saved).
     pub linked: Option<LinkedView>,
+    /// How reads are shown; always `Sequence` without base qualities.
+    pub read_display: ReadDisplay,
 }
 
 /// A linked document in the viewer.
@@ -227,6 +258,10 @@ pub struct LinkedView {
     pub set: LinkedSet,
     /// All records of the files are shown, not only the first ones.
     pub complete: bool,
+    /// The reads shown are a random sample (otherwise the first ones).
+    pub random: bool,
+    /// Phred qualities of the bases of each row (FASTQ; empty for FASTA).
+    pub qual: Vec<Vec<u8>>,
 }
 
 impl OpenDoc {
@@ -262,6 +297,7 @@ impl OpenDoc {
             annotation_kind: crate::model::AnnotationKind::ForwardPrimer,
             last_sort: None,
             linked: None,
+            read_display: ReadDisplay::Sequence,
         };
         od.recompute_stats(prefs);
         od.rebuild_items();
@@ -450,16 +486,24 @@ impl OpenDoc {
         self.vp.row_h.max(18.0)
     }
 
+    /// Height of a sequence item: one lane, or a sequence and a quality lane.
+    pub fn seq_h(&self) -> f32 {
+        match self.read_display {
+            ReadDisplay::SequenceQuality => 2.0 * self.vp.row_h + READ_GAP,
+            _ => self.vp.row_h,
+        }
+    }
+
     /// Top of display item `i` in content pixels (`i == items.len()` gives the total height).
     pub fn item_top(&self, i: usize) -> f32 {
         let g = self.group_prefix[i.min(self.items.len())] as f32;
-        (i as f32 - g) * self.vp.row_h + g * self.group_h()
+        (i as f32 - g) * self.seq_h() + g * self.group_h()
     }
 
     pub fn item_h(&self, i: usize) -> f32 {
         match self.items.get(i) {
             Some(Item::Group { .. }) => self.group_h(),
-            _ => self.vp.row_h,
+            _ => self.seq_h(),
         }
     }
 
@@ -500,12 +544,51 @@ impl OpenDoc {
 
     /// Changes the row height, keeping the top visible item in place.
     pub fn set_row_h(&mut self, h: f32) {
+        self.keep_top(|od| od.vp.row_h = h);
+    }
+
+    /// Shows reads as sequence, quality or both, keeping the top visible item
+    /// in place; documents without base qualities always show sequence.
+    pub fn set_read_display(&mut self, mode: ReadDisplay) {
+        let mode = if self.qualities().is_some() { mode } else { ReadDisplay::Sequence };
+        self.keep_top(|od| od.read_display = mode);
+    }
+
+    /// Applies a change of item heights, keeping the top visible item in place.
+    fn keep_top(&mut self, change: impl FnOnce(&mut OpenDoc)) {
         let top = self.item_at_y(self.vp.scroll_y);
-        self.vp.row_h = h;
+        change(self);
         if let Some(i) = top {
             self.vp.scroll_y = self.item_top(i);
         }
         self.clamp_view();
+    }
+
+    /// Phred qualities of the bases of every row (linked FASTQ reads).
+    pub fn qualities(&self) -> Option<&[Vec<u8>]> {
+        self.linked.as_ref().map(|l| l.qual.as_slice()).filter(|q| !q.is_empty())
+    }
+
+    /// Phred quality of row `row` at alignment column `col`.
+    pub fn quality_at(&self, row: usize, col: usize) -> Option<u8> {
+        let q = self.qualities()?.get(row)?;
+        q.get(col.checked_sub(self.doc.rows.get(row)?.start)?).copied()
+    }
+
+    /// Takes over the display options and the horizontal zoom and position of
+    /// `old`, another set of reads of the same document.
+    pub fn keep_view(&mut self, old: &OpenDoc) {
+        let mut display = old.display.clone();
+        if display.group_by.as_ref().is_some_and(|k| !self.meta_keys.contains(k)) {
+            display.group_by = None;
+        }
+        if matches!(&display.sort, display::SortKey::Meta(k) if !self.meta_keys.contains(k)) {
+            display.sort = display::SortKey::Original;
+        }
+        self.display = display;
+        self.vp.col_w = old.vp.col_w;
+        self.vp.scroll_x = old.vp.scroll_x;
+        self.rebuild_items();
     }
 
     /// Full-width template (consensus or reference with blanks as gaps).

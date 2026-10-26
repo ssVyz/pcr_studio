@@ -4,7 +4,7 @@
 //! A name column sits on the left, scrollbars on the right and bottom.
 
 use super::Message;
-use super::state::{Highlight, Hover, OpenDoc, ViewPrefs};
+use super::state::{Highlight, Hover, OpenDoc, ReadDisplay, ViewPrefs};
 use super::style::Palette;
 use crate::display::Item;
 use crate::model::{Annotation, Row};
@@ -643,7 +643,8 @@ impl Drawer<'_, '_> {
         }
     }
 
-    fn letter(&self, f: &mut Frame, x: f32, y: f32, h: f32, ch: char, color: Color, size: f32) {
+    /// Centered monospace text (a base letter, a quality score).
+    fn letter(&self, f: &mut Frame, x: f32, y: f32, h: f32, ch: impl ToString, color: Color, size: f32) {
         f.fill_text(Text {
             content: ch.to_string(),
             position: Point::new(x, y + h / 2.0),
@@ -777,6 +778,64 @@ impl Drawer<'_, '_> {
         }
     }
 
+    /// Draws the base qualities of a read: cells shaded by Phred score, with
+    /// the score written in them when zoomed in far enough. Zoomed out, a
+    /// pixel shows the mean quality of its columns.
+    fn quality_track(&self, f: &mut Frame, y: f32, h: f32, at: &dyn Fn(usize) -> Option<u8>) {
+        let vp = &self.od().vp;
+        let cols = &self.od().cols;
+        let col_w = vp.col_w;
+        let pal = self.pal;
+        let pad = if h >= 8.0 { 1.0 } else { 0.0 };
+        let mut runs = Runs::new(y + pad / 2.0, h - pad);
+        if col_w >= 1.0 {
+            let (c0, c1) = self.visible_cols();
+            // Two digits must fit into a column; with numbers, a 1 px gap
+            // between cells keeps equal neighbors apart ("37 37", not "3737").
+            let size = ((col_w - 2.0) / 1.2).min(h * 0.75).min(13.0);
+            let numbers = size >= 8.0;
+            let gap = if numbers { 1.0 } else { 0.0 };
+            let mut glyphs: Vec<(f32, u8)> = Vec::new();
+            for d in c0..c1 {
+                let x = self.v.x_of(self.lay, d as f32);
+                match at(cols.col(d)) {
+                    Some(q) => {
+                        runs.push(f, x, x + col_w - gap, pal.quality(q));
+                        if numbers {
+                            glyphs.push((x + (col_w - gap) / 2.0, q));
+                        }
+                    }
+                    None => runs.flush(f),
+                }
+            }
+            runs.flush(f);
+            for (x, q) in glyphs {
+                self.letter(f, x, y, h, q, pal.quality_text(q), size);
+            }
+        } else {
+            let px_n = self.lay.seq_w.ceil() as usize;
+            let width = self.od().view_width();
+            for px in 0..px_n {
+                let x = self.lay.seq_x0 + px as f32;
+                let ca = self.v.col_at(self.lay, x).floor().max(0.0) as usize;
+                let cb = (self.v.col_at(self.lay, x + 1.0).floor().max(0.0) as usize).max(ca + 1).min(width);
+                if ca >= width {
+                    break;
+                }
+                let (mut sum, mut n) = (0u32, 0u32);
+                for q in (ca..cb).filter_map(|d| at(cols.col(d))) {
+                    sum += q as u32;
+                    n += 1;
+                }
+                match (sum + n / 2).checked_div(n) {
+                    Some(mean) => runs.push(f, x, x + 1.0, pal.quality(mean as u8)),
+                    None => runs.flush(f),
+                }
+            }
+            runs.flush(f);
+        }
+    }
+
     fn rows(&self, f: &mut Frame) {
         let od = self.od();
         let vp = &od.vp;
@@ -799,9 +858,17 @@ impl Drawer<'_, '_> {
                 Item::Seq { row, .. } => {
                     let r: &Row = &doc.rows[*row];
                     if od.selected_rows.contains(row) {
-                        f.fill_rectangle(Point::new(lay.seq_x0, y), Size::new(lay.seq_w, vp.row_h), self.pal.row_selected);
+                        f.fill_rectangle(Point::new(lay.seq_x0, y), Size::new(lay.seq_w, h), self.pal.row_selected);
                     }
-                    self.track(f, y, vp.row_h, &|c| r.at(c), cmp);
+                    let qual = |c: usize| od.quality_at(*row, c);
+                    match od.read_display {
+                        ReadDisplay::Sequence => self.track(f, y, vp.row_h, &|c| r.at(c), cmp),
+                        ReadDisplay::SequenceQuality => {
+                            self.track(f, y, vp.row_h, &|c| r.at(c), cmp);
+                            self.quality_track(f, y + vp.row_h, vp.row_h, &qual);
+                        }
+                        ReadDisplay::Quality => self.quality_track(f, y, vp.row_h, &qual),
+                    }
                 }
             }
         }
@@ -1122,7 +1189,7 @@ impl Drawer<'_, '_> {
                 }
                 Item::Seq { row, count } => {
                     if od.selected_rows.contains(row) {
-                        f.fill_rectangle(Point::new(0.0, y), Size::new(lay.seq_x0 - 1.0, vp.row_h), pal.row_selected);
+                        f.fill_rectangle(Point::new(0.0, y), Size::new(lay.seq_x0 - 1.0, h), pal.row_selected);
                     }
                     if show_text {
                         let indent = if od.display.group_by.is_some() { 18.0 } else { x };
