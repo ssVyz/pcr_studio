@@ -1,7 +1,7 @@
 //! SQLite document library, stored next to the executable (`pcr_studio.db`).
 
 use crate::linked::LinkedSet;
-use crate::model::{Annotation, AnnotationKind, DocInfo, DocKind, Document, Folder, Row};
+use crate::model::{Annotation, AnnotationKind, DocInfo, DocKind, Document, Folder, Rgb, Row};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS annotations (
     kind        TEXT NOT NULL,
     start_col   INTEGER NOT NULL,
     end_col     INTEGER NOT NULL,
-    note        TEXT NOT NULL DEFAULT ''
+    note        TEXT NOT NULL DEFAULT '',
+    color       TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS folders (
     id          INTEGER PRIMARY KEY,
@@ -78,6 +79,11 @@ fn meta_from_json(s: &str) -> Vec<(String, String)> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
+/// Stored color of an annotation: `#RRGGBB`, empty for the color of its type.
+fn color_text(color: Option<Rgb>) -> String {
+    color.map(Rgb::hex).unwrap_or_default()
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Db, String> {
         let conn = Connection::open(path).map_err(|e| format!("Cannot open database {}: {e}", path.display()))?;
@@ -91,6 +97,15 @@ impl Db {
             .map_err(|e| e.to_string())?;
         if !has_folder {
             conn.execute_batch("ALTER TABLE documents ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL;")
+                .map_err(|e| format!("Cannot upgrade database: {e}"))?;
+        }
+        // ... and before annotations had their own color.
+        let has_color: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('annotations') WHERE name = 'color'")
+            .and_then(|mut st| st.exists([]))
+            .map_err(|e| e.to_string())?;
+        if !has_color {
+            conn.execute_batch("ALTER TABLE annotations ADD COLUMN color TEXT NOT NULL DEFAULT '';")
                 .map_err(|e| format!("Cannot upgrade database: {e}"))?;
         }
         Ok(Db { conn })
@@ -373,7 +388,7 @@ impl Db {
     pub fn annotations(&self, doc_id: i64) -> Result<Vec<Annotation>, String> {
         let mut st = self
             .conn
-            .prepare("SELECT id, name, kind, start_col, end_col, note FROM annotations WHERE doc_id = ?1 ORDER BY start_col, id")
+            .prepare("SELECT id, name, kind, start_col, end_col, note, color FROM annotations WHERE doc_id = ?1 ORDER BY start_col, id")
             .map_err(|e| e.to_string())?;
         let rows = st
             .query_map(params![doc_id], |r| {
@@ -384,6 +399,7 @@ impl Db {
                     start: r.get::<_, i64>(3)? as usize,
                     end: r.get::<_, i64>(4)? as usize,
                     note: r.get(5)?,
+                    color: Rgb::parse(&r.get::<_, String>(6)?),
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -393,27 +409,46 @@ impl Db {
     pub fn add_annotation(&self, doc_id: i64, a: &Annotation) -> Result<i64, String> {
         self.conn
             .execute(
-                "INSERT INTO annotations (doc_id, name, kind, start_col, end_col, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![doc_id, a.name, a.kind.as_str(), a.start as i64, a.end as i64, a.note],
+                "INSERT INTO annotations (doc_id, name, kind, start_col, end_col, note, color) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![doc_id, a.name, a.kind.as_str(), a.start as i64, a.end as i64, a.note, color_text(a.color)],
             )
             .map_err(|e| e.to_string())?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Saves name, type, range and note of an existing annotation.
+    /// Saves name, type, range, note and color of an existing annotation.
     pub fn update_annotation(&self, a: &Annotation) -> Result<(), String> {
         self.conn
             .execute(
-                "UPDATE annotations SET name = ?2, kind = ?3, start_col = ?4, end_col = ?5, note = ?6 WHERE id = ?1",
-                params![a.id, a.name, a.kind.as_str(), a.start as i64, a.end as i64, a.note],
+                "UPDATE annotations SET name = ?2, kind = ?3, start_col = ?4, end_col = ?5, note = ?6, color = ?7 WHERE id = ?1",
+                params![a.id, a.name, a.kind.as_str(), a.start as i64, a.end as i64, a.note, color_text(a.color)],
             )
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    pub fn delete_annotation(&self, id: i64) -> Result<(), String> {
-        self.conn.execute("DELETE FROM annotations WHERE id = ?1", params![id]).map_err(|e| e.to_string())?;
-        Ok(())
+    /// Gives annotations one color (`None`: the color of their type), all or none.
+    pub fn set_annotation_color(&mut self, ids: &[i64], color: Option<Rgb>) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        {
+            let mut st = tx.prepare("UPDATE annotations SET color = ?2 WHERE id = ?1").map_err(|e| e.to_string())?;
+            for &id in ids {
+                st.execute(params![id, color_text(color)]).map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Deletes annotations, all or none.
+    pub fn delete_annotations(&mut self, ids: &[i64]) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        {
+            let mut st = tx.prepare("DELETE FROM annotations WHERE id = ?1").map_err(|e| e.to_string())?;
+            for &id in ids {
+                st.execute(params![id]).map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn list_folders(&self) -> Result<Vec<Folder>, String> {
@@ -499,6 +534,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn annotations_without_color_column_are_upgraded() {
+        let path = std::env::temp_dir().join(format!("pcr_studio_db_upgrade_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE annotations (id INTEGER PRIMARY KEY, doc_id INTEGER NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
+                     start_col INTEGER NOT NULL, end_col INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '');
+                 INSERT INTO annotations (doc_id, name, kind, start_col, end_col) VALUES (7, 'F1', 'primer_fwd', 0, 4);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let anns = db.annotations(7).unwrap();
+        assert_eq!((anns.len(), anns[0].color), (1, None));
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn store_and_load() {
         let path = std::env::temp_dir().join(format!("pcr_studio_db_test_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -514,12 +569,27 @@ mod tests {
         assert_eq!(loaded.rows[0].meta_value("host"), Some("human"));
         assert!(anns.is_empty());
         let aid = db
-            .add_annotation(id, &Annotation { id: 0, name: "F1".into(), kind: AnnotationKind::ForwardPrimer, start: 1, end: 4, note: String::new() })
+            .add_annotation(
+                id,
+                &Annotation { id: 0, name: "F1".into(), kind: AnnotationKind::ForwardPrimer, start: 1, end: 4, note: String::new(), color: None },
+            )
             .unwrap();
         assert_eq!(db.annotations(id).unwrap()[0].id, aid);
-        let edited = Annotation { id: aid, name: "R1".into(), kind: AnnotationKind::ReversePrimer, start: 2, end: 6, note: "x".into() };
+        assert_eq!(db.annotations(id).unwrap()[0].color, None);
+        let mut edited =
+            Annotation { id: aid, name: "R1".into(), kind: AnnotationKind::ReversePrimer, start: 2, end: 6, note: "x".into(), color: Some(Rgb(1, 2, 3)) };
         db.update_annotation(&edited).unwrap();
+        assert_eq!(db.annotations(id).unwrap(), vec![edited.clone()]);
+        db.set_annotation_color(&[aid], Some(Rgb(0xE0, 0x45, 0x7B))).unwrap();
+        assert_eq!(db.annotations(id).unwrap()[0].color, Some(Rgb(0xE0, 0x45, 0x7B)));
+        db.set_annotation_color(&[aid], None).unwrap();
+        edited.color = None;
         assert_eq!(db.annotations(id).unwrap(), vec![edited]);
+        let probe = db
+            .add_annotation(id, &Annotation { id: 0, name: "P1".into(), kind: AnnotationKind::Probe, start: 0, end: 3, note: String::new(), color: None })
+            .unwrap();
+        db.delete_annotations(&[aid, probe]).unwrap();
+        assert!(db.annotations(id).unwrap().is_empty());
         db.set_setting("k", "v1").unwrap();
         db.set_setting("k", "v2").unwrap();
         assert_eq!(db.setting("k").as_deref(), Some("v2"));
@@ -541,8 +611,11 @@ mod tests {
         let one = Document::new(vec![Row::from_gapped("s".into(), String::new(), b"ACGTACGT".to_vec())]);
         let single = db.insert_document("single", DocKind::Sequences, &one, None, "", None, &|_| {}).unwrap();
         for (s, e) in [(0, 4), (2, 8)] {
-            db.add_annotation(single, &Annotation { id: 0, name: "a".into(), kind: AnnotationKind::Region, start: s, end: e, note: String::new() })
-                .unwrap();
+            db.add_annotation(
+                single,
+                &Annotation { id: 0, name: "a".into(), kind: AnnotationKind::Region, start: s, end: e, note: String::new(), color: None },
+            )
+            .unwrap();
         }
         let mut edited = Row::from_gapped("s2".into(), "d".into(), b"AC-GTA".to_vec());
         edited.set_meta("k", "v".into());

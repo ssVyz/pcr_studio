@@ -83,6 +83,15 @@ impl App {
             .into()
     }
 
+    /// Menu entry for a command on the selected annotations: `one` for one,
+    /// “`several` N annotations…” for several.
+    fn annotations_label(&self, one: &'static str, several: &str) -> std::borrow::Cow<'static, str> {
+        match self.open.as_ref().map_or(0, |o| o.selected_annotations.len()) {
+            0 | 1 => one.into(),
+            n => format!("{several} {n} annotations…").into(),
+        }
+    }
+
     /// Right-click menu of a library entry or the sequence viewer.
     fn context_entries(&self, target: ContextTarget) -> Vec<menu::Entry> {
         use menu::Entry;
@@ -97,7 +106,9 @@ impl App {
                 let mut entries = Vec::new();
                 if let Some(id) = annotation {
                     entries.push(Entry::item("Annotation properties…", "", Some(Message::AnnotationProperties(id))));
-                    entries.push(Entry::danger("Delete annotation…", Some(Message::AskDeleteAnnotation(id))));
+                    // The right-clicked annotation is selected (perhaps with others).
+                    entries.push(Entry::item(self.annotations_label("Annotation color…", "Color of"), "", Some(Message::OpenAnnotationColor)));
+                    entries.push(Entry::danger(self.annotations_label("Delete annotation…", "Delete"), Some(Message::AskDeleteSelectedAnnotations)));
                     entries.push(Entry::Separator);
                 }
                 entries.extend([
@@ -250,7 +261,7 @@ impl App {
         let doc = od.is_some();
         let selection = od.is_some_and(|o| o.selection.is_some());
         let report = od.is_some_and(|o| o.report.is_some());
-        let annotation = od.and_then(|o| o.selected_annotation);
+        let annotation = od.and_then(|o| o.selected_annotation());
         // Linked files are read-only; tools that need all sequences are off
         // while only the first reads are shown.
         let (writable, complete) = (self.open_writable(), self.open_complete());
@@ -277,7 +288,16 @@ impl App {
                 Entry::item("Add annotation from selection…", "", when(selection && writable, Message::NewAnnotation)),
                 Entry::item("Serial annotation…", "", when(writable, Message::OpenSerialAnnotation)),
                 Entry::item("Annotation properties…", "", annotation.map(Message::AnnotationProperties)),
-                Entry::item("Delete annotation…", "Del", annotation.map(Message::AskDeleteAnnotation)),
+                Entry::item(
+                    self.annotations_label("Annotation color…", "Color of"),
+                    "",
+                    when(annotation.is_some() && writable, Message::OpenAnnotationColor),
+                ),
+                Entry::item(
+                    self.annotations_label("Delete annotation…", "Delete"),
+                    "Del",
+                    annotation.map(|_| Message::AskDeleteSelectedAnnotations),
+                ),
                 Entry::Separator,
                 Entry::item("Copy oligo", "Ctrl+C", when(report, Message::CopyOligo)),
                 Entry::item("Copy oligo report", "", when(report, Message::CopyReport)),
@@ -850,20 +870,33 @@ impl App {
             } else if od.annotations.is_empty() {
                 "Select columns, then right-click → Add annotation… (or the Edit menu)."
             } else {
-                "Click to select; drag the edges in the viewer to resize; double-click or right-click for properties."
+                "Click to select, Ctrl/Shift+click for several (to color or delete them at once); drag the edges in the viewer to \
+                 resize; double-click or right-click for properties."
             })
             .size(11)
             .style(style::muted),
         );
+        if od.selected_annotations.len() > 1 {
+            anns = anns.push(
+                row![
+                    text(format!("{} selected", od.selected_annotations.len())).size(12).width(Fill),
+                    button(text("Color…").size(12)).padding([3, 6]).on_press(Message::OpenAnnotationColor),
+                    button(text("Delete…").size(12)).padding([3, 6]).style(button::danger).on_press(Message::AskDeleteSelectedAnnotations),
+                    button(text("Clear").size(12)).padding([3, 6]).style(button::secondary).on_press(Message::ClearSelection),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center),
+            );
+        }
         for a in &od.annotations {
-            let selected = od.selected_annotation == Some(a.id);
+            let selected = od.selected_annotations.contains(&a.id);
             let range = match od.ref_range(a.start, a.end) {
                 Some((x, y)) => format!("{}–{}", group_digits(x as usize), group_digits(y as usize)),
                 None => format!("col {}–{}", a.start + 1, a.end),
             };
             let pal = self.palette();
             let swatch = container(Space::new().width(10).height(10)).style(move |_t: &Theme| container::Style {
-                background: Some(pal.annotation(a.kind).into()),
+                background: Some(pal.annotation(a).into()),
                 border: iced::Border { radius: 2.0.into(), ..Default::default() },
                 ..Default::default()
             });

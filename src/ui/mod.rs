@@ -22,7 +22,7 @@ use crate::tools::primersearch as ps;
 use crate::tools::{self, ToolConfig, ToolSpec, ToolStatus};
 use canvas::ViewMsg;
 use dialogs::{
-    AnnotationDialog, EditTarget, ExportDialog, ExportRows, ImportFastaDialog, LinkFastqDialog, LinkedDialog, LinkedMsg, MapDialog, Modal,
+    AnnotationColorDialog, AnnotationDialog, EditTarget, ExportDialog, ExportRows, ImportFastaDialog, LinkFastqDialog, LinkedDialog, LinkedMsg, MapDialog, Modal,
     PrimersearchDialog, RefChoice, SequenceDialog, SerialAnnotationDialog, SettingsDialog, TextView, TextViewMsg,
 };
 use iced::keyboard::{self, Key, key::Named};
@@ -364,11 +364,17 @@ pub enum Message {
     AnnotationProperties(i64),
     AnnotationEdit(dialogs::AnnotationMsg),
     SaveAnnotation,
-    /// Select an annotation and its columns (side panel).
+    /// Select an annotation and its columns (side panel); Ctrl/Shift select several.
     SelectAnnotation(i64),
+    /// Color of the selected annotations.
+    OpenAnnotationColor,
+    AnnotationColorEdit(dialogs::ColorMsg),
+    ApplyAnnotationColor,
     AskDeleteAnnotation(i64),
+    /// Delete the selected annotations (asks first).
+    AskDeleteSelectedAnnotations,
     /// Deletion confirmed.
-    DeleteAnnotation(i64),
+    DeleteAnnotations(Vec<i64>),
     /// Annotations from pasted oligos placed on the reference or consensus.
     OpenSerialAnnotation,
     SerialAnnotation(dialogs::SerialMsg),
@@ -1794,7 +1800,7 @@ impl App {
             Message::ClearRowSelection => self.with_doc(|od, _| od.selected_rows.clear()),
             Message::ClearSelection => self.with_doc(|od, _| {
                 od.selection = None;
-                od.selected_annotation = None;
+                od.clear_annotation_selection();
                 od.report = None;
                 od.popup_open = false;
             }),
@@ -1846,14 +1852,14 @@ impl App {
                     return Task::none();
                 };
                 let name = format!("Oligo {}", od.annotations.len() + 1);
-                self.modal = Some(Modal::Annotation(AnnotationDialog::new(None, name, od.annotation_kind, sel.c0, sel.c1, od)));
+                self.modal = Some(Modal::Annotation(AnnotationDialog::new(None, name, od.annotation_kind, None, sel.c0, sel.c1, od)));
                 return dialogs::focus_annotation();
             }
             Message::AnnotationProperties(id) => {
                 if let Some(od) = self.open.as_ref()
                     && let Some(a) = od.annotation(id)
                 {
-                    self.modal = Some(Modal::Annotation(AnnotationDialog::new(Some(id), a.name.clone(), a.kind, a.start, a.end, od)));
+                    self.modal = Some(Modal::Annotation(AnnotationDialog::new(Some(id), a.name.clone(), a.kind, a.color, a.start, a.end, od)));
                     return dialogs::focus_annotation();
                 }
             }
@@ -1863,31 +1869,29 @@ impl App {
                 }
             }
             Message::SaveAnnotation => self.save_annotation(),
-            Message::SelectAnnotation(id) => self.select_annotation(id, true, self.settings.view.auto_report),
-            Message::AskDeleteAnnotation(id) => {
-                if let Some(od) = self.open.as_ref()
-                    && let Some(a) = od.annotation(id)
-                {
-                    let detail = format!("{} · {}", a.kind, annotation_range_label(od, a.start, a.end));
-                    self.modal = Some(Modal::ConfirmDeleteAnnotation { id, name: a.name.clone(), detail });
-                }
-            }
-            Message::DeleteAnnotation(id) => {
-                self.modal = None;
-                if let Err(e) = self.db.delete_annotation(id) {
-                    self.error = Some(e);
+            Message::SelectAnnotation(id) => self.click_annotation(id, true),
+            Message::OpenAnnotationColor => {
+                if self.refuse_read_only("annotations") {
                     return Task::none();
                 }
-                if let Some(od) = self.open.as_mut()
-                    && let Some(i) = od.annotations.iter().position(|a| a.id == id)
+                if let Some(od) = self.open.as_ref()
+                    && !od.selected_annotations.is_empty()
                 {
-                    let a = od.annotations.remove(i);
-                    if od.selected_annotation == Some(id) {
-                        od.selected_annotation = None;
-                    }
-                    self.status = format!("Deleted annotation “{}”", a.name);
+                    self.modal = Some(Modal::AnnotationColor(AnnotationColorDialog::new(od)));
                 }
             }
+            Message::AnnotationColorEdit(m) => {
+                if let Some(Modal::AnnotationColor(d)) = self.modal.as_mut() {
+                    d.color.update(m);
+                }
+            }
+            Message::ApplyAnnotationColor => self.apply_annotation_color(),
+            Message::AskDeleteAnnotation(id) => self.ask_delete_annotations(vec![id]),
+            Message::AskDeleteSelectedAnnotations => {
+                let ids = self.open.as_ref().map(|o| o.selected_annotations.clone()).unwrap_or_default();
+                self.ask_delete_annotations(ids);
+            }
+            Message::DeleteAnnotations(ids) => self.delete_annotations(&ids),
             Message::OpenSerialAnnotation => {
                 if self.refuse_read_only("annotations") {
                     return Task::none();
@@ -2105,7 +2109,7 @@ impl App {
                 return Task::none();
             }
             ViewMsg::ClickAnnotation(id) => {
-                self.select_annotation(id, false, self.settings.view.auto_report);
+                self.click_annotation(id, false);
                 return Task::none();
             }
             ViewMsg::OpenAnnotation(id) => return self.update(Message::AnnotationProperties(id)),
@@ -2114,11 +2118,15 @@ impl App {
                 return Task::none();
             }
             ViewMsg::Context { pos, annotation, col } => {
-                // Right-click selects the annotation, like the library entries;
-                // the oligo report stays as it is.
+                // Right-click selects the annotation, like the library entries
+                // (one of several selected keeps them); the oligo report stays as it is.
                 if let Some(id) = annotation {
                     let popup = self.open.as_ref().is_some_and(|o| o.popup_open);
-                    self.select_annotation(id, false, popup);
+                    if self.open.as_ref().is_some_and(|o| o.selected_annotations.contains(&id)) {
+                        self.focus_annotation(id, false, popup);
+                    } else {
+                        self.select_annotation(id, false, popup);
+                    }
                 }
                 self.menu = None;
                 self.context = Some(ContextMenu { target: ContextTarget::Viewer { annotation, col }, pos });
@@ -2162,7 +2170,7 @@ impl App {
             }
             ViewMsg::Select { anchor, to, finished } => {
                 od.selection = Some(Selection::new(anchor, to));
-                od.selected_annotation = None;
+                od.clear_annotation_selection();
                 if !finished {
                     // The report belongs to the previous selection until the drag ends.
                     od.popup_open = false;
@@ -2254,9 +2262,9 @@ impl App {
             return Task::none();
         }
         if let Key::Named(Named::Delete) = key
-            && let Some(id) = self.open.as_ref().and_then(|o| o.selected_annotation)
+            && self.open.as_ref().is_some_and(|o| !o.selected_annotations.is_empty())
         {
-            return self.update(Message::AskDeleteAnnotation(id));
+            return self.update(Message::AskDeleteSelectedAnnotations);
         }
         if modifiers.command() {
             if let Key::Character(c) = &key {
@@ -2321,7 +2329,7 @@ impl App {
         let (c0, c1) = (c0.min(c1), c0.max(c1));
         if b.is_some() {
             od.selection = Some(Selection::new(c0, c1));
-            od.selected_annotation = None;
+            od.clear_annotation_selection();
             let opts = self.settings.primer;
             od.evaluate_selection(&opts);
             od.popup_open = self.settings.view.auto_report;
@@ -2374,7 +2382,7 @@ impl App {
         }
         od.clamp_view();
         od.selection = Some(Selection { anchor: h.c0, c0: h.c0, c1: h.c1 });
-        od.selected_annotation = None;
+        od.clear_annotation_selection();
         od.evaluate_selection(&opts);
     }
 
@@ -2428,10 +2436,36 @@ impl App {
         };
     }
 
-    /// Selects an annotation and makes its range the column selection; primer
-    /// annotations set the report orientation. `reveal` scrolls to it;
-    /// `popup` is whether the oligo report is shown afterwards.
+    /// A click on an annotation (side panel or viewer) selects it alone;
+    /// Ctrl+click adds it to the selection or removes it, Shift+click selects
+    /// the annotations from the last one clicked to it (in list order).
+    fn click_annotation(&mut self, id: i64, reveal: bool) {
+        let popup = self.settings.view.auto_report;
+        let (ctrl, shift) = (self.modifiers.control(), self.modifiers.shift());
+        let Some(od) = self.open.as_mut() else { return };
+        match od.click_annotation(id, ctrl, shift) {
+            Some(current) => self.focus_annotation(current, reveal && current == id, popup),
+            None => {
+                od.selection = None;
+                od.report = None;
+                od.popup_open = false;
+            }
+        }
+    }
+
+    /// Selects only this annotation; see [`App::focus_annotation`].
     fn select_annotation(&mut self, id: i64, reveal: bool, popup: bool) {
+        let Some(od) = self.open.as_mut() else { return };
+        od.selected_annotations.clear();
+        od.annotation_anchor = Some(id);
+        self.focus_annotation(id, reveal, popup);
+    }
+
+    /// Makes an annotation the current one (added to the selection) and its
+    /// range the column selection; primer annotations set the report
+    /// orientation. `reveal` scrolls to it; `popup` is whether the oligo
+    /// report is shown afterwards.
+    fn focus_annotation(&mut self, id: i64, reveal: bool, popup: bool) {
         let Some(od) = self.open.as_mut() else { return };
         let Some(a) = od.annotation(id).cloned() else { return };
         match a.kind {
@@ -2439,7 +2473,8 @@ impl App {
             AnnotationKind::ForwardPrimer => self.settings.primer.orientation = Orientation::Forward,
             _ => {}
         }
-        od.selected_annotation = Some(id);
+        od.selected_annotations.retain(|&x| x != id);
+        od.selected_annotations.push(id);
         od.selection = Some(Selection { anchor: a.start, c0: a.start, c1: a.end });
         od.evaluate_selection(&self.settings.primer);
         od.popup_open = popup;
@@ -2459,7 +2494,11 @@ impl App {
         let Some(od) = self.open.as_mut() else { return };
         let Some(i) = od.annotations.iter().position(|a| a.id == id) else { return };
         (od.annotations[i].start, od.annotations[i].end) = (start, end);
-        od.selected_annotation = Some(id);
+        if od.selected_annotation() != Some(id) {
+            // Dragged edge: the annotation becomes the current one (others stay selected).
+            od.selected_annotations.retain(|&x| x != id);
+            od.selected_annotations.push(id);
+        }
         od.selection = Some(Selection { anchor: start, c0: start, c1: end });
         if !done {
             // The report belongs to the old range until the drag ends.
@@ -2485,11 +2524,11 @@ impl App {
         }
         let Some(Modal::Annotation(d)) = self.modal.as_ref() else { return };
         let (Ok((c0, c1)), None) = (d.range(), d.problem()) else { return };
-        let (id, name, kind) = (d.id, d.name.trim().to_string(), d.kind);
+        let (id, name, kind, color) = (d.id, d.name.trim().to_string(), d.kind, d.color.color);
         let source = self.settings.primer.source;
         let Some(od) = self.open.as_mut() else { return };
         let note = od.oligo(source, kind, c0, c1);
-        let mut a = Annotation { id: id.unwrap_or(0), name, kind, start: c0, end: c1, note };
+        let mut a = Annotation { id: id.unwrap_or(0), name, kind, start: c0, end: c1, note, color };
         let saved = match id {
             None => self.db.add_annotation(od.info.id, &a).map(|new| {
                 a.id = new;
@@ -2523,14 +2562,14 @@ impl App {
         if d.problem().is_some() {
             return;
         }
-        let (placements, (not_found, skipped)) = (d.placements(), d.not_placed());
+        let (placements, (not_found, skipped), color) = (d.placements(), d.not_placed(), d.color.color);
         let source = self.settings.primer.source;
         let Some(od) = self.open.as_mut() else { return };
         let mut added = 0usize;
         for (name, p) in placements {
             let kind = if p.reverse { AnnotationKind::ReversePrimer } else { AnnotationKind::ForwardPrimer };
             let note = od.oligo(source, kind, p.c0, p.c1);
-            let mut a = Annotation { id: 0, name, kind, start: p.c0, end: p.c1, note };
+            let mut a = Annotation { id: 0, name, kind, start: p.c0, end: p.c1, note, color };
             match self.db.add_annotation(od.info.id, &a) {
                 Ok(id) => {
                     a.id = id;
@@ -2552,6 +2591,75 @@ impl App {
         if skipped > 0 {
             self.status.push_str(&format!("; {skipped} skipped"));
         }
+    }
+
+    /// Asks whether to delete annotations (in document order).
+    fn ask_delete_annotations(&mut self, ids: Vec<i64>) {
+        let Some(od) = self.open.as_ref() else { return };
+        let anns: Vec<_> = od.annotations.iter().filter(|a| ids.contains(&a.id)).collect();
+        let (name, detail) = match anns.as_slice() {
+            [] => return,
+            [a] => (a.name.clone(), format!("{} · {}", a.kind, annotation_range_label(od, a.start, a.end))),
+            _ => (String::new(), dialogs::name_list(&anns.iter().map(|a| a.name.as_str()).collect::<Vec<_>>())),
+        };
+        let ids = anns.iter().map(|a| a.id).collect();
+        self.modal = Some(Modal::ConfirmDeleteAnnotations { ids, name, detail });
+    }
+
+    fn delete_annotations(&mut self, ids: &[i64]) {
+        self.modal = None;
+        if let Err(e) = self.db.delete_annotations(ids) {
+            self.error = Some(e);
+            return;
+        }
+        let Some(od) = self.open.as_mut() else { return };
+        let current = od.selected_annotation();
+        let names: Vec<String> = od.annotations.iter().filter(|a| ids.contains(&a.id)).map(|a| a.name.clone()).collect();
+        od.annotations.retain(|a| !ids.contains(&a.id));
+        od.selected_annotations.retain(|x| !ids.contains(x));
+        if od.annotation_anchor.is_some_and(|x| ids.contains(&x)) {
+            od.annotation_anchor = None;
+        }
+        self.status = match names.as_slice() {
+            [one] => format!("Deleted annotation “{one}”"),
+            _ => format!("Deleted {} annotations", names.len()),
+        };
+        // Another selected annotation is left: it becomes the current one.
+        if let Some(next) = od.selected_annotation()
+            && Some(next) != current
+        {
+            let popup = od.popup_open;
+            self.focus_annotation(next, false, popup);
+        }
+    }
+
+    /// Gives the annotations of the color dialog its color.
+    fn apply_annotation_color(&mut self) {
+        if self.refuse_read_only("annotations") {
+            return;
+        }
+        let Some(Modal::AnnotationColor(d)) = self.modal.as_ref() else { return };
+        if d.color.problem().is_some() {
+            return;
+        }
+        let (ids, color) = (d.ids.clone(), d.color.color);
+        let Some(od) = self.open.as_mut() else { return };
+        if let Err(e) = self.db.set_annotation_color(&ids, color) {
+            self.error = Some(e);
+            return;
+        }
+        for a in od.annotations.iter_mut().filter(|a| ids.contains(&a.id)) {
+            a.color = color;
+        }
+        self.modal = None;
+        let what = match ids.len() {
+            1 => "1 annotation".to_string(),
+            n => format!("{n} annotations"),
+        };
+        self.status = match color {
+            Some(c) => format!("Color of {what} set to {}", c.hex()),
+            None => format!("Color of {what} set to the color of its type"),
+        };
     }
 
     fn apply_metadata(&mut self, f: impl FnOnce(&mut [Row]) -> String) {

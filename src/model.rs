@@ -277,6 +277,33 @@ pub struct Annotation {
     pub start: usize,
     pub end: usize,
     pub note: String,
+    /// Own color; `None`: the color of its type.
+    pub color: Option<Rgb>,
+}
+
+/// An sRGB color chosen by the user, written `#RRGGBB`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Rgb(pub u8, pub u8, pub u8);
+
+impl Rgb {
+    /// Parses `#RRGGBB` or `#RGB` (the `#` is optional, any case).
+    pub fn parse(s: &str) -> Option<Rgb> {
+        let s = s.trim();
+        let s = s.strip_prefix('#').unwrap_or(s);
+        if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let digit = |i: usize, n: usize| u8::from_str_radix(&s[i..i + n], 16).ok();
+        match s.len() {
+            6 => Some(Rgb(digit(0, 2)?, digit(2, 2)?, digit(4, 2)?)),
+            3 => Some(Rgb(digit(0, 1)? * 17, digit(1, 1)? * 17, digit(2, 1)? * 17)),
+            _ => None,
+        }
+    }
+
+    pub fn hex(self) -> String {
+        format!("#{:02X}{:02X}{:02X}", self.0, self.1, self.2)
+    }
 }
 
 /// Per-column residue counts over all rows except the reference.
@@ -769,5 +796,16 @@ mod tests {
         assert_eq!(rc.columns(0, 2), None);
         assert_eq!(rc.columns(3, 5), None);
         assert_eq!(rc.columns(3, 2), None);
+    }
+
+    #[test]
+    fn rgb_hex() {
+        assert_eq!(Rgb::parse("#e0457b"), Some(Rgb(0xE0, 0x45, 0x7B)));
+        assert_eq!(Rgb::parse(" E0457B "), Some(Rgb(0xE0, 0x45, 0x7B)));
+        assert_eq!(Rgb::parse("#f80"), Some(Rgb(0xFF, 0x88, 0x00)));
+        for bad in ["", "#", "#12345", "#1234567", "#GG0000", "+12345", "#é1234"] {
+            assert_eq!(Rgb::parse(bad), None, "{bad}");
+        }
+        assert_eq!(Rgb(0xE0, 0x45, 0x7B).hex(), "#E0457B");
     }
 }

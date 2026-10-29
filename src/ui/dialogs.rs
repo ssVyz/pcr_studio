@@ -9,7 +9,7 @@ use crate::fasta::{self, PastedRecord};
 use crate::linked::group::{self, Grouping, Proposal};
 use crate::linked::{self, FileState, Layout, LinkedSet, Technology};
 use crate::mapper::{MapParams, Sensitivity};
-use crate::model::{AnnotationKind, DocInfo, DocKind, RefCoords, Row};
+use crate::model::{AnnotationKind, DocInfo, DocKind, RefCoords, Rgb, Row};
 use crate::primer::{OligoSource, Orientation};
 use crate::search::{self, Placement};
 use crate::seq::{self, GAP};
@@ -48,8 +48,10 @@ pub fn focus_annotation<T: Send + 'static>() -> Task<T> {
 pub enum Modal {
     Sequence(SequenceDialog),
     Annotation(AnnotationDialog),
-    ConfirmDeleteAnnotation { id: i64, name: String, detail: String },
+    /// `detail`: type and range of one annotation, the names of several.
+    ConfirmDeleteAnnotations { ids: Vec<i64>, name: String, detail: String },
     SerialAnnotation(SerialAnnotationDialog),
+    AnnotationColor(AnnotationColorDialog),
     Map(MapDialog),
     Export(ExportDialog),
     Settings(SettingsDialog),
@@ -346,6 +348,178 @@ impl SequenceDialog {
     }
 }
 
+// ---------------------------------------------------------------- annotation color
+
+/// Color choice of the annotation dialogs: the color of the annotation type,
+/// a preset, or any color as `#RRGGBB`.
+pub struct ColorField {
+    /// `None`: the color of the type.
+    pub color: Option<Rgb>,
+    /// Text of the hex field; empty for the type color.
+    hex: String,
+    /// The annotations concerned have different colors and none is chosen yet.
+    mixed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum ColorMsg {
+    Pick(Option<Rgb>),
+    Hex(String),
+}
+
+impl ColorField {
+    pub fn new(color: Option<Rgb>) -> ColorField {
+        ColorField { color, hex: color.map(Rgb::hex).unwrap_or_default(), mixed: false }
+    }
+
+    /// The common color of annotations, or no choice when they differ.
+    pub fn common(colors: impl IntoIterator<Item = Option<Rgb>>) -> ColorField {
+        let mut colors = colors.into_iter();
+        let first = colors.next().flatten();
+        let mut field = ColorField::new(first);
+        field.mixed = colors.any(|c| c != first);
+        if field.mixed {
+            (field.color, field.hex) = (None, String::new());
+        }
+        field
+    }
+
+    pub fn update(&mut self, m: ColorMsg) {
+        match m {
+            ColorMsg::Pick(c) => *self = ColorField::new(c),
+            ColorMsg::Hex(s) => {
+                if s.trim().is_empty() {
+                    self.color = None;
+                } else if let Some(c) = Rgb::parse(&s) {
+                    self.color = Some(c);
+                }
+                self.hex = s;
+                self.mixed = false;
+            }
+        }
+    }
+
+    pub fn problem(&self) -> Option<String> {
+        if self.mixed {
+            return Some("Choose a color.".into());
+        }
+        (!self.hex.trim().is_empty() && Rgb::parse(&self.hex).is_none()).then(|| "Enter the color as #RRGGBB.".into())
+    }
+
+    /// “By type” (with the colors of `kinds`) and the presets in one row,
+    /// the hex field below.
+    pub fn view(&self, kinds: Vec<AnnotationKind>, on: fn(ColorMsg) -> Message) -> Element<'_, Message> {
+        let by_type = !self.mixed && self.color.is_none();
+        let chips = row(kinds.into_iter().map(|k| {
+            container(Space::new().width(10).height(10))
+                .style(move |t: &iced::Theme| container::Style {
+                    background: Some(style::Palette::for_theme(t).annotation_kind(k).into()),
+                    border: iced::Border { radius: 2.0.into(), ..Default::default() },
+                    ..Default::default()
+                })
+                .into()
+        }))
+        .spacing(2);
+        let presets = row(style::ANNOTATION_COLORS.iter().map(|&c| {
+            let chosen = !self.mixed && self.color == Some(c);
+            button(Space::new().width(18).height(18))
+                .padding(0)
+                .style(move |t: &iced::Theme, s| swatch(t, s, style::from_rgb(c), chosen))
+                .on_press(on(ColorMsg::Pick(Some(c))))
+                .into()
+        }))
+        .spacing(5);
+        let first = row![
+            button(row![text("By type").size(12), chips].spacing(6).align_y(iced::Center))
+                .padding([3, 8])
+                .style(if by_type { button::primary } else { button::secondary })
+                .on_press(on(ColorMsg::Pick(None))),
+            presets,
+        ]
+        .spacing(10)
+        .align_y(iced::Center);
+        let note: Element<Message> = match (self.problem(), self.color) {
+            _ if self.mixed => text("The annotations have different colors.").size(12).style(style::muted).into(),
+            (Some(e), _) => text(e).size(12).style(style::danger_text).into(),
+            (None, Some(c)) => container(Space::new().width(18).height(18))
+                .style(move |t: &iced::Theme| container::Style {
+                    background: Some(style::from_rgb(c).into()),
+                    border: iced::Border { color: t.extended_palette().background.strong.color, width: 1.0, radius: 4.0.into() },
+                    ..Default::default()
+                })
+                .into(),
+            (None, None) => text("Each annotation in the color of its type.").size(12).style(style::muted).into(),
+        };
+        let second = row![
+            text("Hex").size(12).style(style::muted),
+            text_input("#RRGGBB", &self.hex).on_input(move |s| on(ColorMsg::Hex(s))).padding(4).size(13).width(90),
+            note,
+        ]
+        .spacing(8)
+        .align_y(iced::Center);
+        column![first, second].spacing(8).into()
+    }
+}
+
+/// A preset color button: framed in the text color when chosen.
+fn swatch(theme: &iced::Theme, status: button::Status, color: iced::Color, chosen: bool) -> button::Style {
+    let p = theme.extended_palette();
+    let (edge, width) = match (chosen, status) {
+        (true, _) => (p.background.base.text, 2.5),
+        (false, button::Status::Hovered) => (p.background.base.text, 1.0),
+        _ => (p.background.strong.color, 1.0),
+    };
+    button::Style { background: Some(color.into()), border: iced::Border { color: edge, width, radius: 4.0.into() }, ..Default::default() }
+}
+
+/// Names of annotations for a dialog: the first few, then how many more.
+pub fn name_list<S: AsRef<str>>(names: &[S]) -> String {
+    const SHOWN: usize = 8;
+    let mut s = names.iter().take(SHOWN).map(|n| n.as_ref()).collect::<Vec<_>>().join(", ");
+    if names.len() > SHOWN {
+        s.push_str(&format!(" and {} more", group_digits(names.len() - SHOWN)));
+    }
+    s
+}
+
+/// Gives the selected annotations one color.
+pub struct AnnotationColorDialog {
+    pub ids: Vec<i64>,
+    /// Names of the annotations, in document order.
+    names: Vec<String>,
+    kinds: Vec<AnnotationKind>,
+    pub color: ColorField,
+}
+
+impl AnnotationColorDialog {
+    pub fn new(od: &OpenDoc) -> AnnotationColorDialog {
+        let anns: Vec<_> = od.annotations.iter().filter(|a| od.selected_annotations.contains(&a.id)).collect();
+        AnnotationColorDialog {
+            ids: anns.iter().map(|a| a.id).collect(),
+            names: anns.iter().map(|a| a.name.clone()).collect(),
+            kinds: AnnotationKind::ALL.into_iter().filter(|&k| anns.iter().any(|a| a.kind == k)).collect(),
+            color: ColorField::common(anns.iter().map(|a| a.color)),
+        }
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let body = column![text(name_list(&self.names)).size(12).style(style::muted), self.color.view(self.kinds.clone(), Message::AnnotationColorEdit)].spacing(14);
+        let problem = self.color.problem();
+        let buttons = row![
+            text(problem.clone().unwrap_or_default()).size(12).style(style::muted).width(Fill),
+            button("Cancel").on_press(Message::CloseModal).style(button::secondary),
+            button("Apply").on_press_maybe(problem.is_none().then_some(Message::ApplyAnnotationColor)).style(button::primary),
+        ]
+        .spacing(10)
+        .align_y(iced::Center);
+        let title = match self.ids.len() {
+            1 => "Annotation color".to_string(),
+            n => format!("Color of {} annotations", group_digits(n)),
+        };
+        dialog_frame_owned(title, body.into(), buttons.into(), 560.0)
+    }
+}
+
 // ---------------------------------------------------------------- annotation properties
 
 /// Creates an annotation from the selection or edits one: name, type, range.
@@ -356,6 +530,7 @@ pub struct AnnotationDialog {
     pub kind: AnnotationKind,
     pub start: String,
     pub end: String,
+    pub color: ColorField,
     /// Columns and field texts when the dialog opened. A field the user does
     /// not change keeps its column (reference positions cannot address
     /// insertion columns).
@@ -371,6 +546,7 @@ pub enum AnnotationMsg {
     Kind(AnnotationKind),
     Start(String),
     End(String),
+    Color(ColorMsg),
 }
 
 /// Range fields for columns `[c0, c1)`: 1-based reference positions, or columns.
@@ -382,7 +558,7 @@ fn range_text(c0: usize, c1: usize, coords: Option<&RefCoords>) -> (String, Stri
 }
 
 impl AnnotationDialog {
-    pub fn new(id: Option<i64>, name: String, kind: AnnotationKind, c0: usize, c1: usize, od: &OpenDoc) -> AnnotationDialog {
+    pub fn new(id: Option<i64>, name: String, kind: AnnotationKind, color: Option<Rgb>, c0: usize, c1: usize, od: &OpenDoc) -> AnnotationDialog {
         // Reference positions when the range holds reference bases.
         let coords = od.ref_coords.clone().filter(|rc| rc.range(c0, c1).is_some());
         let (start, end) = range_text(c0, c1, coords.as_ref());
@@ -393,6 +569,7 @@ impl AnnotationDialog {
             initial: (c0, c1, start.clone(), end.clone()),
             start,
             end,
+            color: ColorField::new(color),
             coords,
             width: od.width(),
         }
@@ -404,6 +581,7 @@ impl AnnotationDialog {
             AnnotationMsg::Kind(k) => self.kind = k,
             AnnotationMsg::Start(s) => self.start = s,
             AnnotationMsg::End(s) => self.end = s,
+            AnnotationMsg::Color(m) => self.color.update(m),
         }
     }
 
@@ -435,7 +613,7 @@ impl AnnotationDialog {
         if self.name.trim().is_empty() {
             return Some("Enter a name.".into());
         }
-        self.range().err()
+        self.range().err().or_else(|| self.color.problem())
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -477,6 +655,11 @@ impl AnnotationDialog {
                 .spacing(8)
                 .align_y(iced::Center),
             row![Space::new().width(Length::Fixed(104.0)), info],
+            row![
+                container(label("Color")).padding(iced::Padding { top: 4.0, ..Default::default() }),
+                self.color.view(vec![self.kind], |m| Message::AnnotationEdit(AnnotationMsg::Color(m)))
+            ]
+            .spacing(8),
         ]
         .spacing(10);
         let mut buttons = row![].spacing(10).align_y(iced::Center);
@@ -487,7 +670,7 @@ impl AnnotationDialog {
         buttons = buttons.push(Space::new().width(Fill)).push(button("Cancel").on_press(Message::CloseModal).style(button::secondary)).push(
             button(if self.id.is_some() { "Save" } else { "Add" }).on_press_maybe(ok.then_some(Message::SaveAnnotation)).style(button::primary),
         );
-        dialog_frame(if self.id.is_some() { "Annotation properties" } else { "New annotation" }, body.into(), buttons.into(), 520.0)
+        dialog_frame(if self.id.is_some() { "Annotation properties" } else { "New annotation" }, body.into(), buttons.into(), 580.0)
     }
 }
 
@@ -522,6 +705,8 @@ pub struct SerialAnnotationDialog {
     pub rows: Vec<SerialRow>,
     /// Characters that are not nucleotide codes (read as N).
     unknown: usize,
+    /// Color of all annotations created.
+    pub color: ColorField,
 }
 
 pub struct SerialRow {
@@ -545,6 +730,7 @@ pub enum SerialOutcome {
 pub enum SerialMsg {
     Edit(text_editor::Action),
     MaxMismatches(String),
+    Color(ColorMsg),
 }
 
 const SERIAL_MAX_MISMATCHES: usize = 3;
@@ -568,6 +754,7 @@ impl SerialAnnotationDialog {
             cache: HashMap::new(),
             rows: Vec::new(),
             unknown: 0,
+            color: ColorField::new(None),
         }
     }
 
@@ -590,6 +777,7 @@ impl SerialAnnotationDialog {
                     self.refresh();
                 }
             }
+            SerialMsg::Color(m) => self.color.update(m),
         }
     }
 
@@ -672,7 +860,7 @@ impl SerialAnnotationDialog {
         if !self.rows.iter().any(|r| matches!(r.outcome, SerialOutcome::Placed(_))) {
             return Some("No oligo can be placed.".into());
         }
-        None
+        self.color.problem()
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -703,6 +891,11 @@ impl SerialAnnotationDialog {
             ]
             .spacing(8)
             .align_y(iced::Center),
+            row![
+                container(text("Color").size(13)).padding(iced::Padding { top: 4.0, ..Default::default() }),
+                self.color.view(vec![AnnotationKind::ForwardPrimer, AnnotationKind::ReversePrimer], |m| Message::SerialAnnotation(SerialMsg::Color(m))),
+            ]
+            .spacing(8),
         ]
         .spacing(10);
 
@@ -2254,20 +2447,23 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
         Modal::Sequence(d) => d.view(),
         Modal::Annotation(d) => d.view(),
         Modal::SerialAnnotation(d) => d.view(),
-        Modal::ConfirmDeleteAnnotation { id, name, detail } => {
+        Modal::AnnotationColor(d) => d.view(),
+        Modal::ConfirmDeleteAnnotations { ids, name, detail } => {
+            let one = ids.len() == 1;
+            let question = if one { format!("Delete the annotation “{name}”?") } else { format!("Delete {} annotations?", group_digits(ids.len())) };
             let body = column![
-                text(format!("Delete the annotation “{name}”?")).size(14),
+                text(question).size(14),
                 text(detail.as_str()).size(12).style(style::muted),
-                irreversible("The annotation is removed permanently."),
+                irreversible(if one { "The annotation is removed permanently." } else { "The annotations are removed permanently." }),
             ]
             .spacing(10);
             let buttons = row![
                 Space::new().width(Fill),
                 button("Cancel").on_press(Message::CloseModal).style(button::secondary),
-                button("Delete").on_press(Message::DeleteAnnotation(*id)).style(button::danger),
+                button("Delete").on_press(Message::DeleteAnnotations(ids.clone())).style(button::danger),
             ]
             .spacing(10);
-            dialog_frame("Delete annotation", body.into(), buttons.into(), 420.0)
+            dialog_frame(if one { "Delete annotation" } else { "Delete annotations" }, body.into(), buttons.into(), 460.0)
         }
         Modal::Map(d) => d.view(),
         Modal::Export(d) => d.view(),
@@ -2401,7 +2597,7 @@ mod tests {
     fn annotation_range_fields() {
         // Reference positions; the reference has an insertion at columns 2-3.
         let od = open(&["AC--GTAC", "ACTTGTAC"], Some(0));
-        let mut d = AnnotationDialog::new(None, "a".into(), AnnotationKind::Region, 1, 5, &od);
+        let mut d = AnnotationDialog::new(None, "a".into(), AnnotationKind::Region, None, 1, 5, &od);
         assert_eq!((d.start.as_str(), d.end.as_str()), ("2", "3"));
         assert_eq!(d.range(), Ok((1, 5)));
         // A changed field is converted; the unchanged one keeps its column.
@@ -2415,11 +2611,40 @@ mod tests {
         assert!(d.range().is_err());
         // Without a reference the fields are alignment columns.
         let od = open(&["ACGT", "ACGA"], None);
-        let mut d = AnnotationDialog::new(Some(3), "b".into(), AnnotationKind::Probe, 0, 2, &od);
+        let mut d = AnnotationDialog::new(Some(3), "b".into(), AnnotationKind::Probe, None, 0, 2, &od);
         assert_eq!((d.start.as_str(), d.end.as_str()), ("1", "2"));
         d.end = "4".into();
         assert_eq!(d.range(), Ok((0, 4)));
         d.name = " ".into();
         assert_eq!(d.problem().as_deref(), Some("Enter a name."));
+        d.name = "b".into();
+        d.update(AnnotationMsg::Color(ColorMsg::Hex("#12".into())));
+        assert_eq!(d.problem().as_deref(), Some("Enter the color as #RRGGBB."));
+    }
+
+    #[test]
+    fn color_field() {
+        let red = Rgb(0xD6, 0x3C, 0x3C);
+        let mut f = ColorField::new(None);
+        assert_eq!((f.color, f.problem()), (None, None));
+        f.update(ColorMsg::Pick(Some(red)));
+        assert_eq!((f.color, f.hex.as_str()), (Some(red), "#D63C3C"));
+        // An unfinished hex code keeps the last valid color but cannot be confirmed.
+        f.update(ColorMsg::Hex("#12".into()));
+        assert_eq!(f.color, Some(red));
+        assert!(f.problem().is_some());
+        f.update(ColorMsg::Hex("#123456".into()));
+        assert_eq!((f.color, f.problem()), (Some(Rgb(0x12, 0x34, 0x56)), None));
+        // An empty field is the type color.
+        f.update(ColorMsg::Hex(" ".into()));
+        assert_eq!((f.color, f.problem()), (None, None));
+
+        // Several annotations: their common color, else no choice yet.
+        let f = ColorField::common([Some(red), Some(red)]);
+        assert_eq!((f.color, f.problem()), (Some(red), None));
+        let mut f = ColorField::common([Some(red), None]);
+        assert_eq!((f.color, f.problem().as_deref()), (None, Some("Choose a color.")));
+        f.update(ColorMsg::Pick(None));
+        assert_eq!((f.color, f.problem()), (None, None));
     }
 }

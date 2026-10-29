@@ -5,7 +5,7 @@
 
 use super::Message;
 use super::state::{Highlight, Hover, OpenDoc, ReadDisplay, ViewPrefs};
-use super::style::Palette;
+use super::style::{self, Palette};
 use crate::display::Item;
 use crate::model::{Annotation, Row};
 use crate::seq::GAP;
@@ -238,7 +238,7 @@ impl AlignmentView<'_> {
                 continue;
             }
             let Some((part, dist)) = annotation_part(self.x_col(lay, a.start), self.x_col(lay, a.end), p.x) else { continue };
-            let score = if self.od.selected_annotation == Some(a.id) { dist - 100.0 } else { dist };
+            let score = if self.od.selected_annotation() == Some(a.id) { dist - 100.0 } else { dist };
             if best.is_none_or(|b| score < b.2) {
                 best = Some((i, part, score));
             }
@@ -923,7 +923,7 @@ impl Drawer<'_, '_> {
             for a in &od.annotations {
                 let x0 = col_x(a.start);
                 let x1 = col_x(a.end).max(x0 + 2.0);
-                f.fill_rectangle(Point::new(x0, y), Size::new(x1 - x0, 3.0), pal.annotation(a.kind));
+                f.fill_rectangle(Point::new(x0, y), Size::new(x1 - x0, 3.0), pal.annotation(a));
             }
             for h in od.search.hits.iter().take(2000) {
                 f.fill_rectangle(Point::new(col_x(h.c0), y + h_off(h.row.is_none())), Size::new(1.5, 3.0), pal.hit);
@@ -1068,15 +1068,17 @@ impl Drawer<'_, '_> {
                 let x0 = self.v.x_of(lay, a0 as f32).max(lay.seq_x0 - 20.0);
                 let x1 = self.v.x_of(lay, a1 as f32).min(lay.seq_x0 + lay.seq_w + 20.0);
                 self.arrow(f, x0, x1, y + 1.0, LANE_H - 3.0, a);
-                if od.selected_annotation == Some(a.id) {
-                    // Outline plus grips on both edges (they can be dragged).
+                if od.selected_annotations.contains(&a.id) {
+                    // Outline; the current one also gets grips on both edges (they can be dragged).
                     let (ya, ha) = (y + 1.0, LANE_H - 3.0);
                     f.stroke(
                         &Path::rectangle(Point::new(x0 - 1.0, ya - 1.0), Size::new(x1 - x0 + 2.0, ha + 2.0)),
                         Stroke::default().with_color(pal.text).with_width(1.5),
                     );
-                    for x in [x0, x1] {
-                        f.fill_rectangle(Point::new(x - 2.0, ya - 2.0), Size::new(4.0, ha + 4.0), pal.selection_edge);
+                    if od.selected_annotation() == Some(a.id) {
+                        for x in [x0, x1] {
+                            f.fill_rectangle(Point::new(x - 2.0, ya - 2.0), Size::new(4.0, ha + 4.0), pal.selection_edge);
+                        }
                     }
                 }
             }
@@ -1095,7 +1097,7 @@ impl Drawer<'_, '_> {
     }
 
     fn arrow(&self, f: &mut Frame, x0: f32, x1: f32, y: f32, h: f32, a: &Annotation) {
-        let color = self.pal.annotation(a.kind);
+        let color = self.pal.annotation(a);
         let head = (h * 0.6).min((x1 - x0) * 0.4).max(0.0);
         let path = Path::new(|p| match a.kind.direction() {
             1 => {
@@ -1122,7 +1124,7 @@ impl Drawer<'_, '_> {
             f.fill_text(Text {
                 content: a.name.clone(),
                 position: Point::new((x0 + x1) / 2.0, y + h / 2.0),
-                color: Color::WHITE,
+                color: style::annotation_text(color),
                 size: Pixels(11.0),
                 align_x: iced::widget::text::Alignment::Center,
                 align_y: Vertical::Center,
@@ -1321,7 +1323,7 @@ mod tests {
 
     #[test]
     fn lanes() {
-        let a = |s, e| Annotation { id: 0, name: String::new(), kind: crate::model::AnnotationKind::Region, start: s, end: e, note: String::new() };
+        let a = |s, e| Annotation { id: 0, name: String::new(), kind: crate::model::AnnotationKind::Region, start: s, end: e, note: String::new(), color: None };
         let l = annotation_lanes(&[a(0, 10), a(5, 15), a(10, 20)]);
         assert_eq!(l, vec![0, 1, 0]);
     }

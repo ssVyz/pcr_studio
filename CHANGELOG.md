@@ -7,6 +7,39 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.1.3] - 2026-10-29
+
+### Added
+
+- **Deleting several annotations at once**: with several annotations selected (Ctrl/Shift+click),
+  **Delete** (key), the Edit menu and the viewer's right-click menu (“Delete N annotations…”) and
+  the **Delete…** button of the annotation list delete all of them after one confirmation, which
+  lists their names. The ✕ of a list entry and **Delete…** in the properties dialog still delete
+  only that annotation.
+
+## [0.1.2] - 2026-10-29
+
+### Added
+
+- **Annotation colors**: an annotation can have its own color instead of the color of its type.
+  The color is chosen in **Annotation properties** (also for new annotations): **By type**
+  (the default, as before), one of 12 preset colors, or any color as a hex code (`#RRGGBB`).
+  The color is used in the viewer, the overview and the annotation list, in light and dark mode.
+  Labels on light colors are written in dark text.
+- **Serial annotation…** has the same color choice; all annotations it creates get that color.
+- **Coloring several annotations at once**: Ctrl+click in the annotation list (or on annotations
+  in the viewer) adds or removes one, Shift+click selects a run in list order. With several
+  selected, the list shows **Color…**, which is also in the Edit menu and the viewer's right-click
+  menu (“Color of N annotations…”). The dialog starts from the annotations' common color; when
+  they differ, a color must be chosen. **By type** resets them to their type colors.
+  - Selected annotations are outlined in the viewer; the current one (the last clicked) has the
+    edge grips, sets the column selection and is the one **Delete** removes.
+
+### Changed
+
+- The library stores a color per annotation; existing libraries are upgraded on start (all
+  existing annotations keep the colors of their types).
+
 ## [0.1.1] - 2026-10-26
 
 ### Added

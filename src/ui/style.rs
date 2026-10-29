@@ -162,10 +162,7 @@ impl Palette {
 
     /// Text on a cell of quality `q`: dark or light, whichever contrasts more.
     pub fn quality_text(&self, q: u8) -> Color {
-        let c = self.quality(q);
-        let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
-        let luminance = 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
-        if luminance > 0.2 { rgb(20, 22, 28) } else { rgb(245, 246, 248) }
+        if luminance(self.quality(q)) > 0.2 { DARK_TEXT } else { LIGHT_TEXT }
     }
 
     pub fn identity(&self, id: f32) -> Color {
@@ -196,7 +193,12 @@ impl Palette {
         }
     }
 
-    pub fn annotation(&self, kind: crate::model::AnnotationKind) -> Color {
+    /// Color of an annotation: its own, else the color of its type.
+    pub fn annotation(&self, a: &crate::model::Annotation) -> Color {
+        a.color.map_or_else(|| self.annotation_kind(a.kind), from_rgb)
+    }
+
+    pub fn annotation_kind(&self, kind: crate::model::AnnotationKind) -> Color {
         use crate::model::AnnotationKind::*;
         match kind {
             ForwardPrimer => self.ann_fwd,
@@ -205,7 +207,49 @@ impl Palette {
             Region => self.ann_region,
         }
     }
+
+    pub fn for_theme(theme: &Theme) -> Palette {
+        if theme.extended_palette().is_dark { Palette::dark() } else { Palette::light() }
+    }
 }
+
+const DARK_TEXT: Color = rgb(20, 22, 28);
+const LIGHT_TEXT: Color = rgb(245, 246, 248);
+
+/// Relative luminance (WCAG) of an sRGB color.
+fn luminance(c: Color) -> f32 {
+    let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+}
+
+/// Label on an annotation of color `c`: white, dark on light colors (the
+/// colors of the annotation types all keep white labels).
+pub fn annotation_text(c: Color) -> Color {
+    if luminance(c) > 0.5 { DARK_TEXT } else { Color::WHITE }
+}
+
+pub const fn from_rgb(c: crate::model::Rgb) -> Color {
+    rgb(c.0, c.1, c.2)
+}
+
+/// Preset colors for annotations, readable in light and dark mode.
+pub const ANNOTATION_COLORS: [crate::model::Rgb; 12] = {
+    use crate::model::Rgb;
+    [
+        Rgb(0xD6, 0x3C, 0x3C), // red
+        Rgb(0xE8, 0x83, 0x2E), // orange
+        Rgb(0xF2, 0xC1, 0x2E), // yellow
+        Rgb(0x8B, 0xC3, 0x4A), // lime
+        Rgb(0x2E, 0x9E, 0x5B), // green
+        Rgb(0x1F, 0xA3, 0x9B), // teal
+        Rgb(0x3B, 0xA7, 0xE0), // sky
+        Rgb(0x34, 0x5F, 0xD0), // blue
+        Rgb(0x7B, 0x5C, 0xD6), // violet
+        Rgb(0xD9, 0x4F, 0xA4), // pink
+        Rgb(0x8D, 0x62, 0x44), // brown
+        Rgb(0x7E, 0x86, 0x92), // gray
+    ]
+};
 
 pub fn app_theme(dark: bool) -> Theme {
     if dark {
@@ -299,3 +343,20 @@ pub fn tool_button(theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::AnnotationKind;
+
+    #[test]
+    fn annotation_labels() {
+        for pal in [Palette::light(), Palette::dark()] {
+            for kind in AnnotationKind::ALL {
+                assert_eq!(annotation_text(pal.annotation_kind(kind)), Color::WHITE, "{kind}");
+            }
+        }
+        assert_eq!(annotation_text(from_rgb(ANNOTATION_COLORS[2])), DARK_TEXT);
+        assert_eq!(annotation_text(from_rgb(ANNOTATION_COLORS[7])), Color::WHITE);
+    }
+}

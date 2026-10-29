@@ -63,7 +63,7 @@ impl Entry {
     }
 
     /// A destructive entry (shown in red).
-    pub fn danger(label: &'static str, action: Option<Message>) -> Entry {
+    pub fn danger(label: impl Into<Cow<'static, str>>, action: Option<Message>) -> Entry {
         Entry::Item { label: label.into(), shortcut: "", action, danger: true, check: None }
     }
 

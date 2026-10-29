@@ -241,8 +241,11 @@ pub struct OpenDoc {
     pub search: SearchState,
     pub jump_text: String,
     pub hover: Option<Hover>,
-    /// Selected annotation (id).
-    pub selected_annotation: Option<i64>,
+    /// Selected annotations (ids); the last one is the current one, whose
+    /// columns are selected (see [`OpenDoc::selected_annotation`]).
+    pub selected_annotations: Vec<i64>,
+    /// Where a Shift+click range of annotations starts.
+    pub annotation_anchor: Option<i64>,
     /// Type of the last annotation added (default for the next one).
     pub annotation_kind: crate::model::AnnotationKind,
     /// Last permanent sort and whether it was descending (repeating it reverses).
@@ -293,7 +296,8 @@ impl OpenDoc {
             search: SearchState::default(),
             jump_text: String::new(),
             hover: None,
-            selected_annotation: None,
+            selected_annotations: Vec::new(),
+            annotation_anchor: None,
             annotation_kind: crate::model::AnnotationKind::ForwardPrimer,
             last_sort: None,
             linked: None,
@@ -628,6 +632,39 @@ impl OpenDoc {
         self.annotations.iter().find(|a| a.id == id)
     }
 
+    /// The current annotation: the last one selected.
+    pub fn selected_annotation(&self) -> Option<i64> {
+        self.selected_annotations.last().copied()
+    }
+
+    pub fn clear_annotation_selection(&mut self) {
+        self.selected_annotations.clear();
+        self.annotation_anchor = None;
+    }
+
+    /// Updates the annotation selection for a click on annotation `id`: alone,
+    /// Ctrl adds or removes it, Shift selects from the anchor to it (in list
+    /// order). Returns the annotation that becomes the current one, `None`
+    /// when none is left selected.
+    pub fn click_annotation(&mut self, id: i64, ctrl: bool, shift: bool) -> Option<i64> {
+        let index = |x: i64| self.annotations.iter().position(|a| a.id == x);
+        if shift && let (Some(i), Some(j)) = (self.annotation_anchor.and_then(index), index(id)) {
+            self.selected_annotations = self.annotations[i.min(j)..=i.max(j)].iter().map(|a| a.id).filter(|&x| x != id).collect();
+        } else if ctrl && self.selected_annotations.contains(&id) {
+            self.selected_annotations.retain(|&x| x != id);
+            self.annotation_anchor = Some(id);
+            return self.selected_annotation();
+        } else {
+            if !ctrl {
+                self.selected_annotations.clear();
+            }
+            self.annotation_anchor = Some(id);
+        }
+        self.selected_annotations.retain(|&x| x != id);
+        self.selected_annotations.push(id);
+        Some(id)
+    }
+
     /// Oligo of columns `[c0, c1)` in the given source, 5'→3' for the
     /// annotation type (reverse complement for reverse primers).
     pub fn oligo(&self, source: OligoSource, kind: crate::model::AnnotationKind, c0: usize, c1: usize) -> String {
@@ -647,5 +684,51 @@ impl OpenDoc {
 
     pub fn item_of_row(&self, row: usize) -> Option<usize> {
         self.items.iter().position(|it| matches!(it, Item::Seq { row: r, .. } if *r == row))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AnnotationKind, DocKind, Row};
+
+    #[test]
+    fn annotation_clicks() {
+        let doc = Document::new(vec![Row::from_gapped("s".into(), String::new(), b"ACGTACGTAC".to_vec())]);
+        let info = DocInfo {
+            id: 1,
+            name: "d".into(),
+            kind: DocKind::Sequences,
+            n_rows: 1,
+            width: doc.width,
+            reference: None,
+            created: String::new(),
+            description: String::new(),
+            folder: None,
+        };
+        // Ids 10..=14 in list order.
+        let anns = (0..5)
+            .map(|i| Annotation { id: 10 + i, name: format!("a{i}"), kind: AnnotationKind::Region, start: i as usize, end: i as usize + 2, note: String::new(), color: None })
+            .collect();
+        let mut od = OpenDoc::new(info, doc, anns, &ViewPrefs::default());
+        // Shift without an anchor selects only the one clicked.
+        assert_eq!(od.click_annotation(11, false, true), Some(11));
+        assert_eq!(od.selected_annotations, [11]);
+        // Ctrl adds; the one clicked becomes the current one.
+        assert_eq!(od.click_annotation(13, true, false), Some(13));
+        assert_eq!(od.selected_annotations, [11, 13]);
+        // Shift selects from the anchor (13) to it, either way round.
+        assert_eq!(od.click_annotation(14, false, true), Some(14));
+        assert_eq!(od.selected_annotations, [13, 14]);
+        assert_eq!(od.click_annotation(10, false, true), Some(10));
+        assert_eq!(od.selected_annotations, [11, 12, 13, 10]);
+        // Ctrl on a selected one removes it; the last one left is current.
+        assert_eq!(od.click_annotation(10, true, false), Some(13));
+        assert_eq!(od.selected_annotations, [11, 12, 13]);
+        // A plain click selects it alone; Ctrl on it then leaves nothing.
+        assert_eq!(od.click_annotation(12, false, false), Some(12));
+        assert_eq!(od.selected_annotations, [12]);
+        assert_eq!(od.click_annotation(12, true, false), None);
+        assert!(od.selected_annotations.is_empty());
     }
 }
