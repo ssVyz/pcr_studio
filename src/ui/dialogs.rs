@@ -11,7 +11,7 @@ use crate::linked::{self, FileState, Layout, LinkedSet, Technology};
 use crate::mapper::{MapParams, Sensitivity};
 use crate::model::{AnnotationKind, DocInfo, DocKind, RefCoords, Rgb, Row};
 use crate::primer::{OligoSource, Orientation};
-use crate::search::{self, Placement};
+use crate::search::{self, Placement, Strands};
 use crate::seq::{self, GAP};
 use crate::thermo::TmConditions;
 use crate::tools::primersearch::{self as ps, Criterion, InputStats, Mode};
@@ -698,8 +698,10 @@ pub struct SerialAnnotationDialog {
     existing: HashSet<String>,
     /// Mismatch limit of the preview (the last valid field value).
     max: usize,
-    /// Placements of the oligos in the text for `max`, so an edit only
-    /// searches the records it changed.
+    /// Strands the oligos may be placed on; one strand gives one primer direction.
+    pub strands: Strands,
+    /// Placements of the oligos in the text for `max` and `strands`, so an
+    /// edit only searches the records it changed.
     cache: HashMap<Vec<u8>, Option<Placement>>,
     /// The parsed records, refreshed on edits.
     pub rows: Vec<SerialRow>,
@@ -730,6 +732,7 @@ pub enum SerialOutcome {
 pub enum SerialMsg {
     Edit(text_editor::Action),
     MaxMismatches(String),
+    Strands(Strands),
     Color(ColorMsg),
 }
 
@@ -751,6 +754,7 @@ impl SerialAnnotationDialog {
             coords: od.ref_coords.clone(),
             existing: od.annotations.iter().map(|a| a.name.clone()).collect(),
             max: SERIAL_MAX_MISMATCHES,
+            strands: Strands::Both,
             cache: HashMap::new(),
             rows: Vec::new(),
             unknown: 0,
@@ -773,6 +777,13 @@ impl SerialAnnotationDialog {
                     && max != self.max
                 {
                     self.max = max;
+                    self.cache.clear();
+                    self.refresh();
+                }
+            }
+            SerialMsg::Strands(strands) => {
+                if strands != self.strands {
+                    self.strands = strands;
                     self.cache.clear();
                     self.refresh();
                 }
@@ -818,7 +829,7 @@ impl SerialAnnotationDialog {
                     let placement = match self.cache.get(&oligo) {
                         Some(p) => *p,
                         None => {
-                            let p = old.remove(&oligo).unwrap_or_else(|| search::best_placement(&self.template, &oligo, self.max));
+                            let p = old.remove(&oligo).unwrap_or_else(|| search::best_placement(&self.template, &oligo, self.max, self.strands));
                             self.cache.insert(oligo, p);
                             p
                         }
@@ -865,11 +876,22 @@ impl SerialAnnotationDialog {
 
     pub fn view(&self) -> Element<'_, Message> {
         let s = Message::SerialAnnotation;
-        let intro = format!(
-            "Each oligo is placed on {} where it has the fewest mismatches, on either strand. \
-             Plus-strand matches become forward primers, minus-strand matches reverse primers.",
-            self.template_label
-        );
+        let intro = match self.strands {
+            Strands::Both => format!(
+                "Each oligo is placed on {} where it has the fewest mismatches, on either strand. \
+                 Plus-strand matches become forward primers, minus-strand matches reverse primers.",
+                self.template_label
+            ),
+            Strands::Plus => format!(
+                "Each oligo is placed on {} where it has the fewest mismatches on the plus strand; all become forward primers.",
+                self.template_label
+            ),
+            Strands::Minus => format!(
+                "Each oligo is placed on {} where its reverse complement has the fewest mismatches (minus strand); \
+                 all become reverse primers.",
+                self.template_label
+            ),
+        };
         let mut body = column![
             text(intro).size(13),
             text_editor(&self.content)
@@ -890,6 +912,14 @@ impl SerialAnnotationDialog {
                     .width(Fill),
             ]
             .spacing(8)
+            .align_y(iced::Center),
+            row![
+                text("Direction").size(13),
+                radio("Any", Strands::Both, Some(self.strands), move |v| s(SerialMsg::Strands(v))).size(14).text_size(13),
+                radio("Forward only", Strands::Plus, Some(self.strands), move |v| s(SerialMsg::Strands(v))).size(14).text_size(13),
+                radio("Reverse only", Strands::Minus, Some(self.strands), move |v| s(SerialMsg::Strands(v))).size(14).text_size(13),
+            ]
+            .spacing(14)
             .align_y(iced::Center),
             row![
                 container(text("Color").size(13)).padding(iced::Padding { top: 4.0, ..Default::default() }),

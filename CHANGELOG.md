@@ -7,6 +7,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.1.4] - 2026-10-29
+
+### Added
+
+- **Serial annotation…**: **Direction** limits where all pasted oligos are placed: **Any**
+  (default, as before: either strand), **Forward only** (plus strand, all become forward primers)
+  or **Reverse only** (the reverse complement on the minus strand, all become reverse primers).
+  Useful when mismatches let oligos fit better in the wrong direction. Positions, mismatches,
+  “also fits … other positions” and “not found” in the preview then count only that strand.
+
 ## [0.1.3] - 2026-10-29
 
 ### Added
