@@ -46,8 +46,9 @@ pub enum ViewMsg {
     /// Double-click on a feature (details).
     OpenFeature(i64),
     /// Right-click at `pos` (window coordinates), on an annotation, a
-    /// feature or neither; `col` is the alignment column under the cursor.
-    Context { pos: Point, annotation: Option<i64>, feature: Option<i64>, col: Option<usize> },
+    /// feature or neither; `col` is the alignment column under the cursor,
+    /// `item` the display item whose name was right-clicked.
+    Context { pos: Point, annotation: Option<i64>, feature: Option<i64>, col: Option<usize>, item: Option<usize> },
     /// Dragging the right edge of the name column; `done` on release.
     NameWidth { w: f32, done: bool },
 }
@@ -441,7 +442,8 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                 let feature = self.feature_at(&lay, p).map(|i| self.od.features[i].id);
                 let d = self.col_at(&lay, p.x);
                 let col = (p.x >= lay.seq_x0 && d >= 0.0 && (d as usize) < self.od.view_width()).then(|| self.col_index(&lay, p.x));
-                return msg(ViewMsg::Context { pos: cursor.position()?, annotation, feature, col });
+                let item = if p.x < lay.seq_x0 { self.item_at(&lay, p.y) } else { None };
+                return msg(ViewMsg::Context { pos: cursor.position()?, annotation, feature, col, item });
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let Some(p) = cursor.position_in(bounds).or_else(|| cursor.position().map(|q| Point::new(q.x - bounds.x, q.y - bounds.y)))

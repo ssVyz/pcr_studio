@@ -98,6 +98,120 @@ fn color_text(color: Option<Rgb>) -> String {
     color.map(Rgb::hex).unwrap_or_default()
 }
 
+/// A new document made of rows of another (see [`Db::insert_copy`]); the
+/// ids of the annotations and features are ignored.
+pub struct DocumentCopy<'a> {
+    pub name: &'a str,
+    pub kind: DocKind,
+    pub doc: &'a Document,
+    pub reference: Option<usize>,
+    pub description: &'a str,
+    pub folder: Option<i64>,
+    pub annotations: &'a [Annotation],
+    pub features: &'a [Feature],
+}
+
+/// Inserts a document and its rows (in the caller's transaction); returns its id.
+#[allow(clippy::too_many_arguments)]
+fn insert_document_in(
+    conn: &Connection,
+    name: &str,
+    kind: DocKind,
+    doc: &Document,
+    reference: Option<usize>,
+    description: &str,
+    folder: Option<i64>,
+    progress: &dyn Fn(f32),
+) -> Result<i64, String> {
+    conn.execute(
+        "INSERT INTO documents (name, kind, n_rows, width, reference, description, folder_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![name, kind.as_str(), doc.rows.len() as i64, doc.width as i64, reference.map(|r| r as i64), description, folder],
+    )
+    .map_err(|e| e.to_string())?;
+    let id = conn.last_insert_rowid();
+    let mut st = conn
+        .prepare("INSERT INTO rows (doc_id, idx, name, description, start, data, meta) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+        .map_err(|e| e.to_string())?;
+    let n = doc.rows.len().max(1);
+    for (i, r) in doc.rows.iter().enumerate() {
+        st.execute(params![id, i as i64, r.name, r.description, r.start as i64, r.data, meta_to_json(&r.meta)])
+            .map_err(|e| e.to_string())?;
+        if i % 500 == 0 {
+            progress(i as f32 / n as f32);
+        }
+    }
+    Ok(id)
+}
+
+/// Inserts features of a document (in the caller's transaction); returns their ids.
+fn insert_features_in(conn: &Connection, doc_id: i64, features: &[Feature]) -> Result<Vec<i64>, String> {
+    let mut ids = Vec::with_capacity(features.len());
+    let mut st = conn
+        .prepare(
+            "INSERT INTO features (doc_id, name, kind, strand, start_col, end_col, parts, location, qualifiers, source, color)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )
+        .map_err(|e| e.to_string())?;
+    for f in features {
+        let parts = serde_json::to_string(&f.parts).map_err(|e| e.to_string())?;
+        st.execute(params![
+            doc_id,
+            f.name,
+            f.kind,
+            f.strand as i64,
+            f.start() as i64,
+            f.end() as i64,
+            parts,
+            f.location,
+            meta_to_json(&f.qualifiers),
+            f.source,
+            color_text(f.color)
+        ])
+        .map_err(|e| e.to_string())?;
+        ids.push(conn.last_insert_rowid());
+    }
+    Ok(ids)
+}
+
+/// Deletes rows of a document (in the caller's transaction); see [`Db::delete_rows`].
+fn delete_rows_in(conn: &Connection, id: i64, rows: &[usize]) -> Result<(), String> {
+    let (n_rows, reference): (i64, Option<i64>) = conn
+        .query_row("SELECT n_rows, reference FROM documents WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Document {id} not found"))?;
+    let n = n_rows as usize;
+    let mut gone = vec![false; n];
+    for &r in rows {
+        *gone.get_mut(r).ok_or("The sequences to delete do not match the document")? = true;
+    }
+    let removed = gone.iter().filter(|&&g| g).count();
+    if removed == n {
+        return Err("A document cannot be left without sequences".into());
+    }
+    {
+        let mut del = conn.prepare("DELETE FROM rows WHERE doc_id = ?1 AND idx = ?2").map_err(|e| e.to_string())?;
+        let mut mv = conn.prepare("UPDATE rows SET idx = ?3 WHERE doc_id = ?1 AND idx = ?2").map_err(|e| e.to_string())?;
+        // In order: each row moves into a slot that was emptied before it.
+        let mut k = 0;
+        for (i, &g) in gone.iter().enumerate() {
+            if g {
+                del.execute(params![id, i as i64]).map_err(|e| e.to_string())?;
+                k += 1;
+            } else if k > 0 {
+                mv.execute(params![id, i as i64, (i - k) as i64]).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    let reference = reference
+        .map(|r| r as usize)
+        .filter(|&r| r < n && !gone[r])
+        .map(|r| (r - gone[..r].iter().filter(|&&g| g).count()) as i64);
+    conn.execute("UPDATE documents SET n_rows = ?2, reference = ?3 WHERE id = ?1", params![id, (n - removed) as i64, reference])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Db, String> {
         let conn = Connection::open(path).map_err(|e| format!("Cannot open database {}: {e}", path.display()))?;
@@ -164,27 +278,42 @@ impl Db {
         progress: &dyn Fn(f32),
     ) -> Result<i64, String> {
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT INTO documents (name, kind, n_rows, width, reference, description, folder_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![name, kind.as_str(), doc.rows.len() as i64, doc.width as i64, reference.map(|r| r as i64), description, folder],
-        )
-        .map_err(|e| e.to_string())?;
-        let id = tx.last_insert_rowid();
+        let id = insert_document_in(&tx, name, kind, doc, reference, description, folder, progress)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    /// Stores a document made of rows of another, with copies of its
+    /// annotations and features, all or nothing; returns its id. With
+    /// `cut`, the rows `cut.1` are deleted from document `cut.0` in the same
+    /// step (see [`Db::delete_rows`]).
+    pub fn insert_copy(&mut self, copy: &DocumentCopy, cut: Option<(i64, &[usize])>) -> Result<i64, String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let id = insert_document_in(&tx, copy.name, copy.kind, copy.doc, copy.reference, copy.description, copy.folder, &|_| {})?;
         {
             let mut st = tx
-                .prepare("INSERT INTO rows (doc_id, idx, name, description, start, data, meta) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+                .prepare("INSERT INTO annotations (doc_id, name, kind, start_col, end_col, note, color) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
                 .map_err(|e| e.to_string())?;
-            let n = doc.rows.len().max(1);
-            for (i, r) in doc.rows.iter().enumerate() {
-                st.execute(params![id, i as i64, r.name, r.description, r.start as i64, r.data, meta_to_json(&r.meta)])
+            for a in copy.annotations {
+                st.execute(params![id, a.name, a.kind.as_str(), a.start as i64, a.end as i64, a.note, color_text(a.color)])
                     .map_err(|e| e.to_string())?;
-                if i % 500 == 0 {
-                    progress(i as f32 / n as f32);
-                }
             }
+        }
+        insert_features_in(&tx, id, copy.features)?;
+        if let Some((source, rows)) = cut {
+            delete_rows_in(&tx, source, rows)?;
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(id)
+    }
+
+    /// Deletes rows `rows` of document `id`; the rows after them move up and
+    /// the reference follows its row (none when it is deleted). Annotations,
+    /// features and the width stay. A document cannot lose all its rows.
+    pub fn delete_rows(&mut self, id: i64, rows: &[usize]) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        delete_rows_in(&tx, id, rows)?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Stores a text document (no sequences); returns its id. A folder that no
@@ -497,33 +626,7 @@ impl Db {
     /// Stores features of a document, all or none; returns their ids.
     pub fn add_features(&mut self, doc_id: i64, features: &[Feature]) -> Result<Vec<i64>, String> {
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
-        let mut ids = Vec::with_capacity(features.len());
-        {
-            let mut st = tx
-                .prepare(
-                    "INSERT INTO features (doc_id, name, kind, strand, start_col, end_col, parts, location, qualifiers, source, color)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                )
-                .map_err(|e| e.to_string())?;
-            for f in features {
-                let parts = serde_json::to_string(&f.parts).map_err(|e| e.to_string())?;
-                st.execute(params![
-                    doc_id,
-                    f.name,
-                    f.kind,
-                    f.strand as i64,
-                    f.start() as i64,
-                    f.end() as i64,
-                    parts,
-                    f.location,
-                    meta_to_json(&f.qualifiers),
-                    f.source,
-                    color_text(f.color)
-                ])
-                .map_err(|e| e.to_string())?;
-                ids.push(tx.last_insert_rowid());
-            }
-        }
+        let ids = insert_features_in(&tx, doc_id, features)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(ids)
     }
@@ -658,6 +761,78 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let anns = db.annotations(7).unwrap();
         assert_eq!((anns.len(), anns[0].color), (1, None));
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn copy_cut_and_delete_rows() {
+        let path = std::env::temp_dir().join(format!("pcr_studio_db_rows_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut db = Db::open(&path).unwrap();
+        let names = ["a", "b", "c", "d", "e", "f"];
+        let rows: Vec<Row> = names
+            .iter()
+            .map(|n| {
+                let mut r = Row::from_gapped(n.to_string(), String::new(), b"ACGT".to_vec());
+                r.set_meta("n", n.to_string());
+                r
+            })
+            .collect();
+        let six = db.insert_document("six", DocKind::Alignment, &Document::new(rows.clone()), Some(3), "", None, &|_| {}).unwrap();
+        let ann = Annotation { id: 0, name: "F1".into(), kind: AnnotationKind::ForwardPrimer, start: 0, end: 2, note: "n".into(), color: Some(Rgb(1, 2, 3)) };
+        let feature = Feature {
+            id: 0,
+            name: "S".into(),
+            kind: "CDS".into(),
+            strand: 1,
+            parts: vec![(1, 3)],
+            location: "2..3".into(),
+            qualifiers: Vec::new(),
+            source: "X1.1".into(),
+            color: None,
+        };
+        db.add_annotation(six, &ann).unwrap();
+        let names_of = |db: &Db, id: i64| -> Vec<String> { db.load_document(id, &|_| {}).unwrap().1.rows.iter().map(|r| r.name.clone()).collect() };
+        // Cut b and e (with the reference d) into a new document, in one step.
+        let doc = Document::new(vec![rows[3].clone(), rows[1].clone(), rows[4].clone()]);
+        let copy = DocumentCopy {
+            name: "cut",
+            kind: DocKind::Alignment,
+            doc: &doc,
+            reference: Some(0),
+            description: "moved",
+            folder: None,
+            annotations: &[ann.clone()],
+            features: &[feature.clone()],
+        };
+        let cut = db.insert_copy(&copy, Some((six, &[1, 4]))).unwrap();
+        assert_eq!(names_of(&db, cut), ["d", "b", "e"]);
+        let (info, loaded, anns) = db.load_document(cut, &|_| {}).unwrap();
+        assert_eq!((info.reference, info.n_rows, info.description.as_str()), (Some(0), 3, "moved"));
+        assert_eq!(loaded.rows[1].meta_value("n"), Some("b"));
+        assert_eq!(anns, vec![Annotation { id: anns[0].id, ..ann.clone() }]);
+        assert_eq!(db.features(cut).unwrap()[0].parts, [(1, 3)]);
+        // The source lost them; the reference d moved from 3 to 2.
+        assert_eq!(names_of(&db, six), ["a", "c", "d", "f"]);
+        let info = db.document_info(six).unwrap().unwrap();
+        assert_eq!((info.reference, info.n_rows, info.width), (Some(2), 4, 4));
+        assert_eq!(db.annotations(six).unwrap().len(), 1);
+        // A copy leaves the source as it is.
+        let copy = DocumentCopy { name: "copy", reference: None, annotations: &[], features: &[], ..copy };
+        let copied = db.insert_copy(&copy, None).unwrap();
+        assert_eq!((names_of(&db, copied).len(), names_of(&db, six).len()), (3, 4));
+        // Deleting: rows after them move up; deleting the reference clears it.
+        db.delete_rows(six, &[2, 0]).unwrap();
+        assert_eq!(names_of(&db, six), ["c", "f"]);
+        assert_eq!(db.document_info(six).unwrap().unwrap().reference, None);
+        assert!(db.load_document(six, &|_| {}).unwrap().1.rows.iter().all(|r| r.meta_value("n") == Some(r.name.as_str())));
+        // Not all rows, not rows that do not exist; nothing changes then.
+        assert!(db.delete_rows(six, &[0, 1]).is_err());
+        assert!(db.delete_rows(six, &[0, 5]).is_err());
+        assert!(db.insert_copy(&copy, Some((six, &[0, 1]))).is_err());
+        assert_eq!(names_of(&db, six), ["c", "f"]);
+        assert_eq!(db.list_documents().unwrap().len(), 3);
         drop(db);
         let _ = std::fs::remove_file(&path);
     }

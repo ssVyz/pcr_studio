@@ -67,6 +67,8 @@ pub enum Modal {
     /// `linked`: only the link is deleted, not the files.
     ConfirmDelete { id: i64, name: String, detail: String, linked: bool },
     ConfirmDeleteFolder { id: i64, name: String, documents: usize, subfolders: usize },
+    /// Cutting the selected rows to a new document, or deleting them.
+    ConfirmRows(RowsConfirm),
     NameFields { delimiter: String, keys: String },
     Info { title: String, text: String },
     Primersearch(PrimersearchDialog),
@@ -3423,6 +3425,84 @@ impl TextView {
     }
 }
 
+// ---------------------------------------------------------------- selected rows
+
+/// Asks before the selected rows are cut to a new document or deleted.
+pub struct RowsConfirm {
+    /// Cut to a new document (else delete).
+    pub cut: bool,
+    pub doc_id: i64,
+    pub doc_name: String,
+    /// Rows of the document, in document order.
+    pub rows: Vec<usize>,
+    /// Their names (a shortened list).
+    pub names: String,
+    /// Cutting: the new document's name, the reference and the number of
+    /// annotations and features copied along.
+    pub new_name: String,
+    pub reference: Option<String>,
+    pub annotations: usize,
+    pub features: usize,
+}
+
+impl RowsConfirm {
+    pub fn view(&self) -> Element<'_, Message> {
+        let n = self.rows.len();
+        let what = if n == 1 { "1 sequence".to_string() } else { format!("{} sequences", group_digits(n)) };
+        let mut body = column![
+            text(if self.cut {
+                format!("Move {what} from “{}” to a new document?", self.doc_name)
+            } else {
+                format!("Delete {what} from “{}”?", self.doc_name)
+            })
+            .size(14),
+            text(self.names.as_str()).size(12).style(style::muted),
+        ]
+        .spacing(10);
+        if self.cut {
+            let mut along = Vec::new();
+            if let Some(r) = &self.reference {
+                along.push(format!("the reference “{r}” (it also stays here)"));
+            }
+            match (self.annotations, self.features) {
+                (0, 0) => {}
+                (a, 0) => along.push(count(a, "annotation")),
+                (0, f) => along.push(count(f, "feature")),
+                (a, f) => along.push(format!("{} and {}", count(a, "annotation"), count(f, "feature"))),
+            }
+            let mut new = format!("New document “{}” in the same folder", self.new_name);
+            if !along.is_empty() {
+                new.push_str(&format!(", with {}", along.join(" and ")));
+            }
+            new.push('.');
+            body = body.push(text(new).size(12));
+        }
+        body = body.push(irreversible(if self.cut {
+            "The sequences are removed from this document; the new document keeps them."
+        } else {
+            "The sequences are removed permanently. Annotations and features stay."
+        }));
+        let confirm = match (self.cut, n) {
+            (true, 1) => "Cut 1 row".to_string(),
+            (true, n) => format!("Cut {} rows", group_digits(n)),
+            (false, 1) => "Delete 1 row".to_string(),
+            (false, n) => format!("Delete {} rows", group_digits(n)),
+        };
+        let buttons = row![
+            Space::new().width(Fill),
+            button("Cancel").on_press(Message::CloseModal).style(button::secondary),
+            button(text(confirm)).on_press(Message::ConfirmRows).style(button::danger),
+        ]
+        .spacing(10);
+        dialog_frame(if self.cut { "Cut rows to a new document" } else { "Delete rows" }, body.into(), buttons.into(), 480.0)
+    }
+}
+
+/// “1 annotation”, “12 annotations”.
+fn count(n: usize, what: &str) -> String {
+    if n == 1 { format!("1 {what}") } else { format!("{} {what}s", group_digits(n)) }
+}
+
 // ---------------------------------------------------------------- common
 
 /// Prominent "cannot be undone" notice for destructive confirmations.
@@ -3562,6 +3642,7 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
             .spacing(10);
             dialog_frame("Delete folder", body.into(), buttons.into(), 440.0)
         }
+        Modal::ConfirmRows(c) => c.view(),
         Modal::NameFields { delimiter, keys } => {
             let body = column![
                 text("Splits every sequence name at a delimiter and stores the parts as metadata fields (for sorting and grouping).").size(13),

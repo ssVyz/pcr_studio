@@ -2,7 +2,7 @@
 
 use crate::display::{self, DisplayOptions, Item, RowSort};
 use crate::linked::LinkedSet;
-use crate::model::{Annotation, ColumnMap, ColumnStats, ConsensusThreshold, DocInfo, Document, Feature, RefCoords};
+use crate::model::{Annotation, ColumnMap, ColumnStats, ConsensusThreshold, DocInfo, DocKind, Document, Feature, RefCoords, Row};
 use crate::primer::{OligoSource, PrimerOptions, PrimerReport};
 use crate::search::{Hit, Scope};
 use crate::seq::GAP;
@@ -731,6 +731,96 @@ impl OpenDoc {
     pub fn item_of_row(&self, row: usize) -> Option<usize> {
         self.items.iter().position(|it| matches!(it, Item::Seq { row: r, .. } if *r == row))
     }
+
+    /// The selected rows, in document order, for copying, cutting or
+    /// deleting them (never the reference).
+    pub fn chosen_rows(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.selected_rows.iter().copied().filter(|&r| r < self.doc.rows.len() && Some(r) != self.reference).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// A new document of rows `rows` (in document order). The reference
+    /// comes along as the first row, so positions keep their meaning. An
+    /// alignment keeps all its columns, so the annotations and features
+    /// stay where they are; those past the new document's end are left out.
+    pub fn copy_of_rows(&self, rows: &[usize]) -> RowsCopy {
+        let reference = self.reference.filter(|r| !rows.contains(r));
+        let picked: Vec<Row> = reference.iter().chain(rows).filter_map(|&r| self.doc.rows.get(r).cloned()).collect();
+        let kind = match self.info.kind {
+            // Reads of linked files: as on FASTA import.
+            DocKind::Linked | DocKind::Text => {
+                let any_gap = picked.iter().any(|r| r.start > 0 || r.data.contains(&GAP));
+                crate::fasta::alignment_kind(any_gap, &picked.iter().map(Row::end).collect::<Vec<_>>())
+            }
+            k => k,
+        };
+        let mut doc = Document::new(picked);
+        if matches!(kind, DocKind::Alignment | DocKind::Contig) {
+            doc.width = doc.width.max(self.doc.width);
+        }
+        let annotations = self.annotations.iter().filter(|a| a.end <= doc.width).cloned().collect();
+        let features = self.features.iter().filter(|f| f.end() <= doc.width).cloned().collect();
+        RowsCopy { kind, reference: reference.map(|r| self.doc.rows[r].name.clone()), doc, annotations, features }
+    }
+
+    /// Removes rows `rows` (after they were deleted in the library). The
+    /// reference and search hits follow their rows; the row selection is
+    /// cleared. The columns stay as they are.
+    pub fn remove_rows(&mut self, rows: &[usize], prefs: &ViewPrefs) {
+        let n = self.doc.rows.len();
+        let mut gone = vec![false; n];
+        for &r in rows.iter().filter(|&&r| r < n) {
+            gone[r] = true;
+        }
+        let mut new_of = vec![None; n];
+        let mut k = 0;
+        for (i, g) in gone.iter().enumerate() {
+            if !g {
+                new_of[i] = Some(k);
+                k += 1;
+            }
+        }
+        let doc = Arc::make_mut(&mut self.doc);
+        let mut i = 0;
+        doc.rows.retain(|_| {
+            i += 1;
+            !gone[i - 1]
+        });
+        self.reference = self.reference.and_then(|r| new_of[r]);
+        self.info.reference = self.reference;
+        self.info.n_rows = self.doc.rows.len();
+        self.selected_rows.clear();
+        let remap = |h: Hit| match h.row {
+            None => Some(h),
+            Some(r) => new_of[r].map(|n| Hit { row: Some(n), ..h }),
+        };
+        let current = self.search.current.and_then(|i| self.search.hits.get(i).copied()).and_then(remap);
+        self.search.hits = self.search.hits.iter().filter_map(|&h| remap(h)).collect();
+        self.search.current = current.and_then(|c| self.search.hits.iter().position(|h| *h == c));
+        self.last_clicked_item = None;
+        self.hover = None;
+        // Grouping or sorting by a field no sequence has any more stops.
+        self.meta_keys = self.doc.meta_keys();
+        if self.display.group_by.as_ref().is_some_and(|k| !self.meta_keys.contains(k)) {
+            self.display.group_by = None;
+        }
+        if matches!(&self.display.sort, display::SortKey::Meta(k) if !self.meta_keys.contains(k)) {
+            self.display.sort = display::SortKey::Original;
+        }
+        self.recompute_stats(prefs);
+        self.rebuild_items();
+    }
+}
+
+/// Rows of the open document as a new document (see [`OpenDoc::copy_of_rows`]).
+pub struct RowsCopy {
+    pub kind: DocKind,
+    pub doc: Document,
+    /// Name of the reference, copied along as the first row.
+    pub reference: Option<String>,
+    pub annotations: Vec<Annotation>,
+    pub features: Vec<Feature>,
 }
 
 /// Updates a selection of ids for a click on `id` (`order`: the list
@@ -759,7 +849,7 @@ fn multi_click(order: &[i64], selected: &mut Vec<i64>, anchor: &mut Option<i64>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AnnotationKind, DocKind, Row};
+    use crate::model::AnnotationKind;
 
     #[test]
     fn annotation_clicks() {
@@ -823,6 +913,59 @@ mod tests {
         assert_eq!(od.selected_features, [9]);
         od.clear_track_selection();
         assert!(od.selected_features.is_empty() && od.feature_anchor.is_none());
+    }
+
+    #[test]
+    fn copy_and_remove_rows() {
+        let rows: Vec<Row> = ["ACGTACGT", "ACG", "--GTAC", "ACGTAC", "ACGTACGT"]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mut r = Row::from_gapped(format!("s{i}"), String::new(), s.as_bytes().to_vec());
+                if i == 2 {
+                    r.set_meta("only", "here".into());
+                }
+                r
+            })
+            .collect();
+        let info = DocInfo {
+            id: 1,
+            name: "d".into(),
+            kind: DocKind::Alignment,
+            n_rows: 5,
+            width: 8,
+            reference: Some(3),
+            created: String::new(),
+            description: String::new(),
+            folder: None,
+        };
+        let ann = |end: usize| Annotation { id: end as i64, name: "a".into(), kind: AnnotationKind::Region, start: 0, end, note: String::new(), color: None };
+        let mut od = OpenDoc::new(info, Document::new(rows), vec![ann(4), ann(8)], &ViewPrefs::default());
+        // The reference is never one of the rows acted on.
+        od.selected_rows.extend([4, 2, 1, 3]);
+        assert_eq!(od.chosen_rows(), [1, 2, 4]);
+        // A copy starts with the reference; an alignment keeps its columns.
+        let copy = od.copy_of_rows(&[1, 2]);
+        assert_eq!(copy.doc.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["s3", "s1", "s2"]);
+        assert_eq!((copy.kind, copy.doc.width, copy.reference.as_deref(), copy.annotations.len()), (DocKind::Alignment, 8, Some("s3"), 2));
+        // A sequence list gets its own width: annotations past it stay behind.
+        od.info.kind = DocKind::Sequences;
+        let copy = od.copy_of_rows(&[1, 2]);
+        assert_eq!((copy.doc.width, copy.annotations.len()), (6, 1));
+        od.info.kind = DocKind::Alignment;
+        // Removing: the reference and search hits follow their rows.
+        od.display.group_by = Some("only".into());
+        od.search.hits = [Some(1), Some(3), None, Some(4)].map(|row| Hit { row, c0: 0, c1: 2, reverse: false, mismatches: 0 }).to_vec();
+        od.search.current = Some(3);
+        od.remove_rows(&[2, 1], &ViewPrefs::default());
+        assert_eq!(od.doc.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["s0", "s3", "s4"]);
+        assert_eq!((od.reference, od.info.reference, od.info.n_rows, od.doc.width), (Some(1), Some(1), 3, 8));
+        assert_eq!(od.search.hits.iter().map(|h| h.row).collect::<Vec<_>>(), [Some(1), None, Some(2)]);
+        assert_eq!(od.search.current, Some(2));
+        assert!(od.selected_rows.is_empty());
+        // Grouping by a field only a removed row had stops.
+        assert_eq!((od.meta_keys.len(), od.display.group_by.as_ref()), (0, None));
+        assert_eq!(od.items.len(), 2);
     }
 
     #[test]

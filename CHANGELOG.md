@@ -7,6 +7,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.1.7] - 2026-11-02
+
+### Added
+
+- **Copy, cut or delete the selected rows** (rows selected by clicking their names, Ctrl/Shift+click
+  for several). The commands are in the viewer's right-click menu, the Edit menu and under
+  “N row(s) selected” in the Display options panel; **Del** deletes the selected rows when no
+  annotation or feature is selected.
+  - **Copy to new document** saves the rows as a new document in the same folder, named
+    “Document [12 sequences]” (“Document [name]” for one). The reference comes along as the
+    first row and stays the reference, so reference positions still apply. An alignment keeps all
+    its columns, so its annotations and features are copied as they are.
+  - **Cut to new document…** does the same and removes the rows from the open document, in one
+    step: if saving fails, nothing changes.
+  - **Delete…** removes the rows. The annotations, features and columns of the document stay.
+  - Cutting and deleting ask first and cannot be undone. Neither works on linked files (read-only)
+    or on all rows, since a document cannot be left empty. Copying works on linked files: the
+    reads shown are saved without their base qualities.
+- Right-clicking a sequence name selects that row, unless it is already selected.
+
 ## [0.1.6] - 2026-11-02
 
 ### Added

@@ -25,7 +25,7 @@ use crate::tools::{self, ToolConfig, ToolSpec, ToolStatus};
 use canvas::ViewMsg;
 use dialogs::{
     AnnotationDialog, ColorDialog, EditTarget, ExportDialog, ExportRows, FeatureDialog, GenBankDialog, ImportFastaDialog, ImportInto, LinkFastqDialog, LinkedDialog,
-    LinkedMsg, MapDialog, Modal, PrimersearchDialog, RefChoice, SequenceDialog, SerialAnnotationDialog, SettingsDialog, TextView, TextViewMsg,
+    LinkedMsg, MapDialog, Modal, PrimersearchDialog, RefChoice, RowsConfirm, SequenceDialog, SerialAnnotationDialog, SettingsDialog, TextView, TextViewMsg,
 };
 use iced::keyboard::{self, Key, key::Named};
 use iced::{Subscription, Task, Theme};
@@ -175,6 +175,17 @@ pub enum ContextTarget {
     /// The sequence viewer, on an annotation or a feature (id) or neither;
     /// `col` is the alignment column under the cursor.
     Viewer { annotation: Option<i64>, feature: Option<i64>, col: Option<usize> },
+}
+
+/// What to do with the selected rows of the open document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowAction {
+    /// Copy them to a new document.
+    Copy,
+    /// Move them to a new document (asks first).
+    Cut,
+    /// Delete them (asks first).
+    Delete,
 }
 
 /// Where a dragged library entry would land.
@@ -378,6 +389,10 @@ pub enum Message {
     SetReferenceFromSelection,
     ClearReference,
     ClearRowSelection,
+    /// Copy the selected rows to a new document; cutting and deleting ask first.
+    SelectedRows(RowAction),
+    /// Cutting or deleting the rows of the confirmation dialog was confirmed.
+    ConfirmRows,
     // Selection / primer popup
     ClearSelection,
     ShowPopup,
@@ -1858,6 +1873,8 @@ impl App {
             }
             Message::ClearReference => self.set_reference(None),
             Message::ClearRowSelection => self.with_doc(|od, _| od.selected_rows.clear()),
+            Message::SelectedRows(action) => self.selected_rows(action),
+            Message::ConfirmRows => self.confirm_rows(),
             Message::ClearSelection => self.with_doc(|od, _| {
                 od.selection = None;
                 od.clear_track_selection();
@@ -2244,10 +2261,18 @@ impl App {
                 self.resize_annotation(id, start, end, done);
                 return Task::none();
             }
-            ViewMsg::Context { pos, annotation, feature, col } => {
-                // Right-click selects the annotation or feature, like the library
-                // entries (one of several selected keeps them); the oligo report
-                // stays as it is.
+            ViewMsg::Context { pos, annotation, feature, col, item } => {
+                // Right-click selects the annotation, feature or row (by its
+                // name), like the library entries (one of several selected
+                // keeps them); the oligo report stays as it is.
+                if let Some(od) = self.open.as_mut()
+                    && let Some(row) = item.and_then(|i| od.item_row(i))
+                    && !od.selected_rows.contains(&row)
+                {
+                    od.selected_rows.clear();
+                    od.selected_rows.insert(row);
+                    od.last_clicked_item = item;
+                }
                 if let Some(id) = annotation {
                     let popup = self.open.as_ref().is_some_and(|o| o.popup_open);
                     if self.open.as_ref().is_some_and(|o| o.selected_annotations.contains(&id)) {
@@ -2405,6 +2430,9 @@ impl App {
             if !od.selected_features.is_empty() {
                 return self.update(Message::AskDeleteSelectedFeatures);
             }
+            if !od.selected_rows.is_empty() {
+                return self.update(Message::SelectedRows(RowAction::Delete));
+            }
         }
         if modifiers.command() {
             if let Key::Character(c) = &key {
@@ -2551,6 +2579,140 @@ impl App {
         let note = if view_sorted { "; the panel's Sort is back to document order" } else { "" };
         self.status = format!("Sorted {} sequences {phrase}{note}", canvas::group_digits(n));
         self.reload_library();
+    }
+
+    /// Copies the selected rows to a new document, or asks before cutting
+    /// them to a new document or deleting them.
+    fn selected_rows(&mut self, action: RowAction) {
+        if self.busy() {
+            return;
+        }
+        let Some(od) = self.open.as_ref() else { return };
+        if action != RowAction::Copy && od.linked.is_some() {
+            self.error = Some("Linked files are read-only: sequences cannot be removed from them. Copy the rows to a new document instead.".into());
+            return;
+        }
+        let rows = od.chosen_rows();
+        if rows.is_empty() {
+            self.error = Some("Select rows first: click their names (Ctrl/Shift+click for several).".into());
+            return;
+        }
+        if action != RowAction::Copy && rows.len() == od.doc.rows.len() {
+            self.error = Some(if action == RowAction::Cut {
+                "All sequences are selected and the document cannot be left empty: copy them instead.".into()
+            } else {
+                "All sequences are selected and the document cannot be left empty: delete the document in the library instead.".into()
+            });
+            return;
+        }
+        if action == RowAction::Copy {
+            self.save_rows(&rows, false);
+            return;
+        }
+        let names: Vec<&str> = rows.iter().map(|&r| od.doc.rows[r].name.as_str()).collect();
+        let copy = (action == RowAction::Cut).then(|| od.copy_of_rows(&rows));
+        self.modal = Some(Modal::ConfirmRows(RowsConfirm {
+            cut: action == RowAction::Cut,
+            doc_id: od.info.id,
+            doc_name: od.info.name.clone(),
+            names: dialogs::name_list(&names),
+            new_name: rows_document_name(od, &rows),
+            reference: copy.as_ref().and_then(|c| c.reference.clone()),
+            annotations: copy.as_ref().map_or(0, |c| c.annotations.len()),
+            features: copy.as_ref().map_or(0, |c| c.features.len()),
+            rows,
+        }));
+    }
+
+    /// Cuts or deletes the rows of the confirmation dialog.
+    fn confirm_rows(&mut self) {
+        let Some(Modal::ConfirmRows(c)) = self.modal.take() else { return };
+        if self.busy() || self.open.as_ref().is_none_or(|o| o.info.id != c.doc_id) {
+            return;
+        }
+        if c.cut {
+            self.save_rows(&c.rows, true);
+            return;
+        }
+        if let Err(e) = self.db.delete_rows(c.doc_id, &c.rows) {
+            self.error = Some(e);
+            return;
+        }
+        self.after_rows_removed(&c.rows);
+        self.reload_library();
+        self.status = format!("Deleted {} from “{}”", sequences(c.rows.len()), c.doc_name);
+    }
+
+    /// Saves rows `rows` of the open document as a new document next to it,
+    /// with its reference, annotations and features; `cut` also removes the
+    /// rows from the open document. The new document is selected in the
+    /// library; the open one stays open.
+    fn save_rows(&mut self, rows: &[usize], cut: bool) {
+        let Some(od) = self.open.as_ref() else { return };
+        let copy = od.copy_of_rows(rows);
+        let name = rows_document_name(od, rows);
+        let what = sequences(rows.len());
+        let mut description = format!("{what} {} “{}”", if cut { "moved from" } else { "copied from" }, od.info.name);
+        if let Some(r) = &copy.reference {
+            description.push_str(&format!(", with the reference “{r}”"));
+        }
+        let folder = od.info.folder;
+        let new = db::DocumentCopy {
+            name: &name,
+            kind: copy.kind,
+            doc: &copy.doc,
+            reference: copy.reference.as_ref().map(|_| 0),
+            description: &description,
+            folder,
+            annotations: &copy.annotations,
+            features: &copy.features,
+        };
+        let qualities = od.qualities().is_some();
+        let id = match self.db.insert_copy(&new, cut.then_some((od.info.id, rows))) {
+            Ok(id) => id,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        if cut {
+            self.after_rows_removed(rows);
+        }
+        self.reload_library();
+        self.reveal_folder(folder);
+        self.set_primary(Some(LibKey::Doc(id)));
+        self.lib_multi.clear();
+        let mut along = Vec::new();
+        if let Some(r) = &copy.reference {
+            along.push(format!("the reference “{r}”"));
+        }
+        match copy.annotations.len() {
+            0 => {}
+            1 => along.push("1 annotation".into()),
+            n => along.push(format!("{} annotations", canvas::group_digits(n))),
+        }
+        match copy.features.len() {
+            0 => {}
+            1 => along.push("1 feature".into()),
+            n => along.push(format!("{} features", canvas::group_digits(n))),
+        }
+        self.status = format!("{} {what} to “{name}”", if cut { "Moved" } else { "Copied" });
+        if !along.is_empty() {
+            self.status.push_str(&format!(" with {}", join_and(&along)));
+        }
+        if qualities {
+            self.status.push_str("; base qualities are not copied");
+        }
+    }
+
+    /// Takes rows deleted in the library out of the open document.
+    fn after_rows_removed(&mut self, rows: &[usize]) {
+        let prefs = self.settings.view.clone();
+        let opts = self.settings.primer;
+        if let Some(od) = self.open.as_mut() {
+            od.remove_rows(rows, &prefs);
+            od.evaluate_selection(&opts);
+        }
     }
 
     fn set_reference(&mut self, reference: Option<usize>) {
@@ -3589,6 +3751,29 @@ fn chosen_rows(od: &OpenDoc, which: ExportRows) -> Vec<usize> {
     let mut rows = row_set(od, which);
     rows.retain(|&r| Some(r) != od.reference);
     rows
+}
+
+/// Name of a new document of rows `rows` of `od`: “Doc [name]” for one
+/// sequence, “Doc [12 sequences]” for several.
+fn rows_document_name(od: &OpenDoc, rows: &[usize]) -> String {
+    match rows {
+        [r] => format!("{} [{}]", od.info.name, od.doc.rows[*r].name),
+        _ => format!("{} [{}]", od.info.name, sequences(rows.len())),
+    }
+}
+
+/// “1 sequence”, “1,200 sequences”.
+fn sequences(n: usize) -> String {
+    if n == 1 { "1 sequence".into() } else { format!("{} sequences", canvas::group_digits(n)) }
+}
+
+/// “a”, “a and b”, “a, b and c”.
+fn join_and(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// How a sort is described in menus and the status bar ("by name (A→Z)").

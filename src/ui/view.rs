@@ -3,7 +3,7 @@
 use super::canvas::{AlignmentView, group_digits};
 use super::dialogs::{self, ModalMsg};
 use super::state::{BASE_COL_W, GraphMode, Highlight, OpenDoc, ReadDisplay};
-use super::{App, ContextTarget, DropTarget, FolderChoice, GroupChoice, JUMP_INPUT, LIB_SCROLL, LibKey, Message, SEARCH_INPUT, Split, icons, menu, style};
+use super::{App, ContextTarget, DropTarget, FolderChoice, GroupChoice, JUMP_INPUT, LIB_SCROLL, LibKey, Message, RowAction, SEARCH_INPUT, Split, icons, menu, style};
 use crate::display::{Item, RowSort, SortKey};
 use crate::linked;
 use crate::model::{ConsensusThreshold, DocKind};
@@ -100,6 +100,27 @@ impl App {
         }
     }
 
+    /// Entries for the selected rows: copy them, cut them to a new document
+    /// or delete them (not from linked files). `shortcut`: show Del.
+    fn row_entries(&self, shortcut: bool) -> [menu::Entry; 3] {
+        use menu::Entry;
+        let n = self.open.as_ref().map_or(0, |o| o.chosen_rows().len());
+        let ok = !self.busy() && n > 0;
+        let remove = ok && self.open_writable();
+        let rows = match n {
+            0 => "selected rows".to_string(),
+            1 => "row".to_string(),
+            n => format!("{} rows", group_digits(n)),
+        };
+        let delete = format!("Delete {rows}…");
+        let action = |a: RowAction, ok: bool| ok.then_some(Message::SelectedRows(a));
+        [
+            Entry::item(format!("Copy {rows} to new document"), "", action(RowAction::Copy, ok)),
+            Entry::item(format!("Cut {rows} to new document…"), "", action(RowAction::Cut, remove)),
+            if shortcut { Entry::item(delete, "Del", action(RowAction::Delete, remove)) } else { Entry::danger(delete, action(RowAction::Delete, remove)) },
+        ]
+    }
+
     /// Right-click menu of a library entry or the sequence viewer.
     fn context_entries(&self, target: ContextTarget) -> Vec<menu::Entry> {
         use menu::Entry;
@@ -124,6 +145,11 @@ impl App {
                     // The right-clicked feature is selected (perhaps with others).
                     entries.push(Entry::item(self.features_label("Feature color…", "Color of"), "", writable.then_some(Message::OpenFeatureColor)));
                     entries.push(Entry::danger(self.features_label("Delete feature…", "Delete"), writable.then_some(Message::AskDeleteSelectedFeatures)));
+                    entries.push(Entry::Separator);
+                }
+                // Selected rows (a right-clicked name is selected).
+                if od.is_some_and(|o| !o.chosen_rows().is_empty()) {
+                    entries.extend(self.row_entries(false));
                     entries.push(Entry::Separator);
                 }
                 entries.extend([
@@ -330,6 +356,9 @@ impl App {
                 Entry::Separator,
             ]
             .into_iter()
+            // Del deletes selected annotations or features first.
+            .chain(self.row_entries(od.is_some_and(|o| o.selected_annotations.is_empty() && o.selected_features.is_empty())))
+            .chain([Entry::Separator])
             .chain(self.sort_entries(None, true))
             .chain([Entry::Separator, Entry::item("Settings…", "Ctrl+,", Some(Message::OpenSettings))])
             .collect(),
@@ -768,12 +797,28 @@ impl App {
         let doc_info = doc_info.push(if od.selected_rows.is_empty() {
             Element::from(text("Click names to select rows (Ctrl/Shift for several).").size(11).style(style::muted))
         } else {
-            row![
-                text(format!("{} row(s) selected", od.selected_rows.len())).size(12),
-                button(text("Clear").size(11)).padding([2, 6]).style(button::text).on_press(Message::ClearRowSelection)
+            let idle = !self.busy();
+            let remove = idle && od.linked.is_none();
+            let small = |label: &'static str, style: fn(&Theme, button::Status) -> button::Style, a: RowAction, ok: bool| {
+                button(text(label).size(11)).padding([3, 7]).style(style).on_press_maybe(ok.then_some(Message::SelectedRows(a)))
+            };
+            column![
+                row![
+                    text(format!("{} row(s) selected", od.selected_rows.len())).size(12),
+                    button(text("Clear").size(11)).padding([2, 6]).style(button::text).on_press(Message::ClearRowSelection)
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                row![
+                    small("Copy to new document", button::secondary, RowAction::Copy, idle),
+                    small("Cut to new document…", button::secondary, RowAction::Cut, remove),
+                    small("Delete…", button::danger, RowAction::Delete, remove),
+                ]
+                .spacing(6)
+                .wrap()
+                .vertical_spacing(6),
             ]
             .spacing(6)
-            .align_y(Alignment::Center)
             .into()
         });
 
