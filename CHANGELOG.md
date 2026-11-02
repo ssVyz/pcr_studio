@@ -7,6 +7,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.1.8] - 2026-11-02
+
+### Added
+
+- **Edit → Trim to sequence range…** removes the empty columns at the ends of the open document:
+  everything before the first and after the last base of any sequence (for example after copying
+  a short sequence out of a long alignment). Annotations and features move with their columns.
+  Those entirely in the removed columns are deleted, and those reaching into them are
+  shortened. The dialog says how many of each before anything changes; trimming cannot be
+  undone. Not for linked files (read-only).
+
+### Changed
+
+- **Copy / Cut rows to new document** no longer brings the reference along. The new document holds
+  only the selected sequences, exactly as they are in the original (same columns and gaps, no
+  reference). The annotations and features still come along unchanged. Rows copied from a contig
+  become an alignment, since the reference they were mapped to is not part of the copy. Sequence
+  lists now also keep their width, so all annotations come along there too.
+
 ## [0.1.7] - 2026-11-02
 
 ### Added

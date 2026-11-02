@@ -25,7 +25,7 @@ use crate::tools::{self, ToolConfig, ToolSpec, ToolStatus};
 use canvas::ViewMsg;
 use dialogs::{
     AnnotationDialog, ColorDialog, EditTarget, ExportDialog, ExportRows, FeatureDialog, GenBankDialog, ImportFastaDialog, ImportInto, LinkFastqDialog, LinkedDialog,
-    LinkedMsg, MapDialog, Modal, PrimersearchDialog, RefChoice, RowsConfirm, SequenceDialog, SerialAnnotationDialog, SettingsDialog, TextView, TextViewMsg,
+    LinkedMsg, MapDialog, Modal, PrimersearchDialog, RefChoice, RowsConfirm, SequenceDialog, SerialAnnotationDialog, SettingsDialog, TextView, TextViewMsg, TrimConfirm,
 };
 use iced::keyboard::{self, Key, key::Named};
 use iced::{Subscription, Task, Theme};
@@ -393,6 +393,9 @@ pub enum Message {
     SelectedRows(RowAction),
     /// Cutting or deleting the rows of the confirmation dialog was confirmed.
     ConfirmRows,
+    /// Remove the empty columns at the ends of the open document (asks first).
+    AskTrim,
+    ConfirmTrim,
     // Selection / primer popup
     ClearSelection,
     ShowPopup,
@@ -1875,6 +1878,8 @@ impl App {
             Message::ClearRowSelection => self.with_doc(|od, _| od.selected_rows.clear()),
             Message::SelectedRows(action) => self.selected_rows(action),
             Message::ConfirmRows => self.confirm_rows(),
+            Message::AskTrim => self.ask_trim(),
+            Message::ConfirmTrim => self.confirm_trim(),
             Message::ClearSelection => self.with_doc(|od, _| {
                 od.selection = None;
                 od.clear_track_selection();
@@ -2617,7 +2622,6 @@ impl App {
             doc_name: od.info.name.clone(),
             names: dialogs::name_list(&names),
             new_name: rows_document_name(od, &rows),
-            reference: copy.as_ref().and_then(|c| c.reference.clone()),
             annotations: copy.as_ref().map_or(0, |c| c.annotations.len()),
             features: copy.as_ref().map_or(0, |c| c.features.len()),
             rows,
@@ -2644,24 +2648,21 @@ impl App {
     }
 
     /// Saves rows `rows` of the open document as a new document next to it,
-    /// with its reference, annotations and features; `cut` also removes the
-    /// rows from the open document. The new document is selected in the
-    /// library; the open one stays open.
+    /// as they are here (without the reference), with the annotations and
+    /// features; `cut` also removes the rows from the open document. The new
+    /// document is selected in the library; the open one stays open.
     fn save_rows(&mut self, rows: &[usize], cut: bool) {
         let Some(od) = self.open.as_ref() else { return };
         let copy = od.copy_of_rows(rows);
         let name = rows_document_name(od, rows);
         let what = sequences(rows.len());
-        let mut description = format!("{what} {} “{}”", if cut { "moved from" } else { "copied from" }, od.info.name);
-        if let Some(r) = &copy.reference {
-            description.push_str(&format!(", with the reference “{r}”"));
-        }
+        let description = format!("{what} {} “{}”", if cut { "moved from" } else { "copied from" }, od.info.name);
         let folder = od.info.folder;
         let new = db::DocumentCopy {
             name: &name,
             kind: copy.kind,
             doc: &copy.doc,
-            reference: copy.reference.as_ref().map(|_| 0),
+            reference: None,
             description: &description,
             folder,
             annotations: &copy.annotations,
@@ -2683,9 +2684,6 @@ impl App {
         self.set_primary(Some(LibKey::Doc(id)));
         self.lib_multi.clear();
         let mut along = Vec::new();
-        if let Some(r) = &copy.reference {
-            along.push(format!("the reference “{r}”"));
-        }
         match copy.annotations.len() {
             0 => {}
             1 => along.push("1 annotation".into()),
@@ -2702,6 +2700,84 @@ impl App {
         }
         if qualities {
             self.status.push_str("; base qualities are not copied");
+        }
+    }
+
+    /// Asks before the empty columns at the ends of the open document (no
+    /// base in any sequence) are removed.
+    fn ask_trim(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let Some(od) = self.open.as_ref() else { return };
+        if od.linked.is_some() {
+            self.error = Some("Linked files are read-only and cannot be trimmed. Copy the rows to a new document first.".into());
+            return;
+        }
+        let Some((c0, c1)) = od.trim_window() else {
+            self.error = Some(if od.doc.base_window().is_none() {
+                "The document has no bases to trim to.".into()
+            } else {
+                "There are no empty columns at the ends of the document.".into()
+            });
+            return;
+        };
+        let t = crate::model::crop_tracks(&od.annotations, &od.features, c0, c1);
+        self.modal = Some(Modal::ConfirmTrim(TrimConfirm {
+            doc_id: od.info.id,
+            doc_name: od.info.name.clone(),
+            width: od.doc.width,
+            c0,
+            c1,
+            removed_annotations: t.removed_annotations.len(),
+            removed_features: t.removed_features.len(),
+            shortened_annotations: t.shortened_annotations,
+            shortened_features: t.shortened_features,
+        }));
+    }
+
+    /// Removes the empty columns at the ends of the open document, with the
+    /// annotations and features entirely in them.
+    fn confirm_trim(&mut self) {
+        let Some(Modal::ConfirmTrim(c)) = self.modal.take() else { return };
+        if self.busy() {
+            return;
+        }
+        let Some(od) = self.open.as_ref().filter(|o| o.info.id == c.doc_id) else { return };
+        let Some((c0, c1)) = od.trim_window() else { return };
+        let mut doc = (*od.doc).clone();
+        let changes = doc.crop(c0, c1);
+        let tracks = crate::model::crop_tracks(&od.annotations, &od.features, c0, c1);
+        if let Err(e) = self.db.save_crop(c.doc_id, &doc, &changes, &tracks) {
+            self.error = Some(e);
+            return;
+        }
+        let removed = od.doc.width - doc.width;
+        let mut gone = Vec::new();
+        match tracks.removed_annotations.len() {
+            0 => {}
+            1 => gone.push("1 annotation".to_string()),
+            n => gone.push(format!("{} annotations", canvas::group_digits(n))),
+        }
+        match tracks.removed_features.len() {
+            0 => {}
+            1 => gone.push("1 feature".to_string()),
+            n => gone.push(format!("{} features", canvas::group_digits(n))),
+        }
+        let prefs = self.settings.view.clone();
+        if let Some(od) = self.open.as_mut() {
+            od.apply_crop(c0, doc, tracks, &prefs);
+        }
+        self.reload_library();
+        self.status = format!(
+            "Trimmed “{}”: removed {} empty column{}, {} left",
+            c.doc_name,
+            canvas::group_digits(removed),
+            if removed == 1 { "" } else { "s" },
+            canvas::group_digits(c1 - c0)
+        );
+        if !gone.is_empty() {
+            self.status.push_str(&format!("; deleted {} outside them", join_and(&gone)));
         }
     }
 

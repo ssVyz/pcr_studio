@@ -175,6 +175,49 @@ impl Document {
         (Document::new(out), columns)
     }
 
+    /// Columns `[c0, c1)` from the first to the last base of any row (gaps
+    /// do not count); `None` without any base.
+    pub fn base_window(&self) -> Option<(usize, usize)> {
+        let mut window: Option<(usize, usize)> = None;
+        for r in &self.rows {
+            if let (Some(a), Some(b)) = (r.data.iter().position(|&x| x != GAP), r.data.iter().rposition(|&x| x != GAP)) {
+                let (a, b) = (r.start + a, r.start + b + 1);
+                window = Some(window.map_or((a, b), |(x, y)| (x.min(a), y.max(b))));
+            }
+        }
+        window
+    }
+
+    /// Keeps only columns `[c0, c1)`: the rows move left by `c0` and lose
+    /// what lies outside. Returns how each row changed.
+    pub fn crop(&mut self, c0: usize, c1: usize) -> Vec<Cropped> {
+        let changes = self
+            .rows
+            .iter_mut()
+            .map(|r| {
+                let (a, b) = (r.start.max(c0), r.end().min(c1));
+                if a >= b {
+                    let change = if r.data.is_empty() && r.start == 0 { Cropped::Unchanged } else { Cropped::Cut };
+                    r.start = 0;
+                    r.data.clear();
+                    return change;
+                }
+                let change = if a != r.start || b != r.end() {
+                    r.data = r.data[a - r.start..b - r.start].to_vec();
+                    Cropped::Cut
+                } else if c0 > 0 {
+                    Cropped::Moved
+                } else {
+                    Cropped::Unchanged
+                };
+                r.start = a - c0;
+                change
+            })
+            .collect();
+        self.width = c1.saturating_sub(c0);
+        changes
+    }
+
     /// Sorted list of all metadata keys present in any row.
     pub fn meta_keys(&self) -> Vec<String> {
         let mut keys: Vec<String> = Vec::new();
@@ -187,6 +230,62 @@ impl Document {
         }
         keys
     }
+}
+
+/// How a row changed in [`Document::crop`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cropped {
+    Unchanged,
+    /// Only its start column moved.
+    Moved,
+    /// Its data lost columns.
+    Cut,
+}
+
+/// Annotations and features after [`Document::crop`] (see [`crop_tracks`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CroppedTracks {
+    /// Those kept, moved to the new columns (ids unchanged).
+    pub annotations: Vec<Annotation>,
+    pub features: Vec<Feature>,
+    /// Ids of those entirely outside the kept columns.
+    pub removed_annotations: Vec<i64>,
+    pub removed_features: Vec<i64>,
+    /// How many of those kept lost columns at an end.
+    pub shortened_annotations: usize,
+    pub shortened_features: usize,
+}
+
+/// Moves annotations and features to the columns kept by cropping to
+/// `[c0, c1)`: those partly outside are shortened, those entirely outside
+/// removed (a feature keeps the parts it has inside).
+pub fn crop_tracks(annotations: &[Annotation], features: &[Feature], c0: usize, c1: usize) -> CroppedTracks {
+    let clip = |a: usize, b: usize| {
+        let (x, y) = (a.max(c0), b.min(c1));
+        (x < y).then(|| (x - c0, y - c0))
+    };
+    let mut out = CroppedTracks::default();
+    for a in annotations {
+        match clip(a.start, a.end) {
+            Some((s, e)) => {
+                out.shortened_annotations += (e - s != a.end - a.start) as usize;
+                out.annotations.push(Annotation { start: s, end: e, ..a.clone() });
+            }
+            None => out.removed_annotations.push(a.id),
+        }
+    }
+    out.annotations.sort_by_key(|a| (a.start, a.id));
+    for f in features {
+        let parts: Vec<(usize, usize)> = f.parts.iter().filter_map(|&(a, b)| clip(a, b)).collect();
+        if parts.is_empty() {
+            out.removed_features.push(f.id);
+            continue;
+        }
+        let kept: usize = parts.iter().map(|(a, b)| b - a).sum();
+        out.shortened_features += (kept != f.parts.iter().map(|(a, b)| b - a).sum::<usize>()) as usize;
+        out.features.push(Feature { parts, ..f.clone() });
+    }
+    out
 }
 
 /// Summary information about a stored document.
@@ -702,6 +801,39 @@ mod tests {
                 .map(|(i, s)| Row::from_gapped(format!("s{i}"), String::new(), s.as_bytes().to_vec()))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn crops_to_the_bases() {
+        // Bases in columns 3..9; s1 has gaps at its ends that are cut off.
+        let mut d = doc(&["---AC-G---", "------TAC-"]);
+        d.rows.push(Row { name: "gappy".into(), start: 1, data: b"--G-".to_vec(), ..Default::default() });
+        d.rows.push(Row::default());
+        d.width = 12;
+        assert_eq!(d.base_window(), Some((3, 9)));
+        assert_eq!(d.crop(3, 9), [Cropped::Moved, Cropped::Moved, Cropped::Cut, Cropped::Unchanged]);
+        assert_eq!(d.width, 6);
+        let shown: Vec<(usize, &[u8])> = d.rows.iter().map(|r| (r.start, r.data.as_slice())).collect();
+        assert_eq!(shown, [(0, &b"AC-G"[..]), (3, b"TAC"), (0, b"G-"), (0, b"")]);
+        assert_eq!(doc(&["---", "-"]).base_window(), None);
+        // Annotations and features move; outside ones go, partial ones shrink.
+        let ann = |id: i64, start: usize, end: usize| Annotation { id, name: String::new(), kind: AnnotationKind::Region, start, end, note: String::new(), color: None };
+        let feature = |id: i64, parts: Vec<(usize, usize)>| Feature {
+            id,
+            name: String::new(),
+            kind: "CDS".into(),
+            strand: 1,
+            parts,
+            location: String::new(),
+            qualifiers: Vec::new(),
+            source: String::new(),
+            color: None,
+        };
+        let t = crop_tracks(&[ann(1, 4, 6), ann(2, 0, 3), ann(3, 2, 5), ann(4, 8, 12)], &[feature(5, vec![(0, 2), (4, 6)]), feature(6, vec![(9, 11)])], 3, 9);
+        assert_eq!(t.annotations.iter().map(|a| (a.id, a.start, a.end)).collect::<Vec<_>>(), [(3, 0, 2), (1, 1, 3), (4, 5, 6)]);
+        assert_eq!((t.removed_annotations, t.shortened_annotations), (vec![2], 2));
+        assert_eq!(t.features.iter().map(|f| (f.id, f.parts.clone())).collect::<Vec<_>>(), [(5, vec![(1, 3)])]);
+        assert_eq!((t.removed_features, t.shortened_features), (vec![6], 1));
     }
 
     #[test]

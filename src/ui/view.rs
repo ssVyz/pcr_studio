@@ -328,6 +328,7 @@ impl App {
             ],
             menu::MenuId::Edit => vec![
                 Entry::item("Edit sequence…", "", self.editable_sequence().filter(|_| idle).map(Message::EditSequence)),
+                Entry::item("Trim to sequence range…", "", when(idle && writable && od.is_some_and(|o| o.trim_window().is_some()), Message::AskTrim)),
                 Entry::Separator,
                 Entry::item("Add annotation from selection…", "", when(selection && writable, Message::NewAnnotation)),
                 Entry::item("Serial annotation…", "", when(writable, Message::OpenSerialAnnotation)),

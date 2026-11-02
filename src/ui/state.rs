@@ -740,28 +740,65 @@ impl OpenDoc {
         v
     }
 
-    /// A new document of rows `rows` (in document order). The reference
-    /// comes along as the first row, so positions keep their meaning. An
-    /// alignment keeps all its columns, so the annotations and features
-    /// stay where they are; those past the new document's end are left out.
+    /// A new document of rows `rows` (in document order) exactly as they
+    /// are here, in the same columns, without the reference. The columns
+    /// stay, so the annotations and features come along unchanged (Trim
+    /// removes the empty columns at the ends).
     pub fn copy_of_rows(&self, rows: &[usize]) -> RowsCopy {
-        let reference = self.reference.filter(|r| !rows.contains(r));
-        let picked: Vec<Row> = reference.iter().chain(rows).filter_map(|&r| self.doc.rows.get(r).cloned()).collect();
+        let picked: Vec<Row> = rows.iter().filter_map(|&r| self.doc.rows.get(r).cloned()).collect();
         let kind = match self.info.kind {
             // Reads of linked files: as on FASTA import.
             DocKind::Linked | DocKind::Text => {
                 let any_gap = picked.iter().any(|r| r.start > 0 || r.data.contains(&GAP));
                 crate::fasta::alignment_kind(any_gap, &picked.iter().map(Row::end).collect::<Vec<_>>())
             }
+            // Mapped reads without the reference they were mapped to.
+            DocKind::Contig => DocKind::Alignment,
             k => k,
         };
+        let linked = self.linked.is_some();
         let mut doc = Document::new(picked);
-        if matches!(kind, DocKind::Alignment | DocKind::Contig) {
+        if !linked {
             doc.width = doc.width.max(self.doc.width);
         }
         let annotations = self.annotations.iter().filter(|a| a.end <= doc.width).cloned().collect();
         let features = self.features.iter().filter(|f| f.end() <= doc.width).cloned().collect();
-        RowsCopy { kind, reference: reference.map(|r| self.doc.rows[r].name.clone()), doc, annotations, features }
+        RowsCopy { kind, doc, annotations, features }
+    }
+
+    /// Columns `[c0, c1)` Trim keeps (from the first to the last base of any
+    /// sequence), when there are empty columns at the ends.
+    pub fn trim_window(&self) -> Option<(usize, usize)> {
+        self.doc.base_window().filter(|&(c0, c1)| c0 > 0 || c1 < self.doc.width)
+    }
+
+    /// Takes over the document cropped to columns `c0..` (after it was
+    /// saved) with its moved annotations and features. The column at the
+    /// center of the view stays there; the column selection and search hits
+    /// are cleared.
+    pub fn apply_crop(&mut self, c0: usize, doc: Document, tracks: crate::model::CroppedTracks, prefs: &ViewPrefs) {
+        let center = (self.vp.scroll_x + self.vp.visible_cols() / 2.0).max(0.0);
+        let c = self.cols.col(center as usize).saturating_sub(c0);
+        self.doc = Arc::new(doc);
+        self.info.width = self.doc.width;
+        self.annotations = tracks.annotations;
+        let ids: HashSet<i64> = self.annotations.iter().map(|a| a.id).collect();
+        self.selected_annotations.retain(|x| ids.contains(x));
+        if self.annotation_anchor.is_some_and(|x| !ids.contains(&x)) {
+            self.annotation_anchor = None;
+        }
+        self.set_features(tracks.features);
+        self.selection = None;
+        self.report = None;
+        self.popup_open = false;
+        self.search.hits.clear();
+        self.search.current = None;
+        self.hover = None;
+        // `update_columns` keeps the center column: find it in the new columns.
+        self.cols = ColumnMap::all(self.doc.width);
+        self.vp.scroll_x = c as f32 + center.fract() - self.vp.visible_cols() / 2.0;
+        self.recompute_stats(prefs);
+        self.rebuild_items();
     }
 
     /// Removes rows `rows` (after they were deleted in the library). The
@@ -817,8 +854,6 @@ impl OpenDoc {
 pub struct RowsCopy {
     pub kind: DocKind,
     pub doc: Document,
-    /// Name of the reference, copied along as the first row.
-    pub reference: Option<String>,
     pub annotations: Vec<Annotation>,
     pub features: Vec<Feature>,
 }
@@ -944,15 +979,18 @@ mod tests {
         // The reference is never one of the rows acted on.
         od.selected_rows.extend([4, 2, 1, 3]);
         assert_eq!(od.chosen_rows(), [1, 2, 4]);
-        // A copy starts with the reference; an alignment keeps its columns.
+        // A copy holds just the rows, in their columns, with all annotations.
         let copy = od.copy_of_rows(&[1, 2]);
-        assert_eq!(copy.doc.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["s3", "s1", "s2"]);
-        assert_eq!((copy.kind, copy.doc.width, copy.reference.as_deref(), copy.annotations.len()), (DocKind::Alignment, 8, Some("s3"), 2));
-        // A sequence list gets its own width: annotations past it stay behind.
-        od.info.kind = DocKind::Sequences;
-        let copy = od.copy_of_rows(&[1, 2]);
-        assert_eq!((copy.doc.width, copy.annotations.len()), (6, 1));
+        assert_eq!(copy.doc.rows.iter().map(|r| (r.name.as_str(), r.start, r.data.as_slice())).collect::<Vec<_>>(), [
+            ("s1", 0, &b"ACG"[..]),
+            ("s2", 2, b"GTAC")
+        ]);
+        assert_eq!((copy.kind, copy.doc.width, copy.annotations.len()), (DocKind::Alignment, 8, 2));
+        // Mapped reads without their reference are an alignment.
+        od.info.kind = DocKind::Contig;
+        assert_eq!(od.copy_of_rows(&[1]).kind, DocKind::Alignment);
         od.info.kind = DocKind::Alignment;
+        let s2_copy = od.copy_of_rows(&[2]);
         // Removing: the reference and search hits follow their rows.
         od.display.group_by = Some("only".into());
         od.search.hits = [Some(1), Some(3), None, Some(4)].map(|row| Hit { row, c0: 0, c1: 2, reverse: false, mismatches: 0 }).to_vec();
@@ -966,6 +1004,20 @@ mod tests {
         // Grouping by a field only a removed row had stops.
         assert_eq!((od.meta_keys.len(), od.display.group_by.as_ref()), (0, None));
         assert_eq!(od.items.len(), 2);
+
+        // Trim: a copy of s2 alone has empty columns at both ends.
+        let info = DocInfo { id: 2, n_rows: 1, reference: None, ..od.info.clone() };
+        let mut child = OpenDoc::new(info, s2_copy.doc, s2_copy.annotations, &ViewPrefs::default());
+        assert_eq!(child.trim_window(), Some((2, 6)));
+        let mut doc = (*child.doc).clone();
+        doc.crop(2, 6);
+        let tracks = crate::model::crop_tracks(&child.annotations, &child.features, 2, 6);
+        child.selected_annotations = vec![4, 8];
+        child.apply_crop(2, doc, tracks, &ViewPrefs::default());
+        assert_eq!((child.doc.width, child.info.width, child.doc.rows[0].start), (4, 4, 0));
+        assert_eq!(child.annotations.iter().map(|a| (a.id, a.start, a.end)).collect::<Vec<_>>(), [(4, 0, 2), (8, 0, 4)]);
+        assert_eq!(child.selected_annotations, [4, 8]);
+        assert_eq!((child.cols.len(), child.trim_window()), (4, None));
     }
 
     #[test]

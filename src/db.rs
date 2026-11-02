@@ -1,7 +1,7 @@
 //! SQLite document library, stored next to the executable (`pcr_studio.db`).
 
 use crate::linked::LinkedSet;
-use crate::model::{Annotation, AnnotationKind, DocInfo, DocKind, Document, Feature, Folder, Rgb, Row};
+use crate::model::{Annotation, AnnotationKind, Cropped, CroppedTracks, DocInfo, DocKind, Document, Feature, Folder, Rgb, Row};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
@@ -305,6 +305,52 @@ impl Db {
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(id)
+    }
+
+    /// Saves document `id` after [`Document::crop`]: the rows that changed
+    /// (`changes`), the new width and the moved, shortened or removed
+    /// annotations and features, all or nothing.
+    pub fn save_crop(&mut self, id: i64, doc: &Document, changes: &[Cropped], tracks: &CroppedTracks) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let n_rows: i64 = tx
+            .query_row("SELECT n_rows FROM documents WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Document {id} not found"))?;
+        if n_rows as usize != doc.rows.len() || changes.len() != doc.rows.len() {
+            return Err("The trimmed sequences do not match the document".into());
+        }
+        {
+            let mut moved = tx.prepare("UPDATE rows SET start = ?3 WHERE doc_id = ?1 AND idx = ?2").map_err(|e| e.to_string())?;
+            let mut cut = tx.prepare("UPDATE rows SET start = ?3, data = ?4 WHERE doc_id = ?1 AND idx = ?2").map_err(|e| e.to_string())?;
+            for (i, (r, change)) in doc.rows.iter().zip(changes).enumerate() {
+                match change {
+                    Cropped::Unchanged => 0,
+                    Cropped::Moved => moved.execute(params![id, i as i64, r.start as i64]).map_err(|e| e.to_string())?,
+                    Cropped::Cut => cut.execute(params![id, i as i64, r.start as i64, r.data]).map_err(|e| e.to_string())?,
+                };
+            }
+            let mut ann = tx.prepare("UPDATE annotations SET start_col = ?2, end_col = ?3 WHERE id = ?1 AND doc_id = ?4").map_err(|e| e.to_string())?;
+            for a in &tracks.annotations {
+                ann.execute(params![a.id, a.start as i64, a.end as i64, id]).map_err(|e| e.to_string())?;
+            }
+            let mut feat =
+                tx.prepare("UPDATE features SET start_col = ?2, end_col = ?3, parts = ?4 WHERE id = ?1 AND doc_id = ?5").map_err(|e| e.to_string())?;
+            for f in &tracks.features {
+                let parts = serde_json::to_string(&f.parts).map_err(|e| e.to_string())?;
+                feat.execute(params![f.id, f.start() as i64, f.end() as i64, parts, id]).map_err(|e| e.to_string())?;
+            }
+            let mut del = tx.prepare("DELETE FROM annotations WHERE id = ?1 AND doc_id = ?2").map_err(|e| e.to_string())?;
+            for &a in &tracks.removed_annotations {
+                del.execute(params![a, id]).map_err(|e| e.to_string())?;
+            }
+            let mut del = tx.prepare("DELETE FROM features WHERE id = ?1 AND doc_id = ?2").map_err(|e| e.to_string())?;
+            for &f in &tracks.removed_features {
+                del.execute(params![f, id]).map_err(|e| e.to_string())?;
+            }
+        }
+        tx.execute("UPDATE documents SET width = ?2 WHERE id = ?1", params![id, doc.width as i64]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Deletes rows `rows` of document `id`; the rows after them move up and
@@ -833,6 +879,25 @@ mod tests {
         assert!(db.insert_copy(&copy, Some((six, &[0, 1]))).is_err());
         assert_eq!(names_of(&db, six), ["c", "f"]);
         assert_eq!(db.list_documents().unwrap().len(), 3);
+        // Trimming to the bases: rows, width, annotations and features follow.
+        let rows = ["----AC-G--", "------TAC-"].map(|s| Row::from_gapped(s.into(), String::new(), s.as_bytes().to_vec()));
+        let mut doc = Document::new(rows.to_vec());
+        doc.width = 12;
+        let wide = db.insert_document("wide", DocKind::Alignment, &doc, None, "", None, &|_| {}).unwrap();
+        let kept = db.add_annotation(wide, &Annotation { start: 5, end: 7, ..ann.clone() }).unwrap();
+        let gone = db.add_annotation(wide, &Annotation { start: 0, end: 3, ..ann.clone() }).unwrap();
+        db.add_features(wide, &[Feature { parts: vec![(2, 6), (7, 8)], ..feature.clone() }]).unwrap();
+        let (c0, c1) = doc.base_window().unwrap();
+        let changes = doc.crop(c0, c1);
+        let tracks = crate::model::crop_tracks(&db.annotations(wide).unwrap(), &db.features(wide).unwrap(), c0, c1);
+        db.save_crop(wide, &doc, &changes, &tracks).unwrap();
+        let (info, loaded, anns) = db.load_document(wide, &|_| {}).unwrap();
+        assert_eq!((info.width, loaded.width), (5, 5));
+        assert_eq!(loaded.rows.iter().map(|r| (r.start, r.data.clone())).collect::<Vec<_>>(), [(0, b"AC-G".to_vec()), (2, b"TAC".to_vec())]);
+        assert_eq!(anns.iter().map(|a| (a.id, a.start, a.end)).collect::<Vec<_>>(), [(kept, 1, 3)]);
+        assert!(!anns.iter().any(|a| a.id == gone));
+        assert_eq!(db.features(wide).unwrap()[0].parts, [(0, 2), (3, 4)]);
+        assert!(db.save_crop(wide, &doc, &changes[..1], &tracks).is_err());
         drop(db);
         let _ = std::fs::remove_file(&path);
     }

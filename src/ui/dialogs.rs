@@ -69,6 +69,8 @@ pub enum Modal {
     ConfirmDeleteFolder { id: i64, name: String, documents: usize, subfolders: usize },
     /// Cutting the selected rows to a new document, or deleting them.
     ConfirmRows(RowsConfirm),
+    /// Removing the empty columns at the ends of the open document.
+    ConfirmTrim(TrimConfirm),
     NameFields { delimiter: String, keys: String },
     Info { title: String, text: String },
     Primersearch(PrimersearchDialog),
@@ -3437,10 +3439,9 @@ pub struct RowsConfirm {
     pub rows: Vec<usize>,
     /// Their names (a shortened list).
     pub names: String,
-    /// Cutting: the new document's name, the reference and the number of
-    /// annotations and features copied along.
+    /// Cutting: the new document's name and the number of annotations and
+    /// features copied along.
     pub new_name: String,
-    pub reference: Option<String>,
     pub annotations: usize,
     pub features: usize,
 }
@@ -3460,22 +3461,17 @@ impl RowsConfirm {
         ]
         .spacing(10);
         if self.cut {
-            let mut along = Vec::new();
-            if let Some(r) = &self.reference {
-                along.push(format!("the reference “{r}” (it also stays here)"));
+            let mut line = format!("New document “{}” in the same folder.", self.new_name);
+            let tracks = match (self.annotations, self.features) {
+                (0, 0) => None,
+                (a, 0) => Some((count(a, "annotation"), a == 1)),
+                (0, f) => Some((count(f, "feature"), f == 1)),
+                (a, f) => Some((format!("{} and {}", count(a, "annotation"), count(f, "feature")), false)),
+            };
+            if let Some((what, one)) = tracks {
+                line.push_str(&format!(" The {what} {} copied to it.", if one { "is" } else { "are" }));
             }
-            match (self.annotations, self.features) {
-                (0, 0) => {}
-                (a, 0) => along.push(count(a, "annotation")),
-                (0, f) => along.push(count(f, "feature")),
-                (a, f) => along.push(format!("{} and {}", count(a, "annotation"), count(f, "feature"))),
-            }
-            let mut new = format!("New document “{}” in the same folder", self.new_name);
-            if !along.is_empty() {
-                new.push_str(&format!(", with {}", along.join(" and ")));
-            }
-            new.push('.');
-            body = body.push(text(new).size(12));
+            body = body.push(text(line).size(12));
         }
         body = body.push(irreversible(if self.cut {
             "The sequences are removed from this document; the new document keeps them."
@@ -3495,6 +3491,67 @@ impl RowsConfirm {
         ]
         .spacing(10);
         dialog_frame(if self.cut { "Cut rows to a new document" } else { "Delete rows" }, body.into(), buttons.into(), 480.0)
+    }
+}
+
+/// Asks before the empty columns at the ends of the open document are removed.
+pub struct TrimConfirm {
+    pub doc_id: i64,
+    pub doc_name: String,
+    pub width: usize,
+    /// The columns kept: `[c0, c1)`.
+    pub c0: usize,
+    pub c1: usize,
+    pub removed_annotations: usize,
+    pub removed_features: usize,
+    pub shortened_annotations: usize,
+    pub shortened_features: usize,
+}
+
+impl TrimConfirm {
+    pub fn view(&self) -> Element<'_, Message> {
+        let (c0, c1, width) = (self.c0, self.c1, self.width);
+        let columns = |a: usize, b: usize| if a + 1 == b { format!("column {}", group_digits(b)) } else { format!("columns {}–{}", group_digits(a + 1), group_digits(b)) };
+        let empty: Vec<String> = [(c0 > 0).then(|| columns(0, c0)), (c1 < width).then(|| columns(c1, width))].into_iter().flatten().collect();
+        let kept = c1 - c0;
+        let mut body = column![
+            text(format!("Remove the {} empty columns at the ends of “{}”?", group_digits(width - kept), self.doc_name)).size(14),
+            text(format!(
+                "No sequence has a base in {}. The {} {} kept and become{} {}.",
+                empty.join(" or "),
+                columns(c0, c1),
+                if kept == 1 { "is" } else { "are" },
+                if kept == 1 { "s" } else { "" },
+                columns(0, kept),
+            ))
+            .size(12)
+            .style(style::muted),
+        ]
+        .spacing(10);
+        let tracks = |a: usize, f: usize| match (a, f) {
+            (0, 0) => None,
+            (a, 0) => Some((count(a, "annotation"), a == 1)),
+            (0, f) => Some((count(f, "feature"), f == 1)),
+            (a, f) => Some((format!("{} and {}", count(a, "annotation"), count(f, "feature")), false)),
+        };
+        let mut notes = Vec::new();
+        if let Some((what, one)) = tracks(self.removed_annotations, self.removed_features) {
+            notes.push(format!("{what} {} entirely in the removed columns and {} deleted.", if one { "lies" } else { "lie" }, if one { "is" } else { "are" }));
+        }
+        if let Some((what, one)) = tracks(self.shortened_annotations, self.shortened_features) {
+            notes.push(format!("{what} {} into them and {} shortened.", if one { "reaches" } else { "reach" }, if one { "is" } else { "are" }));
+        }
+        if !notes.is_empty() {
+            body = body.push(text(notes.join(" ")).size(12));
+        }
+        body = body.push(irreversible("The columns are removed permanently."));
+        let buttons = row![
+            Space::new().width(Fill),
+            button("Cancel").on_press(Message::CloseModal).style(button::secondary),
+            button("Trim").on_press(Message::ConfirmTrim).style(button::danger),
+        ]
+        .spacing(10);
+        dialog_frame("Trim to sequence range", body.into(), buttons.into(), 480.0)
     }
 }
 
@@ -3643,6 +3700,7 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
             dialog_frame("Delete folder", body.into(), buttons.into(), 440.0)
         }
         Modal::ConfirmRows(c) => c.view(),
+        Modal::ConfirmTrim(c) => c.view(),
         Modal::NameFields { delimiter, keys } => {
             let body = column![
                 text("Splits every sequence name at a delimiter and stores the parts as metadata fields (for sorting and grouping).").size(13),
