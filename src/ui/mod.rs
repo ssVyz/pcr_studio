@@ -15,15 +15,17 @@ use crate::fasta;
 use crate::linked::group::{self, Proposal};
 use crate::linked::{self, FileState, Format, Layout, LinkedSet, Role};
 use crate::mapper::{self, MapParams};
-use crate::model::{Annotation, AnnotationKind, ConsensusThreshold, DocInfo, DocKind, Document, Folder, Row};
+use crate::model::{Annotation, AnnotationKind, ConsensusThreshold, DocInfo, DocKind, Document, Feature, Folder, Row};
+use crate::net::NetConfig;
+use crate::net::entrez::{self, Credentials};
 use crate::primer::{self, OligoSource, Orientation, PrimerOptions};
 use crate::search::{self, Scope};
 use crate::tools::primersearch as ps;
 use crate::tools::{self, ToolConfig, ToolSpec, ToolStatus};
 use canvas::ViewMsg;
 use dialogs::{
-    AnnotationColorDialog, AnnotationDialog, EditTarget, ExportDialog, ExportRows, ImportFastaDialog, LinkFastqDialog, LinkedDialog, LinkedMsg, MapDialog, Modal,
-    PrimersearchDialog, RefChoice, SequenceDialog, SerialAnnotationDialog, SettingsDialog, TextView, TextViewMsg,
+    AnnotationDialog, ColorDialog, EditTarget, ExportDialog, ExportRows, FeatureDialog, FeatureImportDialog, ImportFastaDialog, LinkFastqDialog, LinkedDialog,
+    LinkedMsg, MapDialog, Modal, PrimersearchDialog, RefChoice, SequenceDialog, SerialAnnotationDialog, SettingsDialog, TextView, TextViewMsg,
 };
 use iced::keyboard::{self, Key, key::Named};
 use iced::{Subscription, Task, Theme};
@@ -64,6 +66,28 @@ pub struct AppSettings {
     pub tools: BTreeMap<String, ToolConfig>,
     /// Parameters of the last primersearch run.
     pub primersearch: ps::Params,
+    /// Access to NCBI (feature import).
+    pub ncbi: NcbiSettings,
+}
+
+/// Access to NCBI: the user's email address, which NCBI requires with every
+/// request, an optional API key and an optional proxy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NcbiSettings {
+    pub email: String,
+    pub api_key: String,
+    /// Empty: the system's proxy.
+    pub proxy: String,
+}
+
+impl NcbiSettings {
+    /// Connection and credentials for NCBI requests; `None` until a valid
+    /// email address is set (nothing is fetched without one).
+    pub fn ready(&self) -> Option<(NetConfig, Credentials)> {
+        entrez::valid_email(&self.email)
+            .then(|| (NetConfig { proxy: self.proxy.clone() }, Credentials { email: self.email.trim().to_string(), api_key: self.api_key.trim().to_string() }))
+    }
 }
 
 impl AppSettings {
@@ -85,6 +109,7 @@ impl Default for AppSettings {
             show_options: true,
             tools: BTreeMap::new(),
             primersearch: ps::Params::default(),
+            ncbi: NcbiSettings::default(),
         }
     }
 }
@@ -147,9 +172,9 @@ pub enum ContextTarget {
     Entry(LibKey),
     /// Free space in the library list.
     Empty,
-    /// The sequence viewer, on an annotation (id) or not; `col` is the
-    /// alignment column under the cursor.
-    Viewer { annotation: Option<i64>, col: Option<usize> },
+    /// The sequence viewer, on an annotation or a feature (id) or neither;
+    /// `col` is the alignment column under the cursor.
+    Viewer { annotation: Option<i64>, feature: Option<i64>, col: Option<usize> },
 }
 
 /// Where a dragged library entry would land.
@@ -333,6 +358,7 @@ pub enum Message {
     ToggleConsensus(bool),
     ToggleIdentity(bool),
     ToggleAnnotations(bool),
+    ToggleFeatures(bool),
     ToggleOverview(bool),
     ToggleColors(bool),
     SetGraph(state::GraphMode),
@@ -368,8 +394,9 @@ pub enum Message {
     SelectAnnotation(i64),
     /// Color of the selected annotations.
     OpenAnnotationColor,
-    AnnotationColorEdit(dialogs::ColorMsg),
-    ApplyAnnotationColor,
+    /// Edit in the color dialog (annotations or features).
+    ColorEdit(dialogs::ColorMsg),
+    ApplyColor,
     AskDeleteAnnotation(i64),
     /// Delete the selected annotations (asks first).
     AskDeleteSelectedAnnotations,
@@ -379,6 +406,23 @@ pub enum Message {
     OpenSerialAnnotation,
     SerialAnnotation(dialogs::SerialMsg),
     CreateSerialAnnotations,
+    // Features (imported from GenBank records)
+    /// The import dialog (NCBI or a GenBank file).
+    OpenFeatureImport,
+    FeatureImport(dialogs::FeatureImportMsg),
+    ImportFeatures,
+    /// Select a feature and its columns (side panel); Ctrl/Shift select several.
+    SelectFeature(i64),
+    SelectAllFeatures,
+    FeatureProperties(i64),
+    FeatureEdit(dialogs::FeatureMsg),
+    SaveFeature,
+    /// Color of the selected features.
+    OpenFeatureColor,
+    AskDeleteFeature(i64),
+    AskDeleteSelectedFeatures,
+    /// Deletion confirmed.
+    DeleteFeatures(Vec<i64>),
     // Metadata
     ImportMetadata,
     MetadataPicked(Option<PathBuf>),
@@ -863,8 +907,10 @@ impl App {
             move |p| {
                 let db = Db::open(&path)?;
                 let (info, doc, anns) = db.load_document(id, &|f| p.set(f * 0.8, "Loading sequences"))?;
+                let features = db.features(id)?;
                 p.set(0.85, "Computing consensus and statistics");
                 let mut open = OpenDoc::new(info, doc, anns, &prefs);
+                open.set_features(features);
                 open.set_row_h(row_h);
                 Ok(LoadedDoc { open })
             },
@@ -1641,7 +1687,8 @@ impl App {
                     Ok((info, doc, anns)) if doc.rows.len() == 1 => {
                         let row = doc.rows.into_iter().next().unwrap();
                         let annotation_ends = anns.iter().map(|a| a.end).collect();
-                        let target = EditTarget { id, doc_name: info.name, kind: info.kind, row, annotation_ends };
+                        let feature_ends = self.db.features(id).unwrap_or_default().iter().map(Feature::end).collect();
+                        let target = EditTarget { id, doc_name: info.name, kind: info.kind, row, annotation_ends, feature_ends };
                         self.modal = Some(Modal::Sequence(SequenceDialog::edit(target)));
                         return dialogs::focus_sequence();
                     }
@@ -1751,6 +1798,7 @@ impl App {
             Message::ToggleConsensus(b) => self.set_pref(|p| p.show_consensus = b),
             Message::ToggleIdentity(b) => self.set_pref(|p| p.show_identity = b),
             Message::ToggleAnnotations(b) => self.set_pref(|p| p.show_annotations = b),
+            Message::ToggleFeatures(b) => self.set_pref(|p| p.show_features = b),
             Message::ToggleOverview(b) => self.set_pref(|p| p.show_overview = b),
             Message::ToggleColors(b) => self.set_pref(|p| p.color_bases = b),
             Message::SetGraph(g) => self.set_pref(|p| p.graph = g),
@@ -1800,7 +1848,7 @@ impl App {
             Message::ClearRowSelection => self.with_doc(|od, _| od.selected_rows.clear()),
             Message::ClearSelection => self.with_doc(|od, _| {
                 od.selection = None;
-                od.clear_annotation_selection();
+                od.clear_track_selection();
                 od.report = None;
                 od.popup_open = false;
             }),
@@ -1877,15 +1925,15 @@ impl App {
                 if let Some(od) = self.open.as_ref()
                     && !od.selected_annotations.is_empty()
                 {
-                    self.modal = Some(Modal::AnnotationColor(AnnotationColorDialog::new(od)));
+                    self.modal = Some(Modal::Color(ColorDialog::annotations(od)));
                 }
             }
-            Message::AnnotationColorEdit(m) => {
-                if let Some(Modal::AnnotationColor(d)) = self.modal.as_mut() {
+            Message::ColorEdit(m) => {
+                if let Some(Modal::Color(d)) = self.modal.as_mut() {
                     d.color.update(m);
                 }
             }
-            Message::ApplyAnnotationColor => self.apply_annotation_color(),
+            Message::ApplyColor => self.apply_color(),
             Message::AskDeleteAnnotation(id) => self.ask_delete_annotations(vec![id]),
             Message::AskDeleteSelectedAnnotations => {
                 let ids = self.open.as_ref().map(|o| o.selected_annotations.clone()).unwrap_or_default();
@@ -1906,6 +1954,61 @@ impl App {
                 }
             }
             Message::CreateSerialAnnotations => self.create_serial_annotations(),
+            Message::OpenFeatureImport => {
+                if self.refuse_read_only("features") {
+                    return Task::none();
+                }
+                let Some(od) = self.open.as_ref() else { return Task::none() };
+                match FeatureImportDialog::new(od, self.settings.ncbi.ready()) {
+                    Ok(d) => self.modal = Some(Modal::FeatureImport(d)),
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            Message::FeatureImport(m) => {
+                // Results that arrive after the dialog was closed are dropped.
+                if let Some(Modal::FeatureImport(d)) = self.modal.as_mut()
+                    && let Some(task) = d.update(m)
+                {
+                    return task;
+                }
+            }
+            Message::ImportFeatures => self.import_features(),
+            Message::SelectFeature(id) => self.click_feature(id, true),
+            Message::SelectAllFeatures => self.with_doc(|od, _| {
+                od.selected_annotations.clear();
+                od.annotation_anchor = None;
+                od.selected_features = od.features.iter().map(|f| f.id).collect();
+                od.feature_anchor = od.features.first().map(|f| f.id);
+            }),
+            Message::FeatureProperties(id) => {
+                if let Some(od) = self.open.as_ref()
+                    && let Some(f) = od.feature(id)
+                {
+                    self.modal = Some(Modal::Feature(FeatureDialog::new(f, od)));
+                }
+            }
+            Message::FeatureEdit(m) => {
+                if let Some(Modal::Feature(d)) = self.modal.as_mut() {
+                    d.update(m);
+                }
+            }
+            Message::SaveFeature => self.save_feature(),
+            Message::OpenFeatureColor => {
+                if self.refuse_read_only("features") {
+                    return Task::none();
+                }
+                if let Some(od) = self.open.as_ref()
+                    && !od.selected_features.is_empty()
+                {
+                    self.modal = Some(Modal::Color(ColorDialog::features(od)));
+                }
+            }
+            Message::AskDeleteFeature(id) => self.ask_delete_features(vec![id]),
+            Message::AskDeleteSelectedFeatures => {
+                let ids = self.open.as_ref().map(|o| o.selected_features.clone()).unwrap_or_default();
+                self.ask_delete_features(ids);
+            }
+            Message::DeleteFeatures(ids) => self.delete_features(&ids),
             Message::ImportMetadata => {
                 if self.open.is_none() || self.refuse_read_only("metadata") {
                     return Task::none();
@@ -1989,6 +2092,10 @@ impl App {
             }
             Message::SaveSettings => {
                 if let Some(Modal::Settings(d)) = self.modal.take() {
+                    if d.problem().is_some() {
+                        self.modal = Some(Modal::Settings(d));
+                        return Task::none();
+                    }
                     d.apply(&mut self.settings);
                     self.save_settings();
                     self.after_selection_change();
@@ -2113,13 +2220,19 @@ impl App {
                 return Task::none();
             }
             ViewMsg::OpenAnnotation(id) => return self.update(Message::AnnotationProperties(id)),
+            ViewMsg::ClickFeature(id) => {
+                self.click_feature(id, false);
+                return Task::none();
+            }
+            ViewMsg::OpenFeature(id) => return self.update(Message::FeatureProperties(id)),
             ViewMsg::ResizeAnnotation { id, start, end, done } => {
                 self.resize_annotation(id, start, end, done);
                 return Task::none();
             }
-            ViewMsg::Context { pos, annotation, col } => {
-                // Right-click selects the annotation, like the library entries
-                // (one of several selected keeps them); the oligo report stays as it is.
+            ViewMsg::Context { pos, annotation, feature, col } => {
+                // Right-click selects the annotation or feature, like the library
+                // entries (one of several selected keeps them); the oligo report
+                // stays as it is.
                 if let Some(id) = annotation {
                     let popup = self.open.as_ref().is_some_and(|o| o.popup_open);
                     if self.open.as_ref().is_some_and(|o| o.selected_annotations.contains(&id)) {
@@ -2128,8 +2241,15 @@ impl App {
                         self.select_annotation(id, false, popup);
                     }
                 }
+                if let Some(id) = feature {
+                    if let Some(od) = self.open.as_mut().filter(|o| !o.selected_features.contains(&id)) {
+                        od.clear_feature_selection();
+                        od.feature_anchor = Some(id);
+                    }
+                    self.focus_feature(id, false);
+                }
                 self.menu = None;
-                self.context = Some(ContextMenu { target: ContextTarget::Viewer { annotation, col }, pos });
+                self.context = Some(ContextMenu { target: ContextTarget::Viewer { annotation, feature, col }, pos });
                 return Task::none();
             }
             _ => {}
@@ -2170,7 +2290,7 @@ impl App {
             }
             ViewMsg::Select { anchor, to, finished } => {
                 od.selection = Some(Selection::new(anchor, to));
-                od.clear_annotation_selection();
+                od.clear_track_selection();
                 if !finished {
                     // The report belongs to the previous selection until the drag ends.
                     od.popup_open = false;
@@ -2216,6 +2336,8 @@ impl App {
             ViewMsg::NameWidth { .. }
             | ViewMsg::ClickAnnotation(_)
             | ViewMsg::OpenAnnotation(_)
+            | ViewMsg::ClickFeature(_)
+            | ViewMsg::OpenFeature(_)
             | ViewMsg::ResizeAnnotation { .. }
             | ViewMsg::Context { .. } => {}
         }
@@ -2261,10 +2383,13 @@ impl App {
         if self.modal.is_some() {
             return Task::none();
         }
-        if let Key::Named(Named::Delete) = key
-            && self.open.as_ref().is_some_and(|o| !o.selected_annotations.is_empty())
-        {
-            return self.update(Message::AskDeleteSelectedAnnotations);
+        if let (Key::Named(Named::Delete), Some(od)) = (&key, self.open.as_ref()) {
+            if !od.selected_annotations.is_empty() {
+                return self.update(Message::AskDeleteSelectedAnnotations);
+            }
+            if !od.selected_features.is_empty() {
+                return self.update(Message::AskDeleteSelectedFeatures);
+            }
         }
         if modifiers.command() {
             if let Key::Character(c) = &key {
@@ -2329,7 +2454,7 @@ impl App {
         let (c0, c1) = (c0.min(c1), c0.max(c1));
         if b.is_some() {
             od.selection = Some(Selection::new(c0, c1));
-            od.clear_annotation_selection();
+            od.clear_track_selection();
             let opts = self.settings.primer;
             od.evaluate_selection(&opts);
             od.popup_open = self.settings.view.auto_report;
@@ -2382,7 +2507,7 @@ impl App {
         }
         od.clamp_view();
         od.selection = Some(Selection { anchor: h.c0, c0: h.c0, c1: h.c1 });
-        od.clear_annotation_selection();
+        od.clear_track_selection();
         od.evaluate_selection(&opts);
     }
 
@@ -2462,12 +2587,13 @@ impl App {
     }
 
     /// Makes an annotation the current one (added to the selection) and its
-    /// range the column selection; primer annotations set the report
-    /// orientation. `reveal` scrolls to it; `popup` is whether the oligo
-    /// report is shown afterwards.
+    /// range the column selection; features are deselected and primer
+    /// annotations set the report orientation. `reveal` scrolls to it;
+    /// `popup` is whether the oligo report is shown afterwards.
     fn focus_annotation(&mut self, id: i64, reveal: bool, popup: bool) {
         let Some(od) = self.open.as_mut() else { return };
         let Some(a) = od.annotation(id).cloned() else { return };
+        od.clear_feature_selection();
         match a.kind {
             AnnotationKind::ReversePrimer => self.settings.primer.orientation = Orientation::Reverse,
             AnnotationKind::ForwardPrimer => self.settings.primer.orientation = Orientation::Forward,
@@ -2498,6 +2624,7 @@ impl App {
             // Dragged edge: the annotation becomes the current one (others stay selected).
             od.selected_annotations.retain(|&x| x != id);
             od.selected_annotations.push(id);
+            od.clear_feature_selection();
         }
         od.selection = Some(Selection { anchor: start, c0: start, c1: end });
         if !done {
@@ -2633,32 +2760,159 @@ impl App {
         }
     }
 
-    /// Gives the annotations of the color dialog its color.
-    fn apply_annotation_color(&mut self) {
-        if self.refuse_read_only("annotations") {
+    /// Gives the annotations (or features) of the color dialog its color.
+    fn apply_color(&mut self) {
+        let features = matches!(&self.modal, Some(Modal::Color(d)) if d.features);
+        if self.refuse_read_only(if features { "features" } else { "annotations" }) {
             return;
         }
-        let Some(Modal::AnnotationColor(d)) = self.modal.as_ref() else { return };
+        let Some(Modal::Color(d)) = self.modal.as_ref() else { return };
         if d.color.problem().is_some() {
             return;
         }
         let (ids, color) = (d.ids.clone(), d.color.color);
         let Some(od) = self.open.as_mut() else { return };
-        if let Err(e) = self.db.set_annotation_color(&ids, color) {
+        let saved = if features { self.db.set_feature_color(&ids, color) } else { self.db.set_annotation_color(&ids, color) };
+        if let Err(e) = saved {
             self.error = Some(e);
             return;
         }
-        for a in od.annotations.iter_mut().filter(|a| ids.contains(&a.id)) {
-            a.color = color;
+        if features {
+            for f in od.features.iter_mut().filter(|f| ids.contains(&f.id)) {
+                f.color = color;
+            }
+        } else {
+            for a in od.annotations.iter_mut().filter(|a| ids.contains(&a.id)) {
+                a.color = color;
+            }
         }
         self.modal = None;
-        let what = match ids.len() {
-            1 => "1 annotation".to_string(),
-            n => format!("{n} annotations"),
+        let what = match (features, ids.len()) {
+            (false, 1) => "1 annotation".to_string(),
+            (false, n) => format!("{n} annotations"),
+            (true, 1) => "1 feature".to_string(),
+            (true, n) => format!("{n} features"),
         };
         self.status = match color {
             Some(c) => format!("Color of {what} set to {}", c.hex()),
             None => format!("Color of {what} set to the color of its type"),
+        };
+    }
+
+    /// A click on a feature (side panel or viewer), like one on an annotation.
+    fn click_feature(&mut self, id: i64, reveal: bool) {
+        let (ctrl, shift) = (self.modifiers.control(), self.modifiers.shift());
+        let Some(od) = self.open.as_mut() else { return };
+        match od.click_feature(id, ctrl, shift) {
+            Some(current) => self.focus_feature(current, reveal && current == id),
+            None => {
+                od.selection = None;
+                od.report = None;
+                od.popup_open = false;
+            }
+        }
+    }
+
+    /// Makes a feature the current one (added to the selection) and its span,
+    /// from its first to its last part, the column selection; annotations are
+    /// deselected. The oligo report stays closed (features are mostly long).
+    fn focus_feature(&mut self, id: i64, reveal: bool) {
+        let opts = self.settings.primer;
+        let Some(od) = self.open.as_mut() else { return };
+        let Some((start, end)) = od.feature(id).map(|f| (f.start(), f.end())) else { return };
+        od.selected_annotations.clear();
+        od.annotation_anchor = None;
+        od.selected_features.retain(|&x| x != id);
+        od.selected_features.push(id);
+        od.selection = Some(Selection { anchor: start, c0: start, c1: end });
+        od.evaluate_selection(&opts);
+        od.popup_open = false;
+        if reveal {
+            od.reveal_cols(start, end);
+        }
+    }
+
+    /// Adds the features chosen in the import dialog.
+    fn import_features(&mut self) {
+        if self.refuse_read_only("features") {
+            return;
+        }
+        let Some(Modal::FeatureImport(d)) = self.modal.as_ref() else { return };
+        if d.problem().is_some() {
+            return;
+        }
+        let (mut features, source) = (d.chosen(), d.source());
+        let Some(od) = self.open.as_mut() else { return };
+        let ids = match self.db.add_features(od.info.id, &features) {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        for (f, id) in features.iter_mut().zip(ids) {
+            f.id = id;
+        }
+        let n = features.len();
+        let mut all = std::mem::take(&mut od.features);
+        all.extend(features);
+        od.set_features(all);
+        self.modal = None;
+        let what = if n == 1 { "1 feature".to_string() } else { format!("{} features", canvas::group_digits(n)) };
+        self.status = format!("Imported {what} from {source}");
+        if !self.settings.view.show_features {
+            self.set_pref(|p| p.show_features = true);
+        }
+    }
+
+    /// Saves name and color from the feature dialog.
+    fn save_feature(&mut self) {
+        if self.refuse_read_only("features") {
+            return;
+        }
+        let Some(Modal::Feature(d)) = self.modal.as_ref() else { return };
+        if d.problem().is_some() {
+            return;
+        }
+        let (id, name, color) = (d.id, d.name.trim().to_string(), d.color.color);
+        let Some(f) = self.open.as_mut().and_then(|od| od.features.iter_mut().find(|f| f.id == id)) else { return };
+        let updated = Feature { name, color, ..f.clone() };
+        if let Err(e) = self.db.update_feature(&updated) {
+            self.error = Some(e);
+            return;
+        }
+        self.status = format!("Feature “{}” saved", updated.name);
+        *f = updated;
+        self.modal = None;
+    }
+
+    /// Asks whether to delete features (in document order).
+    fn ask_delete_features(&mut self, ids: Vec<i64>) {
+        let Some(od) = self.open.as_ref() else { return };
+        let ids: std::collections::HashSet<i64> = ids.into_iter().collect();
+        let fs: Vec<&Feature> = od.features.iter().filter(|f| ids.contains(&f.id)).collect();
+        let (name, detail) = match fs.as_slice() {
+            [] => return,
+            [f] => (f.name.clone(), format!("{} · {} · from {}", f.kind, annotation_range_label(od, f.start(), f.end()), f.source)),
+            _ => (String::new(), dialogs::name_list(&fs.iter().map(|f| f.name.as_str()).collect::<Vec<_>>())),
+        };
+        let ids = fs.iter().map(|f| f.id).collect();
+        self.modal = Some(Modal::ConfirmDeleteFeatures { ids, name, detail });
+    }
+
+    fn delete_features(&mut self, ids: &[i64]) {
+        self.modal = None;
+        if let Err(e) = self.db.delete_features(ids) {
+            self.error = Some(e);
+            return;
+        }
+        let Some(od) = self.open.as_mut() else { return };
+        let gone: std::collections::HashSet<i64> = ids.iter().copied().collect();
+        let (deleted, kept): (Vec<Feature>, Vec<Feature>) = std::mem::take(&mut od.features).into_iter().partition(|f| gone.contains(&f.id));
+        od.set_features(kept);
+        self.status = match deleted.as_slice() {
+            [one] => format!("Deleted feature “{}”", one.name),
+            _ => format!("Deleted {} features", canvas::group_digits(deleted.len())),
         };
     }
 
@@ -3149,11 +3403,14 @@ impl App {
             _ => fasta::alignment_kind(d.records[0].seq.contains(&crate::seq::GAP), &[row.end()]),
         };
         match self.db.replace_single_row(t.id, &name, kind, &row) {
-            Ok(dropped) => {
+            Ok((dropped, dropped_features)) => {
                 self.reload_library();
                 self.status = format!("Saved “{name}” ({} bp)", canvas::group_digits(row.ungapped_len()));
                 if dropped > 0 {
                     self.status.push_str(&format!("; removed {dropped} annotation(s) past the new end"));
+                }
+                if dropped_features > 0 {
+                    self.status.push_str(&format!("; removed {dropped_features} feature(s) past the new end"));
                 }
                 if self.open.as_ref().is_some_and(|o| o.info.id == t.id) {
                     // Reload (one sequence: quick) so consensus, statistics and
@@ -3161,6 +3418,7 @@ impl App {
                     match self.db.load_document(t.id, &|_| {}) {
                         Ok((info, doc, anns)) => {
                             let mut od = OpenDoc::new(info, doc, anns, &self.settings.view);
+                            od.set_features(self.db.features(t.id).unwrap_or_default());
                             if let Some(old) = &self.open {
                                 od.vp = old.vp;
                             }

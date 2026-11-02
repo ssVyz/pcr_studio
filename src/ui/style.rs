@@ -251,6 +251,37 @@ pub const ANNOTATION_COLORS: [crate::model::Rgb; 12] = {
     ]
 };
 
+/// Default color of a feature type (GenBank key); the same in light and dark mode.
+pub fn feature_kind_color(kind: &str) -> crate::model::Rgb {
+    let c = &ANNOTATION_COLORS;
+    match kind {
+        "gene" => c[4],
+        "CDS" => c[2],
+        "mRNA" | "precursor_RNA" | "prim_transcript" => c[9],
+        "rRNA" | "tRNA" | "ncRNA" | "misc_RNA" | "tmRNA" => c[8],
+        "mat_peptide" | "sig_peptide" | "transit_peptide" | "propeptide" => c[5],
+        "5'UTR" | "3'UTR" => c[6],
+        "regulatory" | "promoter" | "enhancer" | "terminator" | "RBS" | "polyA_signal" => c[0],
+        "stem_loop" | "misc_structure" => c[1],
+        "primer_bind" | "protein_bind" | "misc_binding" => c[7],
+        "variation" | "misc_difference" | "modified_base" => c[3],
+        "repeat_region" | "mobile_element" | "LTR" => c[10],
+        _ => c[11],
+    }
+}
+
+/// Color of a feature (its outline): its own, else the color of its type.
+pub fn feature_color(f: &crate::model::Feature) -> Color {
+    from_rgb(f.color.unwrap_or_else(|| feature_kind_color(&f.kind)))
+}
+
+/// Inside of a feature: its color, much lighter (features are drawn as
+/// outlined light boxes, annotations as solid shapes).
+pub fn feature_fill(c: Color) -> Color {
+    let t = 0.62;
+    Color { r: c.r + (1.0 - c.r) * t, g: c.g + (1.0 - c.g) * t, b: c.b + (1.0 - c.b) * t, a: 1.0 }
+}
+
 pub fn app_theme(dark: bool) -> Theme {
     if dark {
         Theme::custom(
@@ -358,5 +389,9 @@ mod tests {
         }
         assert_eq!(annotation_text(from_rgb(ANNOTATION_COLORS[2])), DARK_TEXT);
         assert_eq!(annotation_text(from_rgb(ANNOTATION_COLORS[7])), Color::WHITE);
+        // Labels inside features (light boxes) are dark for every preset.
+        for c in ANNOTATION_COLORS {
+            assert_eq!(annotation_text(feature_fill(from_rgb(c))), DARK_TEXT, "{}", c.hex());
+        }
     }
 }

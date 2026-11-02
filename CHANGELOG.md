@@ -7,6 +7,47 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.1.5] - 2026-11-02
+
+### Added
+
+- **Features from GenBank records** (File menu **Import features (NCBI, GenBank)…**, or
+  **Import…** under **Features** in the side panel): genes, CDS, mature peptides, UTRs and the
+  other features of a GenBank record are added to the reference (without one: the only sequence,
+  or the one selected row). The record is either **fetched from NCBI** by accession (prefilled
+  from the sequence name, e.g. `MN908947.3`) or read from a **GenBank file** (`.gb`, `.gbk`).
+  - The record must have the same length as the sequence, otherwise nothing is imported (a record
+    of another length is not downloaded further). The dialog also says whether the sequences are
+    identical or at how many positions they differ.
+  - All features are listed with name, type and location; each one, or a whole type, can be left
+    out. The `source` feature (the whole record) is left out unless chosen, and features already
+    imported are not offered again. The color is chosen as for annotations: by type (each feature
+    type has its own color) or one color for all.
+  - Joined locations (`join(…)`) keep their parts; `complement(…)` gives the minus strand.
+- **Features are kept apart from annotations**: their own lanes under the annotations in the
+  viewer (“Features”), drawn as light boxes with a colored outline (pointed on stranded features,
+  parts joined by a line), and their own **Features** list in the side panel. **Display →
+  Features** hides them. A click selects a feature and its columns (Ctrl/Shift+click for several,
+  **Select all** in the panel); double-click or right-click shows its details (type, strand,
+  position, record, location, qualifiers), where name and color can be changed. Several features
+  can be colored or deleted at once (also with the Delete key).
+- **Settings → NCBI**: your **email address** (required: NCBI asks for it with every request;
+  without one nothing is fetched), an optional **API key** and an optional **proxy**, with
+  **Test connection**. Only the email address and the accession numbers looked up are sent, to
+  NCBI (eutils.ncbi.nlm.nih.gov), at most 3 requests per second (10 with an API key).
+
+### Changed
+
+- New dependency **ureq** (HTTP client) for the NCBI requests; all network code is in `src/net/`.
+  HTTPS certificates are checked against the Windows certificate store (so networks that inspect
+  HTTPS with their own certificate work); the proxy comes from the settings, else from the Windows
+  Internet settings or the `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` variables (automatic proxy
+  configuration scripts are not read).
+- Editing a sequence removes features past its new end, like annotations, and says so beforehand.
+- **Settings**: Save and Cancel stay visible when the settings are taller than the dialog; the
+  settings scroll above them.
+- The library database gets a table for features; older libraries are upgraded on start.
+
 ## [0.1.4] - 2026-10-29
 
 ### Added

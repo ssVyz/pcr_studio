@@ -5,9 +5,12 @@ mod db;
 mod demo;
 mod display;
 mod fasta;
+mod genbank;
 mod linked;
 mod mapper;
 mod model;
+/// All network access (NCBI).
+mod net;
 mod primer;
 mod search;
 mod seq;

@@ -1,7 +1,7 @@
 //! SQLite document library, stored next to the executable (`pcr_studio.db`).
 
 use crate::linked::LinkedSet;
-use crate::model::{Annotation, AnnotationKind, DocInfo, DocKind, Document, Folder, Rgb, Row};
+use crate::model::{Annotation, AnnotationKind, DocInfo, DocKind, Document, Feature, Folder, Rgb, Row};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
@@ -49,6 +49,20 @@ CREATE TABLE IF NOT EXISTS annotations (
     start_col   INTEGER NOT NULL,
     end_col     INTEGER NOT NULL,
     note        TEXT NOT NULL DEFAULT '',
+    color       TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS features (
+    id          INTEGER PRIMARY KEY,
+    doc_id      INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    strand      INTEGER NOT NULL DEFAULT 0,
+    start_col   INTEGER NOT NULL,
+    end_col     INTEGER NOT NULL,
+    parts       TEXT NOT NULL,
+    location    TEXT NOT NULL DEFAULT '',
+    qualifiers  TEXT NOT NULL DEFAULT '[]',
+    source      TEXT NOT NULL DEFAULT '',
     color       TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS folders (
@@ -297,9 +311,9 @@ impl Db {
     }
 
     /// Replaces the sequence of a single-sequence document and renames the
-    /// document. Annotations that end past the new sequence are removed;
-    /// returns how many.
-    pub fn replace_single_row(&mut self, id: i64, doc_name: &str, kind: DocKind, row: &Row) -> Result<usize, String> {
+    /// document. Annotations and features that end past the new sequence are
+    /// removed; returns how many of each.
+    pub fn replace_single_row(&mut self, id: i64, doc_name: &str, kind: DocKind, row: &Row) -> Result<(usize, usize), String> {
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
         let n_rows: i64 = tx
             .query_row("SELECT n_rows FROM documents WHERE id = ?1", params![id], |r| r.get(0))
@@ -318,8 +332,9 @@ impl Db {
         )
         .map_err(|e| e.to_string())?;
         let dropped = tx.execute("DELETE FROM annotations WHERE doc_id = ?1 AND end_col > ?2", params![id, width]).map_err(|e| e.to_string())?;
+        let features = tx.execute("DELETE FROM features WHERE doc_id = ?1 AND end_col > ?2", params![id, width]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(dropped)
+        Ok((dropped, features))
     }
 
     /// Stores a new row order: row `order[i]` becomes row `i`; `reference` is
@@ -444,6 +459,100 @@ impl Db {
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
         {
             let mut st = tx.prepare("DELETE FROM annotations WHERE id = ?1").map_err(|e| e.to_string())?;
+            for &id in ids {
+                st.execute(params![id]).map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn features(&self, doc_id: i64) -> Result<Vec<Feature>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT id, name, kind, strand, parts, location, qualifiers, source, color FROM features WHERE doc_id = ?1 ORDER BY start_col, end_col, id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map(params![doc_id], |r| {
+                Ok(Feature {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: r.get(2)?,
+                    strand: r.get::<_, i64>(3)?.clamp(-1, 1) as i8,
+                    parts: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
+                    location: r.get(5)?,
+                    qualifiers: meta_from_json(&r.get::<_, String>(6)?),
+                    source: r.get(7)?,
+                    color: Rgb::parse(&r.get::<_, String>(8)?),
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        // A damaged entry without parts cannot be shown.
+        out.retain(|f| !f.parts.is_empty());
+        Ok(out)
+    }
+
+    /// Stores features of a document, all or none; returns their ids.
+    pub fn add_features(&mut self, doc_id: i64, features: &[Feature]) -> Result<Vec<i64>, String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let mut ids = Vec::with_capacity(features.len());
+        {
+            let mut st = tx
+                .prepare(
+                    "INSERT INTO features (doc_id, name, kind, strand, start_col, end_col, parts, location, qualifiers, source, color)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                )
+                .map_err(|e| e.to_string())?;
+            for f in features {
+                let parts = serde_json::to_string(&f.parts).map_err(|e| e.to_string())?;
+                st.execute(params![
+                    doc_id,
+                    f.name,
+                    f.kind,
+                    f.strand as i64,
+                    f.start() as i64,
+                    f.end() as i64,
+                    parts,
+                    f.location,
+                    meta_to_json(&f.qualifiers),
+                    f.source,
+                    color_text(f.color)
+                ])
+                .map_err(|e| e.to_string())?;
+                ids.push(tx.last_insert_rowid());
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(ids)
+    }
+
+    /// Saves the name and color of a feature (the rest comes from its record).
+    pub fn update_feature(&self, f: &Feature) -> Result<(), String> {
+        self.conn
+            .execute("UPDATE features SET name = ?2, color = ?3 WHERE id = ?1", params![f.id, f.name, color_text(f.color)])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Gives features one color (`None`: the color of their type), all or none.
+    pub fn set_feature_color(&mut self, ids: &[i64], color: Option<Rgb>) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        {
+            let mut st = tx.prepare("UPDATE features SET color = ?2 WHERE id = ?1").map_err(|e| e.to_string())?;
+            for &id in ids {
+                st.execute(params![id, color_text(color)]).map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Deletes features, all or none.
+    pub fn delete_features(&mut self, ids: &[i64]) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        {
+            let mut st = tx.prepare("DELETE FROM features WHERE id = ?1").map_err(|e| e.to_string())?;
             for &id in ids {
                 st.execute(params![id]).map_err(|e| e.to_string())?;
             }
@@ -617,9 +726,34 @@ mod tests {
             )
             .unwrap();
         }
+        let feature = |parts: Vec<(usize, usize)>| Feature {
+            id: 0,
+            name: "S".into(),
+            kind: "CDS".into(),
+            strand: -1,
+            parts,
+            location: "complement(join(1..2,4..5))".into(),
+            qualifiers: vec![("gene".into(), "S".into())],
+            source: "X1.1".into(),
+            color: None,
+        };
+        let fids = db.add_features(single, &[feature(vec![(0, 2), (3, 5)]), feature(vec![(6, 8)])]).unwrap();
+        let mut stored = db.features(single).unwrap();
+        assert_eq!(stored.iter().map(|f| f.id).collect::<Vec<_>>(), fids);
+        assert_eq!(stored[0], Feature { id: fids[0], ..feature(vec![(0, 2), (3, 5)]) });
+        stored[0].name = "spike".into();
+        stored[0].color = Some(Rgb(1, 2, 3));
+        db.update_feature(&stored[0]).unwrap();
+        db.set_feature_color(&[fids[1]], Some(Rgb(4, 5, 6))).unwrap();
+        let again = db.features(single).unwrap();
+        assert_eq!((again[0].name.as_str(), again[0].color, again[1].color), ("spike", Some(Rgb(1, 2, 3)), Some(Rgb(4, 5, 6))));
         let mut edited = Row::from_gapped("s2".into(), "d".into(), b"AC-GTA".to_vec());
         edited.set_meta("k", "v".into());
-        assert_eq!(db.replace_single_row(single, "renamed", DocKind::Alignment, &edited).unwrap(), 1);
+        // The second annotation and the second feature end past the new sequence.
+        assert_eq!(db.replace_single_row(single, "renamed", DocKind::Alignment, &edited).unwrap(), (1, 1));
+        assert_eq!(db.features(single).unwrap().len(), 1);
+        db.delete_features(&[fids[0]]).unwrap();
+        assert!(db.features(single).unwrap().is_empty());
         let (info, loaded, anns) = db.load_document(single, &|_| {}).unwrap();
         assert_eq!((info.name.as_str(), info.kind, info.width, info.n_rows), ("renamed", DocKind::Alignment, 6, 1));
         assert_eq!((loaded.rows[0].name.as_str(), loaded.rows[0].data.as_slice()), ("s2", &b"AC-GTA"[..]));

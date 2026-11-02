@@ -1,13 +1,14 @@
 //! The alignment viewer: a canvas drawing only the visible part of the
 //! alignment. Layout (top to bottom): overview strip, ruler, consensus,
-//! identity graph, annotation lanes, pinned reference row, sequence rows.
+//! identity graph, annotation lanes, feature lanes, pinned reference row,
+//! sequence rows.
 //! A name column sits on the left, scrollbars on the right and bottom.
 
 use super::Message;
 use super::state::{Highlight, Hover, OpenDoc, ReadDisplay, ViewPrefs};
 use super::style::{self, Palette};
 use crate::display::Item;
-use crate::model::{Annotation, Row};
+use crate::model::{Annotation, Feature, Row};
 use crate::seq::GAP;
 use iced::alignment::Vertical;
 use iced::mouse::{self, Cursor, ScrollDelta};
@@ -20,6 +21,8 @@ const RULER_H: f32 = 24.0;
 const IDENTITY_H: f32 = 42.0;
 const LANE_H: f32 = 18.0;
 const MAX_LANES: usize = 8;
+const FEATURE_LANE_H: f32 = 17.0;
+pub const MAX_FEATURE_LANES: usize = 10;
 
 #[derive(Debug, Clone)]
 pub enum ViewMsg {
@@ -38,9 +41,13 @@ pub enum ViewMsg {
     OpenAnnotation(i64),
     /// Dragging an annotation edge; `done` on release.
     ResizeAnnotation { id: i64, start: usize, end: usize, done: bool },
-    /// Right-click at `pos` (window coordinates), on an annotation or not;
-    /// `col` is the alignment column under the cursor.
-    Context { pos: Point, annotation: Option<i64>, col: Option<usize> },
+    /// Click on a feature (selects it).
+    ClickFeature(i64),
+    /// Double-click on a feature (details).
+    OpenFeature(i64),
+    /// Right-click at `pos` (window coordinates), on an annotation, a
+    /// feature or neither; `col` is the alignment column under the cursor.
+    Context { pos: Point, annotation: Option<i64>, feature: Option<i64>, col: Option<usize> },
     /// Dragging the right edge of the name column; `done` on release.
     NameWidth { w: f32, done: bool },
 }
@@ -58,6 +65,8 @@ pub struct Lay {
     pub identity: Option<(f32, f32)>,
     pub annotations: Option<(f32, f32)>,
     pub lanes: Vec<usize>,
+    /// Band of the imported features (their lanes are in `OpenDoc::feature_lanes`).
+    pub features: Option<(f32, f32)>,
     pub reference: Option<(f32, f32)>,
     pub rows_y0: f32,
     pub rows_h: f32,
@@ -65,21 +74,29 @@ pub struct Lay {
 
 /// Greedy lane assignment for overlapping annotations.
 pub fn annotation_lanes(anns: &[Annotation]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..anns.len()).collect();
-    order.sort_by_key(|&i| (anns[i].start, anns[i].end));
+    let spans: Vec<(usize, usize)> = anns.iter().map(|a| (a.start, a.end)).collect();
+    lanes(&spans, MAX_LANES)
+}
+
+/// Greedy lane assignment for overlapping column ranges `[start, end)`:
+/// each goes into the first lane free at its start; beyond `max` lanes the
+/// last one is shared.
+pub fn lanes(spans: &[(usize, usize)], max: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..spans.len()).collect();
+    order.sort_by_key(|&i| spans[i]);
     let mut lane_end: Vec<usize> = Vec::new();
-    let mut lanes = vec![0; anns.len()];
+    let mut lanes = vec![0; spans.len()];
     for i in order {
-        let a = &anns[i];
-        let lane = match lane_end.iter().position(|&e| e <= a.start) {
+        let (start, end) = spans[i];
+        let lane = match lane_end.iter().position(|&e| e <= start) {
             Some(l) => l,
-            None if lane_end.len() < MAX_LANES => {
+            None if lane_end.len() < max => {
                 lane_end.push(0);
                 lane_end.len() - 1
             }
-            None => MAX_LANES - 1,
+            None => max - 1,
         };
-        lane_end[lane] = lane_end[lane].max(a.end);
+        lane_end[lane] = lane_end[lane].max(end);
         lanes[i] = lane;
     }
     lanes
@@ -102,10 +119,12 @@ pub fn layout(od: &OpenDoc, prefs: &ViewPrefs, size: Size) -> Lay {
     let lanes = annotation_lanes(&od.annotations);
     let n_lanes = lanes.iter().map(|l| l + 1).max().unwrap_or(0);
     let annotations = (prefs.show_annotations && n_lanes > 0).then(|| take(n_lanes as f32 * LANE_H + 4.0));
+    let f_lanes = od.feature_lanes.iter().map(|l| l + 1).max().unwrap_or(0);
+    let features = (prefs.show_features && f_lanes > 0).then(|| take(f_lanes as f32 * FEATURE_LANE_H + 4.0));
     let reference = od.reference.map(|_| take(track_h.max(od.vp.row_h)));
     let rows_y0 = y + 2.0;
     let rows_h = (size.height - SB - rows_y0).max(10.0);
-    Lay { w: size.width, h: size.height, seq_x0, seq_w, overview, ruler, consensus, identity, annotations, lanes, reference, rows_y0, rows_h }
+    Lay { w: size.width, h: size.height, seq_x0, seq_w, overview, ruler, consensus, identity, annotations, lanes, features, reference, rows_y0, rows_h }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -143,8 +162,9 @@ pub struct CanvasState {
     drag: Drag,
     modifiers: keyboard::Modifiers,
     last_hover: Option<Hover>,
-    /// Last click on an annotation body (double-click detection).
-    last_click: Option<(std::time::Instant, i64)>,
+    /// Last click on an annotation body or a feature (double-click
+    /// detection): when, on a feature or not, its id.
+    last_click: Option<(std::time::Instant, bool, i64)>,
 }
 
 /// Part of an annotation under the cursor.
@@ -244,6 +264,30 @@ impl AlignmentView<'_> {
             }
         }
         best.map(|(i, part, _)| (i, part))
+    }
+
+    /// Feature (index) under `p` in the feature lanes: the one whose span
+    /// (from its first to its last part) holds the cursor, the selected one
+    /// first, else the shortest.
+    fn feature_at(&self, lay: &Lay, p: Point) -> Option<usize> {
+        let (y0, _) = lay.features.filter(|_| in_band(p.y, lay.features) && p.x >= lay.seq_x0)?;
+        let lane = ((p.y - y0 - 2.0) / FEATURE_LANE_H).floor().max(0.0) as usize;
+        let od = self.od;
+        let mut best: Option<(usize, (bool, usize))> = None;
+        for (i, f) in od.features.iter().enumerate() {
+            if od.feature_lanes[i] != lane {
+                continue;
+            }
+            let (x0, x1) = (self.x_col(lay, f.start()), self.x_col(lay, f.end()).max(self.x_col(lay, f.start()) + 3.0));
+            if p.x < x0 - 1.0 || p.x > x1 + 1.0 {
+                continue;
+            }
+            let score = (!od.selected_features.contains(&f.id), f.end() - f.start());
+            if best.is_none_or(|b| score < b.1) {
+                best = Some((i, score));
+            }
+        }
+        best.map(|b| b.0)
     }
 
     /// Display boundary nearest to `x`.
@@ -360,12 +404,19 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                 if p.x > lay.seq_x0 + lay.seq_w || width == 0 {
                     return None;
                 }
+                if let Some(i) = self.feature_at(&lay, p) {
+                    let id = self.od.features[i].id;
+                    let now = std::time::Instant::now();
+                    let double = state.last_click.is_some_and(|(t, feature, x)| feature && x == id && now - t <= DOUBLE_CLICK);
+                    state.last_click = (!double).then_some((now, true, id));
+                    return msg(if double { ViewMsg::OpenFeature(id) } else { ViewMsg::ClickFeature(id) });
+                }
                 if let Some((i, part)) = self.annotation_at(&lay, p) {
                     let a = &self.od.annotations[i];
                     if part == Part::Body {
                         let now = std::time::Instant::now();
-                        let double = state.last_click.is_some_and(|(t, id)| id == a.id && now - t <= DOUBLE_CLICK);
-                        state.last_click = (!double).then_some((now, a.id));
+                        let double = state.last_click.is_some_and(|(t, feature, id)| !feature && id == a.id && now - t <= DOUBLE_CLICK);
+                        state.last_click = (!double).then_some((now, false, a.id));
                         return msg(if double { ViewMsg::OpenAnnotation(a.id) } else { ViewMsg::ClickAnnotation(a.id) });
                     }
                     // Grabbing an edge selects the annotation and starts resizing it.
@@ -387,9 +438,10 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                     return None;
                 }
                 let annotation = self.annotation_at(&lay, p).map(|(i, _)| self.od.annotations[i].id);
+                let feature = self.feature_at(&lay, p).map(|i| self.od.features[i].id);
                 let d = self.col_at(&lay, p.x);
                 let col = (p.x >= lay.seq_x0 && d >= 0.0 && (d as usize) < self.od.view_width()).then(|| self.col_index(&lay, p.x));
-                return msg(ViewMsg::Context { pos: cursor.position()?, annotation, col });
+                return msg(ViewMsg::Context { pos: cursor.position()?, annotation, feature, col });
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let Some(p) = cursor.position_in(bounds).or_else(|| cursor.position().map(|q| Point::new(q.x - bounds.x, q.y - bounds.y)))
@@ -524,7 +576,7 @@ impl canvas::Program<Message> for AlignmentView<'_> {
                 Some(_) => return mouse::Interaction::ResizingHorizontally,
                 None => {}
             }
-            if in_band(p.y, lay.overview) {
+            if in_band(p.y, lay.overview) || self.feature_at(&lay, p).is_some() {
                 return mouse::Interaction::Pointer;
             }
             return mouse::Interaction::Crosshair;
@@ -1084,6 +1136,18 @@ impl Drawer<'_, '_> {
             }
         }
 
+        // Features.
+        if let Some((y0, _)) = lay.features {
+            for (i, ft) in od.features.iter().enumerate() {
+                let (f0, f1) = (cols.disp(ft.start()), cols.disp(ft.end()));
+                if f1 < c0 || f0 > c1 {
+                    continue;
+                }
+                let y = y0 + 2.0 + od.feature_lanes[i] as f32 * FEATURE_LANE_H;
+                self.feature(f, ft, y + 1.0, FEATURE_LANE_H - 3.0, od.selected_features.contains(&ft.id));
+            }
+        }
+
         // Pinned reference row.
         if let (Some((y, h)), Some(r)) = (lay.reference, od.reference) {
             f.fill_rectangle(Point::new(lay.seq_x0, y), Size::new(lay.seq_w, h), pal.reference_bg);
@@ -1133,6 +1197,86 @@ impl Drawer<'_, '_> {
         }
     }
 
+    /// A feature: an outlined light box per part (pointed at the 3' end of
+    /// stranded features), thin lines joining the parts, the name inside
+    /// the widest visible part when it fits.
+    fn feature(&self, f: &mut Frame, ft: &Feature, y: f32, h: f32, selected: bool) {
+        let lay = self.lay;
+        let color = style::feature_color(ft);
+        let fill = style::feature_fill(color);
+        let (lo, hi) = (lay.seq_x0 - 20.0, lay.seq_x0 + lay.seq_w + 20.0);
+        let xs: Vec<(f32, f32)> = ft
+            .parts
+            .iter()
+            .map(|&(a, b)| {
+                let x0 = self.v.x_col(lay, a);
+                (x0, self.v.x_col(lay, b).max(x0 + 1.5))
+            })
+            .collect();
+        let mid = y + h / 2.0;
+        for w in xs.windows(2) {
+            let (a, b) = (w[0].1.max(lo), w[1].0.min(hi));
+            if b > a {
+                f.fill_rectangle(Point::new(a, mid - 0.5), Size::new(b - a, 1.0), color);
+            }
+        }
+        let last = xs.len() - 1;
+        let mut label_room: Option<(f32, f32)> = None;
+        for (i, &(x0, x1)) in xs.iter().enumerate() {
+            if x1 < lo || x0 > hi {
+                continue;
+            }
+            let (x0, x1) = (x0.max(lo), x1.min(hi));
+            let head = (h * 0.45).min((x1 - x0) * 0.4).max(0.0);
+            let path = Path::new(|p| match ft.strand {
+                1 if i == last => {
+                    p.move_to(Point::new(x0, y));
+                    p.line_to(Point::new(x1 - head, y));
+                    p.line_to(Point::new(x1, mid));
+                    p.line_to(Point::new(x1 - head, y + h));
+                    p.line_to(Point::new(x0, y + h));
+                    p.close();
+                }
+                -1 if i == 0 => {
+                    p.move_to(Point::new(x1, y));
+                    p.line_to(Point::new(x0 + head, y));
+                    p.line_to(Point::new(x0, mid));
+                    p.line_to(Point::new(x0 + head, y + h));
+                    p.line_to(Point::new(x1, y + h));
+                    p.close();
+                }
+                _ => p.rectangle(Point::new(x0, y), Size::new(x1 - x0, h)),
+            });
+            f.fill(&path, fill);
+            f.stroke(&path, Stroke::default().with_color(color).with_width(1.5));
+            let (v0, v1) = (x0.max(lay.seq_x0), x1.min(lay.seq_x0 + lay.seq_w));
+            if label_room.is_none_or(|(a, b)| v1 - v0 > b - a) {
+                label_room = Some((v0, v1));
+            }
+        }
+        if selected {
+            let (x0, x1) = (xs[0].0.max(lo), xs[last].1.min(hi));
+            f.stroke(
+                &Path::rectangle(Point::new(x0 - 2.0, y - 2.0), Size::new(x1 - x0 + 4.0, h + 4.0)),
+                Stroke::default().with_color(self.pal.text).with_width(1.5),
+            );
+        }
+        if let Some((a, b)) = label_room {
+            let text_w = ft.name.chars().count() as f32 * 6.2;
+            if b - a > text_w + 10.0 {
+                f.fill_text(Text {
+                    content: ft.name.clone(),
+                    position: Point::new((a + b) / 2.0, mid),
+                    color: style::annotation_text(fill),
+                    size: Pixels(10.5),
+                    align_x: iced::widget::text::Alignment::Center,
+                    align_y: Vertical::Center,
+                    ..Text::default()
+                });
+            }
+        }
+    }
+
     fn selection(&self, f: &mut Frame) {
         let od = self.od();
         let lay = self.lay;
@@ -1171,6 +1315,7 @@ impl Drawer<'_, '_> {
             super::state::GraphMode::Identity => "Identity",
         });
         head(f, lay.annotations, "Annotations");
+        head(f, lay.features, "Features");
         if let (Some((y, h)), Some(r)) = (lay.reference, od.reference) {
             f.fill_rectangle(Point::new(0.0, y), Size::new(lay.seq_x0 - 1.0, h), pal.reference_bg);
             let name = truncate(&od.doc.rows[r].name, ((lay.seq_x0 - 30.0) / 7.0) as usize);
@@ -1326,5 +1471,7 @@ mod tests {
         let a = |s, e| Annotation { id: 0, name: String::new(), kind: crate::model::AnnotationKind::Region, start: s, end: e, note: String::new(), color: None };
         let l = annotation_lanes(&[a(0, 10), a(5, 15), a(10, 20)]);
         assert_eq!(l, vec![0, 1, 0]);
+        // Beyond the limit the last lane is shared.
+        assert_eq!(super::lanes(&[(0, 9), (1, 9), (2, 9), (3, 9)], 2), vec![0, 1, 1, 1]);
     }
 }

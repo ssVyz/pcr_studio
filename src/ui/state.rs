@@ -2,7 +2,7 @@
 
 use crate::display::{self, DisplayOptions, Item, RowSort};
 use crate::linked::LinkedSet;
-use crate::model::{Annotation, ColumnMap, ColumnStats, ConsensusThreshold, DocInfo, Document, RefCoords};
+use crate::model::{Annotation, ColumnMap, ColumnStats, ConsensusThreshold, DocInfo, Document, Feature, RefCoords};
 use crate::primer::{OligoSource, PrimerOptions, PrimerReport};
 use crate::search::{Hit, Scope};
 use crate::seq::GAP;
@@ -81,6 +81,8 @@ pub struct ViewPrefs {
     pub show_consensus: bool,
     pub show_identity: bool,
     pub show_annotations: bool,
+    /// Features imported from sequence records (GenBank).
+    pub show_features: bool,
     pub show_overview: bool,
     /// Width of the sequence-name column in the alignment view.
     pub name_w: f32,
@@ -104,6 +106,7 @@ impl Default for ViewPrefs {
             show_consensus: true,
             show_identity: true,
             show_annotations: true,
+            show_features: true,
             show_overview: true,
             name_w: NAME_W_DEFAULT,
             threshold: ConsensusThreshold::Majority,
@@ -246,6 +249,13 @@ pub struct OpenDoc {
     pub selected_annotations: Vec<i64>,
     /// Where a Shift+click range of annotations starts.
     pub annotation_anchor: Option<i64>,
+    /// Imported features, sorted by position (see [`OpenDoc::set_features`]).
+    pub features: Vec<Feature>,
+    /// Lane of each feature in the viewer.
+    pub feature_lanes: Vec<usize>,
+    /// Selected features (ids); the last one is the current one.
+    pub selected_features: Vec<i64>,
+    pub feature_anchor: Option<i64>,
     /// Type of the last annotation added (default for the next one).
     pub annotation_kind: crate::model::AnnotationKind,
     /// Last permanent sort and whether it was descending (repeating it reverses).
@@ -298,6 +308,10 @@ impl OpenDoc {
             hover: None,
             selected_annotations: Vec::new(),
             annotation_anchor: None,
+            features: Vec::new(),
+            feature_lanes: Vec::new(),
+            selected_features: Vec::new(),
+            feature_anchor: None,
             annotation_kind: crate::model::AnnotationKind::ForwardPrimer,
             last_sort: None,
             linked: None,
@@ -637,9 +651,16 @@ impl OpenDoc {
         self.selected_annotations.last().copied()
     }
 
-    pub fn clear_annotation_selection(&mut self) {
+    /// Deselects all annotations and features.
+    pub fn clear_track_selection(&mut self) {
         self.selected_annotations.clear();
         self.annotation_anchor = None;
+        self.clear_feature_selection();
+    }
+
+    pub fn clear_feature_selection(&mut self) {
+        self.selected_features.clear();
+        self.feature_anchor = None;
     }
 
     /// Updates the annotation selection for a click on annotation `id`: alone,
@@ -647,22 +668,31 @@ impl OpenDoc {
     /// order). Returns the annotation that becomes the current one, `None`
     /// when none is left selected.
     pub fn click_annotation(&mut self, id: i64, ctrl: bool, shift: bool) -> Option<i64> {
-        let index = |x: i64| self.annotations.iter().position(|a| a.id == x);
-        if shift && let (Some(i), Some(j)) = (self.annotation_anchor.and_then(index), index(id)) {
-            self.selected_annotations = self.annotations[i.min(j)..=i.max(j)].iter().map(|a| a.id).filter(|&x| x != id).collect();
-        } else if ctrl && self.selected_annotations.contains(&id) {
-            self.selected_annotations.retain(|&x| x != id);
-            self.annotation_anchor = Some(id);
-            return self.selected_annotation();
-        } else {
-            if !ctrl {
-                self.selected_annotations.clear();
-            }
-            self.annotation_anchor = Some(id);
+        let order: Vec<i64> = self.annotations.iter().map(|a| a.id).collect();
+        multi_click(&order, &mut self.selected_annotations, &mut self.annotation_anchor, id, ctrl, shift)
+    }
+
+    /// Like [`OpenDoc::click_annotation`], for features.
+    pub fn click_feature(&mut self, id: i64, ctrl: bool, shift: bool) -> Option<i64> {
+        let order: Vec<i64> = self.features.iter().map(|f| f.id).collect();
+        multi_click(&order, &mut self.selected_features, &mut self.feature_anchor, id, ctrl, shift)
+    }
+
+    /// Replaces the features (sorted by position) and lays out their lanes.
+    pub fn set_features(&mut self, mut features: Vec<Feature>) {
+        features.sort_by_key(|f| (f.start(), f.end(), f.id));
+        let spans: Vec<(usize, usize)> = features.iter().map(|f| (f.start(), f.end())).collect();
+        self.feature_lanes = super::canvas::lanes(&spans, super::canvas::MAX_FEATURE_LANES);
+        self.features = features;
+        let ids: std::collections::HashSet<i64> = self.features.iter().map(|f| f.id).collect();
+        self.selected_features.retain(|x| ids.contains(x));
+        if self.feature_anchor.is_some_and(|x| !ids.contains(&x)) {
+            self.feature_anchor = None;
         }
-        self.selected_annotations.retain(|&x| x != id);
-        self.selected_annotations.push(id);
-        Some(id)
+    }
+
+    pub fn feature(&self, id: i64) -> Option<&Feature> {
+        self.features.iter().find(|f| f.id == id)
     }
 
     /// Oligo of columns `[c0, c1)` in the given source, 5'→3' for the
@@ -672,6 +702,22 @@ impl OpenDoc {
         let s = crate::seq::ungap(&t[c0.min(t.len())..c1.min(t.len())]);
         let s = if kind == crate::model::AnnotationKind::ReversePrimer { crate::seq::revcomp(&s) } else { s };
         String::from_utf8_lossy(&s).into_owned()
+    }
+
+    /// The row features are imported onto, with a description: the
+    /// reference, else the only sequence, else the one selected row.
+    pub fn feature_target(&self) -> Result<(usize, String), String> {
+        let label = |r: usize| format!("“{}”", self.doc.rows[r].name);
+        if let Some(r) = self.reference {
+            return Ok((r, format!("the reference {}", label(r))));
+        }
+        if self.doc.rows.len() == 1 {
+            return Ok((0, format!("the sequence {}", label(0))));
+        }
+        match self.selected_rows.iter().copied().collect::<Vec<_>>().as_slice() {
+            [r] => Ok((*r, format!("the selected sequence {}", label(*r)))),
+            _ => Err("Set a reference, or select one sequence (click its name), to import features onto.".into()),
+        }
     }
 
     /// Row shown by a display item (group headers have none).
@@ -685,6 +731,29 @@ impl OpenDoc {
     pub fn item_of_row(&self, row: usize) -> Option<usize> {
         self.items.iter().position(|it| matches!(it, Item::Seq { row: r, .. } if *r == row))
     }
+}
+
+/// Updates a selection of ids for a click on `id` (`order`: the list
+/// order): alone it selects only `id`, Ctrl adds or removes it, Shift
+/// selects from the anchor to it. The last selected is the current one;
+/// returns it, `None` when nothing is left selected.
+fn multi_click(order: &[i64], selected: &mut Vec<i64>, anchor: &mut Option<i64>, id: i64, ctrl: bool, shift: bool) -> Option<i64> {
+    let index = |x: i64| order.iter().position(|&o| o == x);
+    if shift && let (Some(i), Some(j)) = ((*anchor).and_then(index), index(id)) {
+        *selected = order[i.min(j)..=i.max(j)].iter().copied().filter(|&x| x != id).collect();
+    } else if ctrl && selected.contains(&id) {
+        selected.retain(|&x| x != id);
+        *anchor = Some(id);
+        return selected.last().copied();
+    } else {
+        if !ctrl {
+            selected.clear();
+        }
+        *anchor = Some(id);
+    }
+    selected.retain(|&x| x != id);
+    selected.push(id);
+    Some(id)
 }
 
 #[cfg(test)]
@@ -730,5 +799,53 @@ mod tests {
         assert_eq!(od.selected_annotations, [12]);
         assert_eq!(od.click_annotation(12, true, false), None);
         assert!(od.selected_annotations.is_empty());
+
+        // Features: sorted on arrival, the same clicks.
+        let feature = |id: i64, start: usize| Feature {
+            id,
+            name: format!("f{id}"),
+            kind: "gene".into(),
+            strand: 1,
+            parts: vec![(start, start + 3)],
+            location: String::new(),
+            qualifiers: Vec::new(),
+            source: String::new(),
+            color: None,
+        };
+        od.set_features(vec![feature(7, 5), feature(8, 0), feature(9, 2)]);
+        assert_eq!(od.features.iter().map(|f| f.id).collect::<Vec<_>>(), [8, 9, 7]);
+        assert_eq!(od.feature_lanes, [0, 1, 0]);
+        assert_eq!(od.click_feature(8, false, false), Some(8));
+        assert_eq!(od.click_feature(7, false, true), Some(7));
+        assert_eq!(od.selected_features, [8, 9, 7]);
+        // Features that are gone leave the selection.
+        od.set_features(vec![feature(9, 2)]);
+        assert_eq!(od.selected_features, [9]);
+        od.clear_track_selection();
+        assert!(od.selected_features.is_empty() && od.feature_anchor.is_none());
+    }
+
+    #[test]
+    fn feature_target() {
+        let rows = |n: usize| (0..n).map(|i| Row::from_gapped(format!("s{i}"), String::new(), b"ACGT".to_vec())).collect::<Vec<_>>();
+        let info = |reference| DocInfo {
+            id: 1,
+            name: "d".into(),
+            kind: DocKind::Alignment,
+            n_rows: 3,
+            width: 4,
+            reference,
+            created: String::new(),
+            description: String::new(),
+            folder: None,
+        };
+        let mut od = OpenDoc::new(info(None), Document::new(rows(3)), Vec::new(), &ViewPrefs::default());
+        assert!(od.feature_target().is_err());
+        od.selected_rows.insert(2);
+        assert_eq!(od.feature_target().map(|t| t.0), Ok(2));
+        let od = OpenDoc::new(info(Some(1)), Document::new(rows(3)), Vec::new(), &ViewPrefs::default());
+        assert_eq!(od.feature_target(), Ok((1, "the reference “s1”".to_string())));
+        let od = OpenDoc::new(info(None), Document::new(rows(1)), Vec::new(), &ViewPrefs::default());
+        assert_eq!(od.feature_target().map(|t| t.0), Ok(0));
     }
 }

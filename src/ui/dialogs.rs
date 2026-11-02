@@ -1,15 +1,19 @@
-//! Modal dialogs: new/edit sequence, map to reference, export, settings,
-//! primersearch, text viewer, rename, confirmations.
+//! Modal dialogs: new/edit sequence, annotations, feature import, map to
+//! reference, export, settings, primersearch, text viewer, rename,
+//! confirmations.
 
 use super::canvas::group_digits;
 use super::job;
 use super::state::OpenDoc;
-use super::{AppSettings, Message, style};
+use super::{AppSettings, Message, NcbiSettings, style};
 use crate::fasta::{self, PastedRecord};
+use crate::genbank;
 use crate::linked::group::{self, Grouping, Proposal};
 use crate::linked::{self, FileState, Layout, LinkedSet, Technology};
 use crate::mapper::{MapParams, Sensitivity};
-use crate::model::{AnnotationKind, DocInfo, DocKind, RefCoords, Rgb, Row};
+use crate::net::NetConfig;
+use crate::net::entrez::{self, Credentials};
+use crate::model::{AnnotationKind, DocInfo, DocKind, Feature, RefCoords, Rgb, Row};
 use crate::primer::{OligoSource, Orientation};
 use crate::search::{self, Placement, Strands};
 use crate::seq::{self, GAP};
@@ -51,7 +55,11 @@ pub enum Modal {
     /// `detail`: type and range of one annotation, the names of several.
     ConfirmDeleteAnnotations { ids: Vec<i64>, name: String, detail: String },
     SerialAnnotation(SerialAnnotationDialog),
-    AnnotationColor(AnnotationColorDialog),
+    /// Color of the selected annotations or features.
+    Color(ColorDialog),
+    FeatureImport(FeatureImportDialog),
+    Feature(FeatureDialog),
+    ConfirmDeleteFeatures { ids: Vec<i64>, name: String, detail: String },
     Map(MapDialog),
     Export(ExportDialog),
     Settings(SettingsDialog),
@@ -89,8 +97,9 @@ pub struct EditTarget {
     pub kind: DocKind,
     /// The stored sequence (name, description, metadata, placement).
     pub row: Row,
-    /// End columns of the document's annotations.
+    /// End columns of the document's annotations and features.
     pub annotation_ends: Vec<usize>,
+    pub feature_ends: Vec<usize>,
 }
 
 impl EditTarget {
@@ -238,24 +247,14 @@ impl SequenceDialog {
             self.notes.push(format!("{} character(s) that are not nucleotide codes will be stored as N.", group_digits(unknown)));
         }
         if let (Some(t), [r]) = (&self.edit, self.records.as_slice())
-            && !t.annotation_ends.is_empty()
             && r.seq != t.gapped()
         {
             let end = r.seq.iter().rposition(|&b| b != GAP).map_or(0, |p| p + 1);
-            let n = t.annotation_ends.len();
-            let dropped = t.annotation_ends.iter().filter(|&&e| e > end).count();
-            let mut note = if n == 1 {
-                "This document has 1 annotation; its position is not shifted when bases are inserted or removed.".to_string()
-            } else {
-                format!("This document has {n} annotations; their positions are not shifted when bases are inserted or removed.")
-            };
-            note.push_str(&match (n, dropped) {
-                (_, 0) => String::new(),
-                (1, _) => " It extends past the new end and will be removed.".into(),
-                (_, 1) => " 1 of them extends past the new end and will be removed.".into(),
-                (_, d) => format!(" {d} of them extend past the new end and will be removed."),
-            });
-            self.notes.push(note);
+            for (ends, one, many) in [(&t.annotation_ends, "annotation", "annotations"), (&t.feature_ends, "imported feature", "imported features")] {
+                if !ends.is_empty() {
+                    self.notes.push(position_note(ends, end, one, many));
+                }
+            }
         }
     }
 
@@ -348,6 +347,25 @@ impl SequenceDialog {
     }
 }
 
+/// Note for editing a sequence with annotations (or features) on it: their
+/// positions stay, and those past the new end (`end`) are removed.
+fn position_note(ends: &[usize], end: usize, one: &str, many: &str) -> String {
+    let n = ends.len();
+    let dropped = ends.iter().filter(|&&e| e > end).count();
+    let mut note = if n == 1 {
+        format!("This document has 1 {one}; its position is not shifted when bases are inserted or removed.")
+    } else {
+        format!("This document has {n} {many}; their positions are not shifted when bases are inserted or removed.")
+    };
+    note.push_str(&match (n, dropped) {
+        (_, 0) => String::new(),
+        (1, _) => " It extends past the new end and will be removed.".into(),
+        (_, 1) => " 1 of them extends past the new end and will be removed.".into(),
+        (_, d) => format!(" {d} of them extend past the new end and will be removed."),
+    });
+    note
+}
+
 // ---------------------------------------------------------------- annotation color
 
 /// Color choice of the annotation dialogs: the color of the annotation type,
@@ -359,6 +377,17 @@ pub struct ColorField {
     hex: String,
     /// The annotations concerned have different colors and none is chosen yet.
     mixed: bool,
+    /// For features (texts speak of features).
+    features: bool,
+}
+
+/// A color chip on the “By type” button.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Chip {
+    /// The color of an annotation type (it depends on the theme).
+    Kind(AnnotationKind),
+    /// A fixed color (feature types).
+    Rgb(Rgb),
 }
 
 #[derive(Debug, Clone)]
@@ -369,7 +398,13 @@ pub enum ColorMsg {
 
 impl ColorField {
     pub fn new(color: Option<Rgb>) -> ColorField {
-        ColorField { color, hex: color.map(Rgb::hex).unwrap_or_default(), mixed: false }
+        ColorField { color, hex: color.map(Rgb::hex).unwrap_or_default(), mixed: false, features: false }
+    }
+
+    /// The same field for features.
+    pub fn for_features(mut self) -> ColorField {
+        self.features = true;
+        self
     }
 
     /// The common color of annotations, or no choice when they differ.
@@ -386,7 +421,7 @@ impl ColorField {
 
     pub fn update(&mut self, m: ColorMsg) {
         match m {
-            ColorMsg::Pick(c) => *self = ColorField::new(c),
+            ColorMsg::Pick(c) => *self = ColorField { features: self.features, ..ColorField::new(c) },
             ColorMsg::Hex(s) => {
                 if s.trim().is_empty() {
                     self.color = None;
@@ -406,14 +441,20 @@ impl ColorField {
         (!self.hex.trim().is_empty() && Rgb::parse(&self.hex).is_none()).then(|| "Enter the color as #RRGGBB.".into())
     }
 
-    /// “By type” (with the colors of `kinds`) and the presets in one row,
-    /// the hex field below.
-    pub fn view(&self, kinds: Vec<AnnotationKind>, on: fn(ColorMsg) -> Message) -> Element<'_, Message> {
+    /// “By type” (with the colors of the types concerned) and the presets in
+    /// one row, the hex field below.
+    pub fn view(&self, chips: Vec<Chip>, on: fn(ColorMsg) -> Message) -> Element<'_, Message> {
         let by_type = !self.mixed && self.color.is_none();
-        let chips = row(kinds.into_iter().map(|k| {
+        let chips = row(chips.into_iter().map(|chip| {
             container(Space::new().width(10).height(10))
                 .style(move |t: &iced::Theme| container::Style {
-                    background: Some(style::Palette::for_theme(t).annotation_kind(k).into()),
+                    background: Some(
+                        match chip {
+                            Chip::Kind(k) => style::Palette::for_theme(t).annotation_kind(k),
+                            Chip::Rgb(c) => style::from_rgb(c),
+                        }
+                        .into(),
+                    ),
                     border: iced::Border { radius: 2.0.into(), ..Default::default() },
                     ..Default::default()
                 })
@@ -439,7 +480,10 @@ impl ColorField {
         .spacing(10)
         .align_y(iced::Center);
         let note: Element<Message> = match (self.problem(), self.color) {
-            _ if self.mixed => text("The annotations have different colors.").size(12).style(style::muted).into(),
+            _ if self.mixed => text(if self.features { "The features have different colors." } else { "The annotations have different colors." })
+                .size(12)
+                .style(style::muted)
+                .into(),
             (Some(e), _) => text(e).size(12).style(style::danger_text).into(),
             (None, Some(c)) => container(Space::new().width(18).height(18))
                 .style(move |t: &iced::Theme| container::Style {
@@ -448,7 +492,10 @@ impl ColorField {
                     ..Default::default()
                 })
                 .into(),
-            (None, None) => text("Each annotation in the color of its type.").size(12).style(style::muted).into(),
+            (None, None) => text(if self.features { "Each feature in the color of its type." } else { "Each annotation in the color of its type." })
+                .size(12)
+                .style(style::muted)
+                .into(),
         };
         let second = row![
             text("Hex").size(12).style(style::muted),
@@ -482,39 +529,61 @@ pub fn name_list<S: AsRef<str>>(names: &[S]) -> String {
     s
 }
 
-/// Gives the selected annotations one color.
-pub struct AnnotationColorDialog {
+/// Gives the selected annotations, or the selected features, one color.
+pub struct ColorDialog {
+    /// Features (else annotations).
+    pub features: bool,
     pub ids: Vec<i64>,
-    /// Names of the annotations, in document order.
+    /// Their names, in document order.
     names: Vec<String>,
-    kinds: Vec<AnnotationKind>,
+    chips: Vec<Chip>,
     pub color: ColorField,
 }
 
-impl AnnotationColorDialog {
-    pub fn new(od: &OpenDoc) -> AnnotationColorDialog {
+impl ColorDialog {
+    pub fn annotations(od: &OpenDoc) -> ColorDialog {
         let anns: Vec<_> = od.annotations.iter().filter(|a| od.selected_annotations.contains(&a.id)).collect();
-        AnnotationColorDialog {
+        ColorDialog {
+            features: false,
             ids: anns.iter().map(|a| a.id).collect(),
             names: anns.iter().map(|a| a.name.clone()).collect(),
-            kinds: AnnotationKind::ALL.into_iter().filter(|&k| anns.iter().any(|a| a.kind == k)).collect(),
+            chips: AnnotationKind::ALL.into_iter().filter(|&k| anns.iter().any(|a| a.kind == k)).map(Chip::Kind).collect(),
             color: ColorField::common(anns.iter().map(|a| a.color)),
         }
     }
 
+    pub fn features(od: &OpenDoc) -> ColorDialog {
+        let fs: Vec<_> = od.features.iter().filter(|f| od.selected_features.contains(&f.id)).collect();
+        let mut kinds: Vec<&str> = Vec::new();
+        for f in &fs {
+            if !kinds.contains(&f.kind.as_str()) {
+                kinds.push(&f.kind);
+            }
+        }
+        ColorDialog {
+            features: true,
+            ids: fs.iter().map(|f| f.id).collect(),
+            names: fs.iter().map(|f| f.name.clone()).collect(),
+            chips: kinds.iter().take(10).map(|k| Chip::Rgb(style::feature_kind_color(k))).collect(),
+            color: ColorField::common(fs.iter().map(|f| f.color)).for_features(),
+        }
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
-        let body = column![text(name_list(&self.names)).size(12).style(style::muted), self.color.view(self.kinds.clone(), Message::AnnotationColorEdit)].spacing(14);
+        let body = column![text(name_list(&self.names)).size(12).style(style::muted), self.color.view(self.chips.clone(), Message::ColorEdit)].spacing(14);
         let problem = self.color.problem();
         let buttons = row![
             text(problem.clone().unwrap_or_default()).size(12).style(style::muted).width(Fill),
             button("Cancel").on_press(Message::CloseModal).style(button::secondary),
-            button("Apply").on_press_maybe(problem.is_none().then_some(Message::ApplyAnnotationColor)).style(button::primary),
+            button("Apply").on_press_maybe(problem.is_none().then_some(Message::ApplyColor)).style(button::primary),
         ]
         .spacing(10)
         .align_y(iced::Center);
-        let title = match self.ids.len() {
-            1 => "Annotation color".to_string(),
-            n => format!("Color of {} annotations", group_digits(n)),
+        let title = match (self.features, self.ids.len()) {
+            (false, 1) => "Annotation color".to_string(),
+            (false, n) => format!("Color of {} annotations", group_digits(n)),
+            (true, 1) => "Feature color".to_string(),
+            (true, n) => format!("Color of {} features", group_digits(n)),
         };
         dialog_frame_owned(title, body.into(), buttons.into(), 560.0)
     }
@@ -657,7 +726,7 @@ impl AnnotationDialog {
             row![Space::new().width(Length::Fixed(104.0)), info],
             row![
                 container(label("Color")).padding(iced::Padding { top: 4.0, ..Default::default() }),
-                self.color.view(vec![self.kind], |m| Message::AnnotationEdit(AnnotationMsg::Color(m)))
+                self.color.view(vec![Chip::Kind(self.kind)], |m| Message::AnnotationEdit(AnnotationMsg::Color(m)))
             ]
             .spacing(8),
         ]
@@ -923,7 +992,9 @@ impl SerialAnnotationDialog {
             .align_y(iced::Center),
             row![
                 container(text("Color").size(13)).padding(iced::Padding { top: 4.0, ..Default::default() }),
-                self.color.view(vec![AnnotationKind::ForwardPrimer, AnnotationKind::ReversePrimer], |m| Message::SerialAnnotation(SerialMsg::Color(m))),
+                self.color.view(vec![Chip::Kind(AnnotationKind::ForwardPrimer), Chip::Kind(AnnotationKind::ReversePrimer)], |m| {
+                    Message::SerialAnnotation(SerialMsg::Color(m))
+                }),
             ]
             .spacing(8),
         ]
@@ -994,6 +1065,529 @@ impl SerialAnnotationDialog {
         .spacing(10)
         .align_y(iced::Center);
         dialog_frame("Serial annotation", body.into(), buttons.into(), 780.0)
+    }
+}
+
+// ---------------------------------------------------------------- features
+
+/// Records read for the feature import (where from, the records), or why not.
+pub type RecordsPayload = job::Payload<Result<(String, Vec<genbank::Record>), String>>;
+
+/// Imports features of a GenBank record, fetched from NCBI or read from a
+/// file, onto the reference (else the only or the selected sequence). The
+/// record must have the length of that sequence; the user picks the
+/// features and their color.
+pub struct FeatureImportDialog {
+    pub accession: String,
+    /// NCBI connection; `None` without an email address in the settings.
+    ncbi: Option<(NetConfig, Credentials)>,
+    target_label: String,
+    /// The target sequence without gaps, upper case.
+    target_seq: Vec<u8>,
+    /// Positions of the target sequence → alignment columns.
+    coords: RefCoords,
+    /// Type and parts of the document's features (not imported twice).
+    existing: HashSet<(String, Vec<(usize, usize)>)>,
+    /// Number of the latest fetch; results of older ones are dropped.
+    request: u64,
+    pub state: ImportState,
+    pub color: ColorField,
+}
+
+pub enum ImportState {
+    Idle,
+    /// Fetching or reading (what is going on).
+    Busy(String),
+    Failed(String),
+    Loaded(LoadedRecord),
+}
+
+pub struct LoadedRecord {
+    /// Accession and version of the record.
+    pub source: String,
+    /// Record, description, length, where from.
+    about: String,
+    /// Bases that differ from the target sequence; `None` when the record has no sequence.
+    differences: Option<usize>,
+    pub items: Vec<ImportItem>,
+    /// Feature types with their number of features, in record order.
+    kinds: Vec<(String, usize)>,
+}
+
+pub struct ImportItem {
+    /// The feature on the document's columns (no parts if it cannot be imported).
+    pub feature: Feature,
+    pub include: bool,
+    /// Why it cannot be imported, or a remark.
+    note: String,
+    importable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum FeatureImportMsg {
+    Accession(String),
+    Fetch,
+    OpenFile,
+    FilePicked(Option<PathBuf>),
+    /// Result of request number `.0`.
+    Loaded(u64, RecordsPayload),
+    Toggle(usize, bool),
+    ToggleKind(String, bool),
+    All(bool),
+    Color(ColorMsg),
+}
+
+/// Features listed in the import dialog; the type filters reach all of them.
+const IMPORT_LIST_MAX: usize = 400;
+
+/// A likely accession in a sequence name: the first part of its first word
+/// that looks like one ("gi|1798174254|gb|MN908947.3|" → "MN908947.3").
+fn accession_in(name: &str) -> String {
+    let word = name.split_whitespace().next().unwrap_or("");
+    word.split('|')
+        .find(|s| entrez::valid_accession(s) && s.starts_with(|c: char| c.is_ascii_alphabetic()))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// At most `max` characters of `s` (with “…” when cut).
+fn shorten(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(max - 1).collect();
+    t.push('…');
+    t
+}
+
+impl FeatureImportDialog {
+    /// The dialog for the open document; `ncbi` is `None` without an email
+    /// address in the settings (only files can be read then).
+    pub fn new(od: &OpenDoc, ncbi: Option<(NetConfig, Credentials)>) -> Result<FeatureImportDialog, String> {
+        let (row, target_label) = od.feature_target()?;
+        let r = &od.doc.rows[row];
+        let accession = r.meta_value("accession").map(str::to_string).unwrap_or_else(|| accession_in(&r.name));
+        Ok(FeatureImportDialog {
+            accession,
+            ncbi,
+            target_label,
+            target_seq: r.ungapped().to_ascii_uppercase(),
+            coords: RefCoords::new(r, od.width()),
+            existing: od.features.iter().map(|f| (f.kind.clone(), f.parts.clone())).collect(),
+            request: 0,
+            state: ImportState::Idle,
+            color: ColorField::new(None).for_features(),
+        })
+    }
+
+    pub fn update(&mut self, m: FeatureImportMsg) -> Option<Task<Message>> {
+        match m {
+            FeatureImportMsg::Accession(s) => self.accession = s,
+            FeatureImportMsg::Fetch => {
+                let (net, who) = self.ncbi.clone()?;
+                let acc = self.accession.trim().to_string();
+                if !entrez::valid_accession(&acc) {
+                    self.state = ImportState::Failed("Enter an accession number, like MN908947.3.".into());
+                    return None;
+                }
+                let len = self.target_seq.len();
+                self.state = ImportState::Busy(format!("Fetching {acc} from NCBI…"));
+                return Some(self.read_in_background(move || {
+                    // A record of another length is not downloaded further.
+                    let (text, _) = entrez::fetch_genbank(&net, &who, &acc, |l| l == len)?;
+                    Ok(("NCBI".to_string(), genbank::parse(&text)?))
+                }));
+            }
+            FeatureImportMsg::OpenFile => {
+                return Some(Task::perform(
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Open GenBank file")
+                        .add_filter("GenBank", &["gb", "gbk", "gbff", "genbank"])
+                        .add_filter("All files", &["*"])
+                        .pick_file(),
+                    |f| Message::FeatureImport(FeatureImportMsg::FilePicked(f.map(|f| f.path().to_path_buf()))),
+                ));
+            }
+            FeatureImportMsg::FilePicked(None) => {}
+            FeatureImportMsg::FilePicked(Some(path)) => {
+                self.state = ImportState::Busy(format!("Reading {}…", file_name(&path)));
+                return Some(self.read_in_background(move || {
+                    let bytes = std::fs::read(&path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+                    Ok((file_name(&path), genbank::parse(&String::from_utf8_lossy(&bytes))?))
+                }));
+            }
+            FeatureImportMsg::Loaded(request, p) => {
+                if request == self.request
+                    && let Some(r) = p.take()
+                {
+                    self.state = match r {
+                        Ok((from, records)) => self.load(&from, &records),
+                        Err(e) => ImportState::Failed(e),
+                    };
+                }
+            }
+            FeatureImportMsg::Toggle(i, on) => {
+                if let ImportState::Loaded(r) = &mut self.state
+                    && let Some(it) = r.items.get_mut(i).filter(|it| it.importable)
+                {
+                    it.include = on;
+                }
+            }
+            FeatureImportMsg::ToggleKind(kind, on) => self.set_included(|it| it.feature.kind == kind, on),
+            FeatureImportMsg::All(on) => self.set_included(|_| true, on),
+            FeatureImportMsg::Color(m) => self.color.update(m),
+        }
+        None
+    }
+
+    fn set_included(&mut self, which: impl Fn(&ImportItem) -> bool, on: bool) {
+        if let ImportState::Loaded(r) = &mut self.state {
+            for it in r.items.iter_mut().filter(|it| it.importable && which(it)) {
+                it.include = on;
+            }
+        }
+    }
+
+    /// Runs `work` (fetch or read records) on a background thread as the latest request.
+    fn read_in_background(&mut self, work: impl FnOnce() -> Result<(String, Vec<genbank::Record>), String> + Send + 'static) -> Task<Message> {
+        self.request += 1;
+        let request = self.request;
+        job::background(work, move |r| {
+            let r = r.unwrap_or_else(|| Err("Reading the record failed unexpectedly.".into()));
+            Message::FeatureImport(FeatureImportMsg::Loaded(request, job::Payload::new(r)))
+        })
+    }
+
+    /// Takes the record with the target's length and maps its features.
+    fn load(&self, from: &str, records: &[genbank::Record]) -> ImportState {
+        let len = self.target_seq.len();
+        let Some(rec) = records.iter().find(|r| r.length == len) else {
+            let what = match records {
+                [r] if r.definition.is_empty() => format!("The record {} is {} bp long", r.version, group_digits(r.length)),
+                [r] => format!("The record {} ({}) is {} bp long", r.version, shorten(r.definition.trim_end_matches('.'), 80), group_digits(r.length)),
+                rs => format!("None of the {} records is {} bp long", rs.len(), group_digits(len)),
+            };
+            return ImportState::Failed(format!(
+                "{what}; {} has {} bases. Features are only imported onto a sequence of the same length (the same record and version).",
+                self.target_label,
+                group_digits(len)
+            ));
+        };
+        // U and T count as the same base.
+        let norm = |b: u8| if b == b'U' { b'T' } else { b };
+        let differences = (rec.sequence.len() == len).then(|| rec.sequence.iter().zip(&self.target_seq).filter(|(a, b)| norm(**a) != norm(**b)).count());
+        let mut kinds: Vec<(String, usize)> = Vec::new();
+        let items = rec
+            .features
+            .iter()
+            .map(|f| {
+                match kinds.iter_mut().find(|k| k.0 == f.key) {
+                    Some(k) => k.1 += 1,
+                    None => kinds.push((f.key.clone(), 1)),
+                }
+                self.item(rec, f)
+            })
+            .collect();
+        let mut about = rec.version.clone();
+        if !rec.definition.is_empty() {
+            about.push_str(&format!(" · {}", rec.definition.trim_end_matches('.')));
+        }
+        about.push_str(&format!(" · {} bp · from {from}", group_digits(rec.length)));
+        ImportState::Loaded(LoadedRecord { source: rec.version.clone(), about, differences, items, kinds })
+    }
+
+    /// A feature of the record on the document's columns.
+    fn item(&self, rec: &genbank::Record, f: &genbank::Feature) -> ImportItem {
+        let len = self.target_seq.len();
+        let mut feature = Feature {
+            id: 0,
+            name: f.name(),
+            kind: f.key.clone(),
+            strand: 0,
+            parts: Vec::new(),
+            location: f.location.clone(),
+            qualifiers: f.qualifiers.clone(),
+            source: rec.version.clone(),
+            color: None,
+        };
+        let unusable = |feature: Feature, note: String| ImportItem { feature, include: false, note, importable: false };
+        let loc = match genbank::parse_location(&f.location) {
+            Ok(l) => l,
+            Err(e) => return unusable(feature, format!("location not understood ({e})")),
+        };
+        feature.strand = loc.strand();
+        feature.parts = loc.spans.iter().filter(|s| s.start <= len).filter_map(|s| self.coords.columns(s.start, s.end.min(len))).collect();
+        if feature.parts.is_empty() {
+            let note = if loc.remote > 0 { "on another record" } else { "outside the sequence" };
+            return unusable(feature, note.into());
+        }
+        if self.existing.contains(&(feature.kind.clone(), feature.parts.clone())) {
+            return unusable(feature, "already imported".into());
+        }
+        let note = if loc.remote > 0 { "parts on other records left out".to_string() } else { String::new() };
+        ImportItem { include: f.key != "source", note, importable: true, feature }
+    }
+
+    /// The features chosen, in the chosen color.
+    pub fn chosen(&self) -> Vec<Feature> {
+        let ImportState::Loaded(r) = &self.state else { return Vec::new() };
+        r.items.iter().filter(|it| it.include).map(|it| Feature { color: self.color.color, ..it.feature.clone() }).collect()
+    }
+
+    /// Where the chosen features come from.
+    pub fn source(&self) -> String {
+        match &self.state {
+            ImportState::Loaded(r) => r.source.clone(),
+            _ => String::new(),
+        }
+    }
+
+    pub fn problem(&self) -> Option<String> {
+        let ImportState::Loaded(r) = &self.state else { return Some("Fetch a record from NCBI or open a GenBank file.".into()) };
+        if !r.items.iter().any(|it| it.include) {
+            return Some("Choose at least one feature.".into());
+        }
+        self.color.problem()
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let fi = Message::FeatureImport;
+        let busy = matches!(self.state, ImportState::Busy(_));
+        let intro = format!(
+            "Features (genes, CDS, …) of a GenBank record are added to {} ({} bases) and shown below the annotations. \
+             The record must have the same length.",
+            self.target_label,
+            group_digits(self.target_seq.len())
+        );
+        let can_fetch = self.ncbi.is_some() && !busy && entrez::valid_accession(&self.accession);
+        let fetch = can_fetch.then_some(fi(FeatureImportMsg::Fetch));
+        let mut ncbi = row![
+            text("NCBI accession").size(13).width(Length::Fixed(120.0)),
+            text_input("e.g. MN908947.3", &self.accession)
+                .on_input(move |s| fi(FeatureImportMsg::Accession(s)))
+                .on_submit_maybe(fetch.clone())
+                .padding(5)
+                .size(13)
+                .width(180),
+            button(text("Fetch").size(13)).padding([5, 14]).on_press_maybe(fetch),
+        ]
+        .spacing(8)
+        .align_y(iced::Center);
+        if self.ncbi.is_none() {
+            ncbi = ncbi.push(
+                text("Enter your email address in Settings (NCBI) to fetch records from NCBI.").size(12).style(style::danger_text).width(Fill),
+            );
+        }
+        let file = row![
+            text("or a file").size(13).width(Length::Fixed(120.0)),
+            button(text("Open GenBank file…").size(13))
+                .padding([5, 12])
+                .style(button::secondary)
+                .on_press_maybe((!busy).then_some(fi(FeatureImportMsg::OpenFile))),
+        ]
+        .spacing(8)
+        .align_y(iced::Center);
+        let mut body = column![text(intro).size(13), ncbi, file].spacing(10);
+        match &self.state {
+            ImportState::Idle => {}
+            ImportState::Busy(m) => body = body.push(text(m.as_str()).size(13).style(style::muted)),
+            ImportState::Failed(e) => body = body.push(text(e.as_str()).size(13).style(style::danger_text).wrapping(text::Wrapping::WordOrGlyph)),
+            ImportState::Loaded(r) => body = body.push(self.record_view(r)),
+        }
+        let problem = self.problem();
+        let n = match &self.state {
+            ImportState::Loaded(r) => r.items.iter().filter(|it| it.include).count(),
+            _ => 0,
+        };
+        let confirm = if n == 1 { "Import 1 feature".to_string() } else { format!("Import {} features", group_digits(n)) };
+        let buttons = row![
+            text(problem.clone().unwrap_or_default()).size(12).style(style::muted).width(Fill),
+            button("Cancel").on_press(Message::CloseModal).style(button::secondary),
+            button(text(confirm)).on_press_maybe(problem.is_none().then_some(Message::ImportFeatures)).style(button::primary),
+        ]
+        .spacing(10)
+        .align_y(iced::Center);
+        dialog_frame("Import features", body.into(), buttons.into(), 880.0)
+    }
+
+    fn record_view<'a>(&'a self, r: &'a LoadedRecord) -> Element<'a, Message> {
+        let fi = Message::FeatureImport;
+        let same = format!("✓ Same length as {} ({} bases)", self.target_label, group_digits(self.target_seq.len()));
+        let (check, differs) = match r.differences {
+            Some(0) => (format!("{same}; identical sequence."), false),
+            Some(n) => (format!("{same}; but the sequences differ at {} position(s).", group_digits(n)), true),
+            None => (format!("{same}."), false),
+        };
+        let kinds = row(r.kinds.iter().map(|(k, n)| {
+            let on = r.items.iter().any(|it| it.feature.kind == *k && it.include);
+            let any = r.items.iter().any(|it| it.feature.kind == *k && it.importable);
+            let kind = k.clone();
+            checkbox(on)
+                .label(format!("{k} ({})", group_digits(*n)))
+                .on_toggle_maybe(any.then_some(move |b| fi(FeatureImportMsg::ToggleKind(kind.clone(), b))))
+                .text_size(12)
+                .into()
+        }))
+        .spacing(14)
+        .wrap();
+        let head = |t: &'static str, w: Length| text(t).size(12).style(style::muted).width(w);
+        let (w_kind, w_loc, w_note) = (Length::Fixed(110.0), Length::Fixed(230.0), Length::Fixed(150.0));
+        let mut list = column![row![Space::new().width(22), head("Name", Fill), head("Type", w_kind), head("Location in the record", w_loc), head("", w_note)].spacing(8)]
+            .spacing(2);
+        for (i, it) in r.items.iter().enumerate().take(IMPORT_LIST_MAX) {
+            list = list.push(
+                row![
+                    checkbox(it.include).on_toggle_maybe(it.importable.then_some(move |b| fi(FeatureImportMsg::Toggle(i, b)))).size(14),
+                    text(it.feature.name.as_str()).size(12).width(Fill),
+                    text(it.feature.kind.as_str()).size(12).width(w_kind),
+                    text(shorten(&it.feature.location, 36)).size(12).width(w_loc),
+                    text(it.note.as_str()).size(12).style(style::muted).width(w_note),
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
+            );
+        }
+        if r.items.len() > IMPORT_LIST_MAX {
+            list = list.push(
+                text(format!("… and {} more features (the type filters above include or leave out all of them).", group_digits(r.items.len() - IMPORT_LIST_MAX)))
+                    .size(12)
+                    .style(style::muted),
+            );
+        }
+        let list_h = if r.items.len() > 10 { Length::Fixed(250.0) } else { Length::Shrink };
+        let chips: Vec<Chip> = r
+            .kinds
+            .iter()
+            .filter(|(k, _)| r.items.iter().any(|it| it.feature.kind == *k && it.include))
+            .take(10)
+            .map(|(k, _)| Chip::Rgb(style::feature_kind_color(k)))
+            .collect();
+        column![
+            text(r.about.as_str()).size(13).font(Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT }).wrapping(text::Wrapping::WordOrGlyph),
+            text(check).size(12).style(if differs { style::danger_text } else { style::success_text }),
+            row![
+                text("Types").size(12).style(style::muted).width(Length::Fixed(50.0)),
+                kinds,
+            ]
+            .spacing(8),
+            row![
+                button(text("All").size(12)).padding([2, 8]).style(button::secondary).on_press(fi(FeatureImportMsg::All(true))),
+                button(text("None").size(12)).padding([2, 8]).style(button::secondary).on_press(fi(FeatureImportMsg::All(false))),
+                text("The source feature (the whole record) is left out unless chosen.").size(12).style(style::muted),
+            ]
+            .spacing(6)
+            .align_y(iced::Center),
+            scrollable(list.padding(iced::Padding { right: 12.0, ..Default::default() })).height(list_h),
+            row![
+                container(text("Color").size(13)).padding(iced::Padding { top: 4.0, ..Default::default() }),
+                self.color.view(chips, |m| Message::FeatureImport(FeatureImportMsg::Color(m))),
+            ]
+            .spacing(8),
+        ]
+        .spacing(8)
+        .into()
+    }
+}
+
+/// Details of an imported feature; name and color can be changed.
+pub struct FeatureDialog {
+    pub id: i64,
+    pub name: String,
+    pub color: ColorField,
+    kind: String,
+    /// Label and value of each fact (type, strand, position, record).
+    facts: Vec<(&'static str, String)>,
+    qualifiers: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub enum FeatureMsg {
+    Name(String),
+    Color(ColorMsg),
+}
+
+impl FeatureDialog {
+    pub fn new(f: &Feature, od: &OpenDoc) -> FeatureDialog {
+        let parts = match f.parts.len() {
+            1 => String::new(),
+            n => format!(" in {n} parts"),
+        };
+        FeatureDialog {
+            id: f.id,
+            name: f.name.clone(),
+            color: ColorField::new(f.color).for_features(),
+            kind: f.kind.clone(),
+            facts: vec![
+                ("Type", format!("{} · {}", f.kind, f.strand_label())),
+                ("Position", format!("{}{parts}", super::range_label(od.ref_coords.as_ref(), f.start(), f.end()))),
+                ("Record", f.source.clone()),
+                ("Location", f.location.clone()),
+            ],
+            qualifiers: f.qualifiers.clone(),
+        }
+    }
+
+    pub fn update(&mut self, m: FeatureMsg) {
+        match m {
+            FeatureMsg::Name(s) => self.name = s,
+            FeatureMsg::Color(m) => self.color.update(m),
+        }
+    }
+
+    pub fn problem(&self) -> Option<String> {
+        if self.name.trim().is_empty() {
+            return Some("Enter a name.".into());
+        }
+        self.color.problem()
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let label = |t: &'static str| text(t).size(13).width(Length::Fixed(96.0));
+        let mut body = column![
+            row![
+                label("Name"),
+                text_input("Feature name", &self.name)
+                    .on_input(|s| Message::FeatureEdit(FeatureMsg::Name(s)))
+                    .on_submit(Message::SaveFeature)
+                    .padding(6)
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+            row![
+                container(label("Color")).padding(iced::Padding { top: 4.0, ..Default::default() }),
+                self.color.view(vec![Chip::Rgb(style::feature_kind_color(&self.kind))], |m| Message::FeatureEdit(FeatureMsg::Color(m)))
+            ]
+            .spacing(8),
+        ]
+        .spacing(10);
+        for (k, v) in &self.facts {
+            body = body.push(row![label(k), text(v.as_str()).size(13).wrapping(text::Wrapping::WordOrGlyph).width(Fill)].spacing(8));
+        }
+        if !self.qualifiers.is_empty() {
+            let mut q = column![].spacing(3);
+            for (k, v) in &self.qualifiers {
+                q = q.push(
+                    row![
+                        text(k.as_str()).size(12).style(style::muted).width(Length::Fixed(120.0)),
+                        text(shorten(v, 400)).size(12).wrapping(text::Wrapping::WordOrGlyph).width(Fill),
+                    ]
+                    .spacing(8),
+                );
+            }
+            body = body.push(text("Qualifiers").size(13).font(Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT }));
+            let h = if self.qualifiers.len() > 6 { Length::Fixed(200.0) } else { Length::Shrink };
+            body = body.push(scrollable(q.padding(iced::Padding { right: 12.0, ..Default::default() })).height(h));
+        }
+        let problem = self.problem();
+        let buttons = row![
+            button("Delete…").on_press(Message::AskDeleteFeature(self.id)).style(button::danger),
+            text(problem.clone().unwrap_or_default()).size(12).style(style::muted).width(Fill),
+            button("Cancel").on_press(Message::CloseModal).style(button::secondary),
+            button("Save").on_press_maybe(problem.is_none().then_some(Message::SaveFeature)).style(button::primary),
+        ]
+        .spacing(10)
+        .align_y(iced::Center);
+        dialog_frame("Feature", body.into(), buttons.into(), 640.0)
     }
 }
 
@@ -1437,6 +2031,20 @@ pub struct SettingsDialog {
     window: String,
     dark: bool,
     pub tools: Vec<ToolRow>,
+    email: String,
+    api_key: String,
+    proxy: String,
+    net_test: NetTest,
+    /// Number of the latest connection test; older results are dropped.
+    net_request: u64,
+}
+
+/// State of the NCBI connection test in the settings.
+#[derive(Debug, Clone, PartialEq)]
+enum NetTest {
+    None,
+    Testing,
+    Done(Result<String, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -1455,6 +2063,12 @@ pub enum SettingsMsg {
     ToolTest(usize),
     /// Result of a test of the given configuration.
     ToolTested(usize, ToolConfig, ToolStatus),
+    Email(String),
+    ApiKey(String),
+    Proxy(String),
+    NetTest,
+    /// Result of connection test number `.0`.
+    NetTested(u64, Result<String, String>),
 }
 
 impl SettingsDialog {
@@ -1472,7 +2086,23 @@ impl SettingsDialog {
                 .into_iter()
                 .map(|spec| ToolRow { spec, config: s.tool_config(spec.id), status: status.get(spec.id).cloned() })
                 .collect(),
+            email: s.ncbi.email.clone(),
+            api_key: s.ncbi.api_key.clone(),
+            proxy: s.ncbi.proxy.clone(),
+            net_test: NetTest::None,
+            net_request: 0,
         }
+    }
+
+    /// NCBI settings as entered.
+    fn ncbi(&self) -> NcbiSettings {
+        NcbiSettings { email: self.email.trim().to_string(), api_key: self.api_key.trim().to_string(), proxy: self.proxy.trim().to_string() }
+    }
+
+    /// Why the settings cannot be saved.
+    pub fn problem(&self) -> Option<String> {
+        let email = self.email.trim();
+        (!email.is_empty() && !entrez::valid_email(email)).then(|| "The email address is not valid.".into())
     }
 
     pub fn update(&mut self, m: SettingsMsg) -> Option<Task<Message>> {
@@ -1484,11 +2114,41 @@ impl SettingsDialog {
             SettingsMsg::Window(s) => self.window = s,
             SettingsMsg::Dark(b) => self.dark = b,
             SettingsMsg::Defaults => {
-                // Tool locations are kept.
-                let d = AppSettings { dark: self.dark, ..AppSettings::default() };
+                // Tool locations and the NCBI settings are kept.
+                let d = AppSettings { dark: self.dark, ncbi: self.ncbi(), ..AppSettings::default() };
                 let tools = std::mem::take(&mut self.tools);
                 *self = SettingsDialog::new(&d, &HashMap::new());
                 self.tools = tools;
+            }
+            SettingsMsg::Email(s) => {
+                self.email = s;
+                self.net_test = NetTest::None;
+            }
+            SettingsMsg::ApiKey(s) => {
+                self.api_key = s;
+                self.net_test = NetTest::None;
+            }
+            SettingsMsg::Proxy(s) => {
+                self.proxy = s;
+                self.net_test = NetTest::None;
+            }
+            SettingsMsg::NetTest => {
+                let Some((net, who)) = self.ncbi().ready() else {
+                    self.net_test = NetTest::Done(Err("Enter a valid email address first: NCBI requires it.".into()));
+                    return None;
+                };
+                self.net_request += 1;
+                let request = self.net_request;
+                self.net_test = NetTest::Testing;
+                return Some(job::background(
+                    move || entrez::test_connection(&net, &who),
+                    move |r| Message::Settings(SettingsMsg::NetTested(request, r.unwrap_or_else(|| Err("The test failed unexpectedly.".into())))),
+                ));
+            }
+            SettingsMsg::NetTested(request, r) => {
+                if request == self.net_request {
+                    self.net_test = NetTest::Done(r);
+                }
             }
             SettingsMsg::ToolSource(i, src) => {
                 if let Some(r) = self.tools.get_mut(i).filter(|r| r.config.source != src) {
@@ -1552,6 +2212,7 @@ impl SettingsDialog {
         for r in &self.tools {
             s.tools.insert(r.spec.id.to_string(), r.config.clone());
         }
+        s.ncbi = self.ncbi();
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -1583,15 +2244,70 @@ impl SettingsDialog {
         for (i, r) in self.tools.iter().enumerate() {
             body = body.push(tool_row(i, r));
         }
+        body = body.push(rule::horizontal(1)).push(self.ncbi_view());
+        let problem = self.problem();
         let buttons = row![
             button("Defaults").on_press(Message::Settings(SettingsMsg::Defaults)).style(button::text),
-            Space::new().width(Fill),
+            text(problem.clone().unwrap_or_default()).size(12).style(style::danger_text).width(Fill),
             button("Cancel").on_press(Message::CloseModal).style(button::secondary),
-            button("Save").on_press(Message::SaveSettings).style(button::primary),
+            button("Save").on_press_maybe(problem.is_none().then_some(Message::SaveSettings)).style(button::primary),
         ]
-        .spacing(10);
-        let body = scrollable(body.padding(iced::Padding { right: 12.0, ..Default::default() })).height(Length::Shrink);
+        .spacing(10)
+        .align_y(iced::Center);
+        // Fill: the buttons keep their place when the settings are taller than the dialog.
+        let body = scrollable(body.padding(iced::Padding { right: 12.0, ..Default::default() })).height(Length::Fill);
         dialog_frame("Settings", body.into(), buttons.into(), 580.0)
+    }
+}
+
+impl SettingsDialog {
+    /// Email, API key and proxy for NCBI, with a connection test.
+    fn ncbi_view(&self) -> Element<'_, Message> {
+        let set = Message::Settings;
+        let field = |label: &'static str, hint: &'static str, value: &str, f: fn(String) -> SettingsMsg| {
+            row![text(label).width(Length::Fixed(150.0)), text_input(hint, value).on_input(move |s| set(f(s))).padding(5).size(13).width(Fill)]
+                .spacing(8)
+                .align_y(iced::Center)
+        };
+        let status: Element<Message> = match &self.net_test {
+            NetTest::None => text("").size(12).into(),
+            NetTest::Testing => text("Connecting to NCBI…").size(12).style(style::muted).into(),
+            NetTest::Done(Ok(s)) => text(format!("✓ {s}")).size(12).style(style::success_text).wrapping(text::Wrapping::WordOrGlyph).into(),
+            NetTest::Done(Err(e)) => text(format!("✗ {e}")).size(12).style(style::danger_text).wrapping(text::Wrapping::WordOrGlyph).into(),
+        };
+        column![
+            text("NCBI").size(15),
+            text(
+                "PCR Studio can fetch GenBank records from NCBI to import their features. NCBI requires an email address with \
+                 every request: it is sent along with the accession numbers you look up, nothing else. Without an email \
+                 address nothing is fetched."
+            )
+            .size(12)
+            .style(style::muted),
+            field("Email address", "name@institute.org", &self.email, SettingsMsg::Email),
+            field("API key (optional)", "", &self.api_key, SettingsMsg::ApiKey),
+            text("With an NCBI API key 10 instead of 3 requests per second are allowed; not needed for occasional imports.")
+                .size(12)
+                .style(style::muted),
+            field("Proxy (optional)", "automatic", &self.proxy, SettingsMsg::Proxy),
+            text(
+                "Empty: the proxy of the Windows Internet settings or of the HTTPS_PROXY variable, if any. \
+                 Otherwise host:port, e.g. proxy.example.org:8080."
+            )
+            .size(12)
+            .style(style::muted),
+            row![
+                button(text("Test connection").size(13))
+                    .padding([5, 12])
+                    .style(button::secondary)
+                    .on_press_maybe((self.net_test != NetTest::Testing).then_some(set(SettingsMsg::NetTest))),
+                status,
+            ]
+            .spacing(10)
+            .align_y(iced::Center),
+        ]
+        .spacing(8)
+        .into()
     }
 }
 
@@ -2477,7 +3193,30 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
         Modal::Sequence(d) => d.view(),
         Modal::Annotation(d) => d.view(),
         Modal::SerialAnnotation(d) => d.view(),
-        Modal::AnnotationColor(d) => d.view(),
+        Modal::Color(d) => d.view(),
+        Modal::FeatureImport(d) => d.view(),
+        Modal::Feature(d) => d.view(),
+        Modal::ConfirmDeleteFeatures { ids, name, detail } => {
+            let one = ids.len() == 1;
+            let question = if one { format!("Delete the feature “{name}”?") } else { format!("Delete {} features?", group_digits(ids.len())) };
+            let body = column![
+                text(question).size(14),
+                text(detail.as_str()).size(12).style(style::muted),
+                irreversible(if one {
+                    "The feature is removed permanently (it can be imported again)."
+                } else {
+                    "The features are removed permanently (they can be imported again)."
+                }),
+            ]
+            .spacing(10);
+            let buttons = row![
+                Space::new().width(Fill),
+                button("Cancel").on_press(Message::CloseModal).style(button::secondary),
+                button("Delete").on_press(Message::DeleteFeatures(ids.clone())).style(button::danger),
+            ]
+            .spacing(10);
+            dialog_frame(if one { "Delete feature" } else { "Delete features" }, body.into(), buttons.into(), 460.0)
+        }
         Modal::ConfirmDeleteAnnotations { ids, name, detail } => {
             let one = ids.len() == 1;
             let question = if one { format!("Delete the annotation “{name}”?") } else { format!("Delete {} annotations?", group_digits(ids.len())) };
@@ -2650,6 +3389,56 @@ mod tests {
         d.name = "b".into();
         d.update(AnnotationMsg::Color(ColorMsg::Hex("#12".into())));
         assert_eq!(d.problem().as_deref(), Some("Enter the color as #RRGGBB."));
+    }
+
+    #[test]
+    fn feature_import() {
+        // Reference with an insertion (columns 3-4) relative to the record.
+        let mut od = open(&["ACG--TACGTA", "ACGTTTACGTA"], Some(0));
+        od.doc = std::sync::Arc::new(Document::new(vec![
+            Row::from_gapped("gi|123|gb|AB000001.1|".into(), String::new(), b"ACG--TACGTA".to_vec()),
+            Row::from_gapped("s1".into(), String::new(), b"ACGTTTACGTA".to_vec()),
+        ]));
+        let mut d = FeatureImportDialog::new(&od, None).unwrap();
+        assert_eq!(d.accession, "AB000001.1");
+        // Without an email address nothing is fetched.
+        assert!(d.update(FeatureImportMsg::Fetch).is_none());
+        assert!(matches!(d.state, ImportState::Idle));
+        let gb = "LOCUS       AB000001     9 bp    DNA     linear\nVERSION     AB000001.1\nFEATURES             Location/Qualifiers\n     \
+                  source          1..9\n     gene            2..5\n                     /gene=\"g1\"\n     CDS             \
+                  complement(join(1..2,7..9))\n                     /product=\"p1\"\n     misc_feature    X1.1:1..5\nORIGIN\n        \
+                  1 acgtacgaa\n//\n";
+        let recs = genbank::parse(gb).unwrap();
+        d.state = d.load("test", &recs);
+        let ImportState::Loaded(r) = &d.state else { panic!("not loaded") };
+        assert_eq!(r.differences, Some(1));
+        assert_eq!(r.kinds.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(), ["source", "gene", "CDS", "misc_feature"]);
+        let it = |i: usize| (&r.items[i].feature, r.items[i].include, r.items[i].importable);
+        // The source is not chosen by default; positions map around the insertion.
+        assert_eq!((it(0).1, it(0).2), (false, true));
+        assert_eq!((it(1).0.parts.clone(), it(1).0.strand, it(1).1), (vec![(1, 7)], 1, true));
+        assert_eq!((it(2).0.parts.clone(), it(2).0.strand, it(2).0.name.as_str()), (vec![(0, 2), (8, 11)], -1, "p1"));
+        assert_eq!((it(3).1, it(3).2, r.items[3].note.as_str()), (false, false, "on another record"));
+        d.update(FeatureImportMsg::ToggleKind("source".into(), true));
+        d.update(FeatureImportMsg::Toggle(1, false));
+        d.update(FeatureImportMsg::Color(ColorMsg::Pick(Some(Rgb(1, 2, 3)))));
+        let chosen = d.chosen();
+        assert_eq!(chosen.iter().map(|f| f.kind.as_str()).collect::<Vec<_>>(), ["source", "CDS"]);
+        assert!(chosen.iter().all(|f| f.color == Some(Rgb(1, 2, 3)) && f.source == "AB000001.1"));
+        d.update(FeatureImportMsg::All(false));
+        assert_eq!(d.problem().as_deref(), Some("Choose at least one feature."));
+        // Imported features are not offered again.
+        od.set_features(vec![Feature { id: 5, ..chosen[1].clone() }]);
+        let mut d = FeatureImportDialog::new(&od, None).unwrap();
+        d.state = d.load("test", &recs);
+        let ImportState::Loaded(r) = &d.state else { panic!("not loaded") };
+        assert_eq!((r.items[2].importable, r.items[2].note.as_str()), (false, "already imported"));
+        // Another length is refused.
+        let other = genbank::parse("LOCUS       X  12 bp    DNA\nDEFINITION  Other.\nVERSION     X.1\n").unwrap();
+        let ImportState::Failed(e) = d.load("NCBI", &other) else { panic!("loaded") };
+        assert!(e.starts_with("The record X.1 (Other) is 12 bp long; the reference “gi|123|gb|AB000001.1|” has 9 bases."), "{e}");
+        assert_eq!(accession_in("hCoV-19/x MN908947.3"), "");
+        assert_eq!(accession_in("NC_045512.2 Severe acute"), "NC_045512.2");
     }
 
     #[test]

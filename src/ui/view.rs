@@ -92,13 +92,21 @@ impl App {
         }
     }
 
+    /// Like [`App::annotations_label`], for the selected features.
+    fn features_label(&self, one: &'static str, several: &str) -> std::borrow::Cow<'static, str> {
+        match self.open.as_ref().map_or(0, |o| o.selected_features.len()) {
+            0 | 1 => one.into(),
+            n => format!("{several} {} features…", group_digits(n)).into(),
+        }
+    }
+
     /// Right-click menu of a library entry or the sequence viewer.
     fn context_entries(&self, target: ContextTarget) -> Vec<menu::Entry> {
         use menu::Entry;
         let idle = !self.busy();
         let key = match target {
             ContextTarget::Entry(k) => k,
-            ContextTarget::Viewer { annotation, col } => {
+            ContextTarget::Viewer { annotation, feature, col } => {
                 let od = self.open.as_ref();
                 let selection = od.is_some_and(|o| o.selection.is_some());
                 let report = od.is_some_and(|o| o.report.is_some());
@@ -109,6 +117,13 @@ impl App {
                     // The right-clicked annotation is selected (perhaps with others).
                     entries.push(Entry::item(self.annotations_label("Annotation color…", "Color of"), "", Some(Message::OpenAnnotationColor)));
                     entries.push(Entry::danger(self.annotations_label("Delete annotation…", "Delete"), Some(Message::AskDeleteSelectedAnnotations)));
+                    entries.push(Entry::Separator);
+                }
+                if let Some(id) = feature {
+                    entries.push(Entry::item("Feature details…", "", Some(Message::FeatureProperties(id))));
+                    // The right-clicked feature is selected (perhaps with others).
+                    entries.push(Entry::item(self.features_label("Feature color…", "Color of"), "", writable.then_some(Message::OpenFeatureColor)));
+                    entries.push(Entry::danger(self.features_label("Delete feature…", "Delete"), writable.then_some(Message::AskDeleteSelectedFeatures)));
                     entries.push(Entry::Separator);
                 }
                 entries.extend([
@@ -272,6 +287,7 @@ impl App {
                 Entry::item("Import FASTA…", "Ctrl+O", when(idle, Message::ImportFasta)),
                 Entry::item("Import FASTQ (linked)…", "", when(idle, Message::ImportFastq)),
                 Entry::item("Import metadata table…", "", when(idle && writable, Message::ImportMetadata)),
+                Entry::item("Import features (NCBI, GenBank)…", "", when(idle && writable, Message::OpenFeatureImport)),
                 Entry::item("Generate demo data", "", when(idle, Message::DemoData)),
                 Entry::Separator,
                 Entry::item("Export FASTA…", "Ctrl+E", when(idle && complete, Message::OpenExport)),
@@ -792,6 +808,7 @@ impl App {
             pick_list([GraphMode::Conservation, GraphMode::Identity], Some(prefs.graph), Message::SetGraph).text_size(12).padding(4).width(Fill),
             checkbox(prefs.show_overview).label("Overview strip").on_toggle(Message::ToggleOverview).text_size(13),
             checkbox(prefs.show_annotations).label("Annotations").on_toggle(Message::ToggleAnnotations).text_size(13),
+            checkbox(prefs.show_features).label("Features").on_toggle(Message::ToggleFeatures).text_size(13),
             checkbox(prefs.color_bases).label("Color bases").on_toggle(Message::ToggleColors).text_size(13),
             tooltip(
                 checkbox(prefs.collapse_gaps && od.reference.is_some())
@@ -995,7 +1012,7 @@ impl App {
                 .into(),
         };
 
-        let content = column![doc_info, selection, display, highlighting, rows, anns].spacing(18).padding(12);
+        let content = column![doc_info, selection, display, highlighting, rows, anns, self.features_section(od)].spacing(18).padding(12);
         let header = row![
             Space::new().width(Fill),
             tooltip(
@@ -1007,6 +1024,114 @@ impl App {
             ),
         ];
         container(column![header, scrollable(content).height(Fill)]).width(width).height(Fill).style(style::panel).into()
+    }
+
+    /// The imported features in the side panel: import buttons, the list
+    /// (click to select, Ctrl/Shift for several) and actions on a selection.
+    fn features_section<'a>(&'a self, od: &'a OpenDoc) -> Element<'a, Message> {
+        /// Features listed; more are reached through the viewer.
+        const LISTED: usize = 300;
+        let mut col = column![section("Features")].spacing(4);
+        if od.linked.is_some() {
+            return col.push(text("Linked files are read-only: features cannot be imported.").size(11).style(style::muted)).into();
+        }
+        let idle = !self.busy();
+        col = col.push(
+            row![
+                tooltip(
+                    button(text("Import…").size(12)).padding([3, 8]).on_press_maybe(idle.then_some(Message::OpenFeatureImport)),
+                    container(text("Genes, CDS and other features of the reference's GenBank record, fetched from NCBI or read from a file").size(12))
+                        .padding(6)
+                        .max_width(300)
+                        .style(container::rounded_box),
+                    tooltip::Position::Bottom,
+                ),
+                Space::new().width(Fill),
+                button(text("Select all").size(11))
+                    .padding([2, 6])
+                    .style(button::text)
+                    .on_press_maybe((!od.features.is_empty()).then_some(Message::SelectAllFeatures)),
+            ]
+            .align_y(Alignment::Center),
+        );
+        if self.settings.ncbi.ready().is_none() {
+            col = col.push(
+                row![
+                    text("Fetching from NCBI needs your email address.").size(11).style(style::muted).width(Fill),
+                    button(text("Settings…").size(11)).padding([2, 6]).style(button::text).on_press(Message::OpenSettings),
+                ]
+                .align_y(Alignment::Center),
+            );
+        }
+        col = col.push(
+            text(if od.features.is_empty() {
+                "No features yet. They are shown below the annotations and can be hidden under Display."
+            } else {
+                "Click to select (Ctrl/Shift+click for several); double-click or right-click in the viewer for details."
+            })
+            .size(11)
+            .style(style::muted),
+        );
+        if od.selected_features.len() > 1 {
+            col = col.push(
+                row![
+                    text(format!("{} selected", group_digits(od.selected_features.len()))).size(12).width(Fill),
+                    button(text("Color…").size(12)).padding([3, 6]).on_press(Message::OpenFeatureColor),
+                    button(text("Delete…").size(12)).padding([3, 6]).style(button::danger).on_press(Message::AskDeleteSelectedFeatures),
+                    button(text("Clear").size(12)).padding([3, 6]).style(button::secondary).on_press(Message::ClearSelection),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center),
+            );
+        }
+        for f in od.features.iter().take(LISTED) {
+            let selected = od.selected_features.contains(&f.id);
+            let range = match od.ref_range(f.start(), f.end()) {
+                Some((x, y)) => format!("{}–{}", group_digits(x as usize), group_digits(y as usize)),
+                None => format!("col {}–{}", group_digits(f.start() + 1), group_digits(f.end())),
+            };
+            let color = style::feature_color(f);
+            let swatch = container(Space::new().width(10).height(10)).style(move |_t: &Theme| container::Style {
+                background: Some(style::feature_fill(color).into()),
+                border: iced::Border { color, width: 1.5, radius: 2.0.into() },
+                ..Default::default()
+            });
+            col = col.push(
+                row![
+                    swatch,
+                    button(column![text(f.name.as_str()).size(12), text(format!("{} · {range}", f.kind)).size(10).style(style::muted)])
+                        .padding([2, 4])
+                        .style(move |t: &Theme, s| {
+                            let mut st = button::text(t, s);
+                            if selected {
+                                let p = t.extended_palette();
+                                st.background = Some(p.primary.weak.color.into());
+                                st.text_color = p.primary.weak.text;
+                                st.border.radius = 4.0.into();
+                            }
+                            st
+                        })
+                        .width(Fill)
+                        .on_press(Message::SelectFeature(f.id)),
+                    tooltip(
+                        button(text("✎").size(11)).padding([2, 6]).style(button::text).on_press(Message::FeatureProperties(f.id)),
+                        container(text("Details").size(12)).padding(6).style(container::rounded_box),
+                        tooltip::Position::Left,
+                    ),
+                    tooltip(
+                        button(text("✕").size(11)).padding([2, 6]).style(button::text).on_press(Message::AskDeleteFeature(f.id)),
+                        container(text("Delete").size(12)).padding(6).style(container::rounded_box),
+                        tooltip::Position::Left,
+                    ),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            );
+        }
+        if od.features.len() > LISTED {
+            col = col.push(text(format!("… and {} more (select them in the viewer)", group_digits(od.features.len() - LISTED))).size(11).style(style::muted));
+        }
+        col.into()
     }
 
     fn primer_popup<'a>(&'a self, od: &'a OpenDoc, r: &'a PrimerReport) -> Element<'a, Message> {

@@ -281,6 +281,48 @@ pub struct Annotation {
     pub color: Option<Rgb>,
 }
 
+/// A feature imported from a sequence record (GenBank: gene, CDS, …), kept
+/// apart from the user's annotations. Its parts are alignment columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Feature {
+    pub id: i64,
+    pub name: String,
+    /// GenBank feature key: "gene", "CDS", "mat_peptide", …
+    pub kind: String,
+    /// +1 plus strand, -1 minus strand, 0 none or mixed.
+    pub strand: i8,
+    /// Columns `[start, end)` of its parts (more than one for joined
+    /// locations), sorted; never empty.
+    pub parts: Vec<(usize, usize)>,
+    /// Location as written in the record (positions of the record).
+    pub location: String,
+    pub qualifiers: Vec<(String, String)>,
+    /// The record it comes from ("MN908947.3", or a file's record).
+    pub source: String,
+    /// Own color; `None`: the color of its type.
+    pub color: Option<Rgb>,
+}
+
+impl Feature {
+    /// First column.
+    pub fn start(&self) -> usize {
+        self.parts.first().map_or(0, |p| p.0)
+    }
+
+    /// End column (exclusive) of the last part.
+    pub fn end(&self) -> usize {
+        self.parts.iter().map(|p| p.1).max().unwrap_or(0)
+    }
+
+    pub fn strand_label(&self) -> &'static str {
+        match self.strand {
+            1 => "plus strand",
+            -1 => "minus strand",
+            _ => "no strand",
+        }
+    }
+}
+
 /// An sRGB color chosen by the user, written `#RRGGBB`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rgb(pub u8, pub u8, pub u8);
