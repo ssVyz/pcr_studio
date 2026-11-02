@@ -11,6 +11,8 @@ pub struct Record {
     pub locus: String,
     /// Length from the LOCUS line (bp); without one, the length of the sequence.
     pub length: usize,
+    /// A protein record (length in `aa`, from GenPept).
+    pub protein: bool,
     pub definition: String,
     /// Accession with version ("MN908947.3"), else the accession, else the locus name.
     pub version: String,
@@ -138,8 +140,10 @@ struct Builder {
 impl Builder {
     fn new(locus_line: &str) -> Builder {
         let toks: Vec<&str> = locus_line.split_whitespace().skip(1).collect();
-        let length = toks.windows(2).find(|w| w[1] == "bp" || w[1] == "aa").and_then(|w| w[0].parse().ok()).unwrap_or(0);
-        let rec = Record { locus: toks.first().map(|s| s.to_string()).unwrap_or_default(), length, ..Record::default() };
+        let unit = toks.windows(2).find(|w| w[1] == "bp" || w[1] == "aa");
+        let length = unit.and_then(|w| w[0].parse().ok()).unwrap_or(0);
+        let protein = unit.is_some_and(|w| w[1] == "aa");
+        let rec = Record { locus: toks.first().map(|s| s.to_string()).unwrap_or_default(), length, protein, ..Record::default() };
         Builder { rec, accession: String::new(), section: Section::Other, feature: None, open_quote: false }
     }
 
@@ -446,7 +450,7 @@ ORIGIN
         let recs = parse(SAMPLE).unwrap();
         assert_eq!(recs.len(), 2);
         let r = &recs[0];
-        assert_eq!((r.locus.as_str(), r.length, r.version.as_str()), ("TEST01", 120, "TEST01.2"));
+        assert_eq!((r.locus.as_str(), r.length, r.version.as_str(), r.protein), ("TEST01", 120, "TEST01.2", false));
         assert_eq!(r.definition, "Test virus isolate X, complete genome.");
         assert_eq!(r.sequence.len(), 120);
         assert!(r.sequence.starts_with(b"ATTAAAGGTT"));
@@ -472,6 +476,8 @@ ORIGIN
         // An interrupted download: the header still gives name and length.
         let r = &parse("LOCUS       NC_045512   29903 bp ss-RNA linear VRL\nDEFINITION  SARS-CoV-2.\nVERSION     NC_045512.2\n").unwrap()[0];
         assert_eq!((r.length, r.version.as_str(), r.features.len()), (29903, "NC_045512.2", 0));
+        assert!(parse("LOCUS       YP_009724390   1273 aa linear VRL
+").unwrap()[0].protein);
     }
 
     #[test]

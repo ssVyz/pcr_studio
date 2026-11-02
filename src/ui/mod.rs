@@ -24,7 +24,7 @@ use crate::tools::primersearch as ps;
 use crate::tools::{self, ToolConfig, ToolSpec, ToolStatus};
 use canvas::ViewMsg;
 use dialogs::{
-    AnnotationDialog, ColorDialog, EditTarget, ExportDialog, ExportRows, FeatureDialog, FeatureImportDialog, ImportFastaDialog, LinkFastqDialog, LinkedDialog,
+    AnnotationDialog, ColorDialog, EditTarget, ExportDialog, ExportRows, FeatureDialog, GenBankDialog, ImportFastaDialog, ImportInto, LinkFastqDialog, LinkedDialog,
     LinkedMsg, MapDialog, Modal, PrimersearchDialog, RefChoice, SequenceDialog, SerialAnnotationDialog, SettingsDialog, TextView, TextViewMsg,
 };
 use iced::keyboard::{self, Key, key::Named};
@@ -269,6 +269,10 @@ pub enum Message {
     FastaPicked(Option<Vec<PathBuf>>),
     ImportFastaLink(bool),
     RunImportFasta,
+    /// The GenBank dialog for a new sequence (NCBI accession or file).
+    OpenRecordImport,
+    /// Adds the record of the GenBank dialog as a new document.
+    ImportRecord,
     /// Imports FASTA files into the library (also files given on the command line).
     ImportPicked(Option<Vec<PathBuf>>),
     ImportDone(Payload<Result<Vec<i64>, String>>),
@@ -407,9 +411,10 @@ pub enum Message {
     SerialAnnotation(dialogs::SerialMsg),
     CreateSerialAnnotations,
     // Features (imported from GenBank records)
-    /// The import dialog (NCBI or a GenBank file).
+    /// The GenBank dialog for features (NCBI or a GenBank file).
     OpenFeatureImport,
-    FeatureImport(dialogs::FeatureImportMsg),
+    /// Edits in the GenBank dialog (features or a new sequence).
+    GenBank(dialogs::GenBankMsg),
     ImportFeatures,
     /// Select a feature and its columns (side panel); Ctrl/Shift select several.
     SelectFeature(i64),
@@ -1454,6 +1459,13 @@ impl App {
                     return dialogs::pick_fastq_files();
                 }
             }
+            Message::OpenRecordImport => {
+                if !self.busy() {
+                    self.modal = Some(Modal::GenBank(GenBankDialog::sequence(self.target_folder(), self.settings.ncbi.ready())));
+                    return dialogs::focus_accession();
+                }
+            }
+            Message::ImportRecord => return self.import_record(),
             Message::FastqPicked(Some(paths)) if !paths.is_empty() => self.add_fastq(paths),
             Message::FastqPicked(_) => {}
             Message::FastqFolderPicked(Some(dir)) => {
@@ -1959,14 +1971,17 @@ impl App {
                     return Task::none();
                 }
                 let Some(od) = self.open.as_ref() else { return Task::none() };
-                match FeatureImportDialog::new(od, self.settings.ncbi.ready()) {
-                    Ok(d) => self.modal = Some(Modal::FeatureImport(d)),
+                match GenBankDialog::features(od, self.settings.ncbi.ready()) {
+                    Ok(d) => {
+                        self.modal = Some(Modal::GenBank(d));
+                        return dialogs::focus_accession();
+                    }
                     Err(e) => self.error = Some(e),
                 }
             }
-            Message::FeatureImport(m) => {
+            Message::GenBank(m) => {
                 // Results that arrive after the dialog was closed are dropped.
-                if let Some(Modal::FeatureImport(d)) = self.modal.as_mut()
+                if let Some(Modal::GenBank(d)) = self.modal.as_mut()
                     && let Some(task) = d.update(m)
                 {
                     return task;
@@ -2837,8 +2852,8 @@ impl App {
         if self.refuse_read_only("features") {
             return;
         }
-        let Some(Modal::FeatureImport(d)) = self.modal.as_ref() else { return };
-        if d.problem().is_some() {
+        let Some(Modal::GenBank(d)) = self.modal.as_ref() else { return };
+        if d.problem().is_some() || !matches!(d.into, ImportInto::Features(_)) {
             return;
         }
         let (mut features, source) = (d.chosen(), d.source());
@@ -2863,6 +2878,51 @@ impl App {
         if !self.settings.view.show_features {
             self.set_pref(|p| p.show_features = true);
         }
+    }
+
+    /// Adds the record of the GenBank dialog as a new document, with the
+    /// features chosen, and opens it.
+    fn import_record(&mut self) -> Task<Message> {
+        if self.busy() {
+            self.error = Some("Wait for the current task to finish, then import.".into());
+            return Task::none();
+        }
+        let Some(Modal::GenBank(d)) = self.modal.as_ref() else { return Task::none() };
+        if d.problem().is_some() {
+            return Task::none();
+        }
+        let Some(new) = d.new_document() else { return Task::none() };
+        let (features, source) = (d.chosen(), d.source());
+        let len = new.row.ungapped_len();
+        let doc = Document::new(vec![new.row]);
+        let id = match self.db.insert_document(&new.name, DocKind::Sequences, &doc, None, &new.description, new.folder, &|_| {}) {
+            Ok(id) => id,
+            Err(e) => {
+                self.error = Some(e);
+                return Task::none();
+            }
+        };
+        if !features.is_empty()
+            && let Err(e) = self.db.add_features(id, &features)
+        {
+            let _ = self.db.delete_document(id);
+            self.error = Some(format!("The features could not be saved, so {source} was not imported: {e}"));
+            return Task::none();
+        }
+        self.modal = None;
+        self.reload_library();
+        self.reveal_folder(new.folder);
+        self.set_primary(Some(LibKey::Doc(id)));
+        self.lib_multi.clear();
+        self.status = match features.len() {
+            0 => format!("Imported {source} ({} bp)", canvas::group_digits(len)),
+            1 => format!("Imported {source} ({} bp) with 1 feature", canvas::group_digits(len)),
+            n => format!("Imported {source} ({} bp) with {} features", canvas::group_digits(len), canvas::group_digits(n)),
+        };
+        if !features.is_empty() && !self.settings.view.show_features {
+            self.set_pref(|p| p.show_features = true);
+        }
+        self.open_document(id)
     }
 
     /// Saves name and color from the feature dialog.

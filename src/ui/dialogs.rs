@@ -57,7 +57,7 @@ pub enum Modal {
     SerialAnnotation(SerialAnnotationDialog),
     /// Color of the selected annotations or features.
     Color(ColorDialog),
-    FeatureImport(FeatureImportDialog),
+    GenBank(GenBankDialog),
     Feature(FeatureDialog),
     ConfirmDeleteFeatures { ids: Vec<i64>, name: String, detail: String },
     Map(MapDialog),
@@ -1068,30 +1068,70 @@ impl SerialAnnotationDialog {
     }
 }
 
-// ---------------------------------------------------------------- features
+// ---------------------------------------------------------------- GenBank records (features, sequences)
 
-/// Records read for the feature import (where from, the records), or why not.
+/// Records read for the GenBank dialog (where from, the records), or why not.
 pub type RecordsPayload = job::Payload<Result<(String, Vec<genbank::Record>), String>>;
 
-/// Imports features of a GenBank record, fetched from NCBI or read from a
-/// file, onto the reference (else the only or the selected sequence). The
-/// record must have the length of that sequence; the user picks the
-/// features and their color.
-pub struct FeatureImportDialog {
+/// Longest record downloaded from NCBI as a new sequence (bp); a longer one
+/// (a whole chromosome) is refused after its header.
+pub const MAX_DOWNLOAD_LEN: usize = 20_000_000;
+
+/// Id of the accession field, focused when the GenBank dialog opens.
+pub const ACCESSION_INPUT: &str = "genbank-accession";
+
+pub fn focus_accession<T: Send + 'static>() -> Task<T> {
+    iced::widget::operation::focus(ACCESSION_INPUT)
+}
+
+/// Reads a GenBank record, fetched from NCBI by accession or from a file,
+/// and imports either its features onto a sequence of the open document
+/// (which must have the record's length) or its sequence as a new document,
+/// with or without features. The user picks the features and their color.
+pub struct GenBankDialog {
     pub accession: String,
     /// NCBI connection; `None` without an email address in the settings.
     ncbi: Option<(NetConfig, Credentials)>,
-    target_label: String,
-    /// The target sequence without gaps, upper case.
-    target_seq: Vec<u8>,
-    /// Positions of the target sequence → alignment columns.
-    coords: RefCoords,
-    /// Type and parts of the document's features (not imported twice).
-    existing: HashSet<(String, Vec<(usize, usize)>)>,
+    pub into: ImportInto,
     /// Number of the latest fetch; results of older ones are dropped.
     request: u64,
     pub state: ImportState,
     pub color: ColorField,
+}
+
+/// What a record is imported into.
+pub enum ImportInto {
+    /// Its features, onto a sequence of the open document.
+    Features(FeatureTarget),
+    /// Its sequence, as a new document.
+    Sequence(NewRecord),
+}
+
+/// The sequence of the open document that features are imported onto.
+pub struct FeatureTarget {
+    label: String,
+    /// The sequence without gaps, upper case.
+    seq: Vec<u8>,
+    /// Positions of the sequence → alignment columns.
+    coords: RefCoords,
+    /// The document's features (not imported twice).
+    existing: FeatureKeys,
+}
+
+/// Type and parts (alignment columns) of features.
+type FeatureKeys = HashSet<(String, Vec<(usize, usize)>)>;
+
+/// A record imported as a new document.
+pub struct NewRecord {
+    /// Library folder of the new document.
+    folder: Option<i64>,
+    /// The records read (a file may hold several) and where from.
+    records: Vec<genbank::Record>,
+    from: String,
+    /// The record to import (index into `records`).
+    chosen: usize,
+    /// Whether the chosen features come with the sequence.
+    pub with_features: bool,
 }
 
 pub enum ImportState {
@@ -1107,7 +1147,8 @@ pub struct LoadedRecord {
     pub source: String,
     /// Record, description, length, where from.
     about: String,
-    /// Bases that differ from the target sequence; `None` when the record has no sequence.
+    /// Bases that differ from the target sequence; `None` when the record has
+    /// no sequence or is imported as a new one.
     differences: Option<usize>,
     pub items: Vec<ImportItem>,
     /// Feature types with their number of features, in record order.
@@ -1123,18 +1164,45 @@ pub struct ImportItem {
     importable: bool,
 }
 
+/// The new document of a sequence import.
+pub struct NewDocument {
+    pub name: String,
+    /// The record's sequence, named by its accession, with the description
+    /// and details of its source (organism, isolate, …) as metadata.
+    pub row: Row,
+    /// Library description: where it came from.
+    pub description: String,
+    pub folder: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
-pub enum FeatureImportMsg {
+pub enum GenBankMsg {
     Accession(String),
     Fetch,
     OpenFile,
     FilePicked(Option<PathBuf>),
     /// Result of request number `.0`.
     Loaded(u64, RecordsPayload),
+    /// Another record of the file (sequence import).
+    Record(usize),
+    WithFeatures(bool),
     Toggle(usize, bool),
     ToggleKind(String, bool),
     All(bool),
     Color(ColorMsg),
+}
+
+/// A record of a file, in the record list of a sequence import.
+#[derive(Debug, Clone, PartialEq)]
+struct RecordChoice {
+    index: usize,
+    label: String,
+}
+
+impl std::fmt::Display for RecordChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
 }
 
 /// Features listed in the import dialog; the type filters reach all of them.
@@ -1160,82 +1228,256 @@ fn shorten(s: &str, max: usize) -> String {
     t
 }
 
-impl FeatureImportDialog {
-    /// The dialog for the open document; `ncbi` is `None` without an email
-    /// address in the settings (only files can be read then).
-    pub fn new(od: &OpenDoc, ncbi: Option<(NetConfig, Credentials)>) -> Result<FeatureImportDialog, String> {
-        let (row, target_label) = od.feature_target()?;
-        let r = &od.doc.rows[row];
-        let accession = r.meta_value("accession").map(str::to_string).unwrap_or_else(|| accession_in(&r.name));
-        Ok(FeatureImportDialog {
-            accession,
-            ncbi,
-            target_label,
-            target_seq: r.ungapped().to_ascii_uppercase(),
-            coords: RefCoords::new(r, od.width()),
-            existing: od.features.iter().map(|f| (f.kind.clone(), f.parts.clone())).collect(),
-            request: 0,
-            state: ImportState::Idle,
-            color: ColorField::new(None).for_features(),
+/// Why a record was not downloaded as a new sequence.
+fn too_long(records: &[genbank::Record]) -> String {
+    let (name, len) = records.first().map_or(("The record".to_string(), 0), |r| (r.version.clone(), r.length));
+    format!(
+        "{name} is {} bp long. Records over {} bp (such as whole chromosomes) are not downloaded; \
+         save it as a GenBank or FASTA file from the NCBI website and import that file.",
+        group_digits(len),
+        group_digits(MAX_DOWNLOAD_LEN)
+    )
+}
+
+/// Record, description, length and where it was read from.
+fn about(rec: &genbank::Record, from: &str) -> String {
+    let mut about = rec.version.clone();
+    if !rec.definition.is_empty() {
+        about.push_str(&format!(" · {}", rec.definition.trim_end_matches('.')));
+    }
+    about.push_str(&format!(" · {} bp · from {from}", group_digits(rec.length)));
+    about
+}
+
+/// Metadata of a sequence imported from a record: its accession and details
+/// of its source (organism, isolate, host, …).
+fn record_meta(rec: &genbank::Record) -> Vec<(String, String)> {
+    const SOURCE: [&str; 9] = ["organism", "strain", "isolate", "serotype", "segment", "host", "geo_loc_name", "country", "collection_date"];
+    let mut meta = vec![("accession".to_string(), rec.version.clone())];
+    if let Some(src) = rec.features.iter().find(|f| f.key == "source") {
+        meta.extend(SOURCE.iter().filter_map(|k| src.qualifier(k).map(|v| (k.to_string(), v.to_string()))));
+    }
+    meta
+}
+
+/// The features of `rec` for a sequence of `len` bases whose positions
+/// (1-based, inclusive) `columns` maps to alignment columns, and the feature
+/// types with their number of features, in record order.
+fn record_items(
+    rec: &genbank::Record,
+    len: usize,
+    columns: &dyn Fn(usize, usize) -> Option<(usize, usize)>,
+    existing: Option<&FeatureKeys>,
+) -> (Vec<ImportItem>, Vec<(String, usize)>) {
+    let mut kinds: Vec<(String, usize)> = Vec::new();
+    let items = rec
+        .features
+        .iter()
+        .map(|f| {
+            match kinds.iter_mut().find(|k| k.0 == f.key) {
+                Some(k) => k.1 += 1,
+                None => kinds.push((f.key.clone(), 1)),
+            }
+            import_item(rec, f, len, columns, existing)
         })
+        .collect();
+    (items, kinds)
+}
+
+/// A feature of the record on the document's columns.
+fn import_item(
+    rec: &genbank::Record,
+    f: &genbank::Feature,
+    len: usize,
+    columns: &dyn Fn(usize, usize) -> Option<(usize, usize)>,
+    existing: Option<&FeatureKeys>,
+) -> ImportItem {
+    let mut feature = Feature {
+        id: 0,
+        name: f.name(),
+        kind: f.key.clone(),
+        strand: 0,
+        parts: Vec::new(),
+        location: f.location.clone(),
+        qualifiers: f.qualifiers.clone(),
+        source: rec.version.clone(),
+        color: None,
+    };
+    let unusable = |feature: Feature, note: String| ImportItem { feature, include: false, note, importable: false };
+    let loc = match genbank::parse_location(&f.location) {
+        Ok(l) => l,
+        Err(e) => return unusable(feature, format!("location not understood ({e})")),
+    };
+    feature.strand = loc.strand();
+    feature.parts = loc.spans.iter().filter(|s| s.start <= len).filter_map(|s| columns(s.start, s.end.min(len))).collect();
+    if feature.parts.is_empty() {
+        let note = if loc.remote > 0 { "on another record" } else { "outside the sequence" };
+        return unusable(feature, note.into());
+    }
+    if existing.is_some_and(|e| e.contains(&(feature.kind.clone(), feature.parts.clone()))) {
+        return unusable(feature, "already imported".into());
+    }
+    let note = if loc.remote > 0 { "parts on other records left out".to_string() } else { String::new() };
+    ImportItem { include: f.key != "source", note, importable: true, feature }
+}
+
+impl FeatureTarget {
+    /// Takes the record with the target's length and maps its features.
+    fn load(&self, from: &str, records: &[genbank::Record]) -> ImportState {
+        let len = self.seq.len();
+        let Some(rec) = records.iter().find(|r| r.length == len && !r.protein) else {
+            let what = match records {
+                [r] if r.protein => {
+                    return ImportState::Failed(format!("{} is a protein record; features are imported from nucleotide records.", r.version));
+                }
+                [r] if r.definition.is_empty() => format!("The record {} is {} bp long", r.version, group_digits(r.length)),
+                [r] => format!("The record {} ({}) is {} bp long", r.version, shorten(r.definition.trim_end_matches('.'), 80), group_digits(r.length)),
+                rs => format!("None of the {} records is {} bp long", rs.len(), group_digits(len)),
+            };
+            return ImportState::Failed(format!(
+                "{what}; {} has {} bases. Features are only imported onto a sequence of the same length (the same record and version).",
+                self.label,
+                group_digits(len)
+            ));
+        };
+        // U and T count as the same base.
+        let norm = |b: u8| if b == b'U' { b'T' } else { b };
+        let differences = (rec.sequence.len() == len).then(|| rec.sequence.iter().zip(&self.seq).filter(|(a, b)| norm(**a) != norm(**b)).count());
+        let (items, kinds) = record_items(rec, len, &|a, b| self.coords.columns(a, b), Some(&self.existing));
+        ImportState::Loaded(LoadedRecord { source: rec.version.clone(), about: about(rec, from), differences, items, kinds })
+    }
+}
+
+impl NewRecord {
+    /// The chosen record with its features, or why it cannot be imported.
+    fn state(&self) -> ImportState {
+        let Some(rec) = self.records.get(self.chosen) else { return ImportState::Failed("No GenBank record was read.".into()) };
+        if rec.protein {
+            return ImportState::Failed(format!("{} is a protein record; only nucleotide sequences can be imported.", rec.version));
+        }
+        if rec.sequence.is_empty() {
+            return ImportState::Failed(format!("{} holds no sequence (the record has no ORIGIN section).", rec.version));
+        }
+        // The new document's columns are the record's positions.
+        let len = rec.sequence.len();
+        let (items, kinds) = record_items(rec, len, &|a, b| (1..=b).contains(&a).then(|| (a - 1, b)), None);
+        ImportState::Loaded(LoadedRecord { source: rec.version.clone(), about: about(rec, &self.from), differences: None, items, kinds })
     }
 
-    pub fn update(&mut self, m: FeatureImportMsg) -> Option<Task<Message>> {
+    fn label(r: &genbank::Record) -> String {
+        let mut label = r.version.clone();
+        if !r.definition.is_empty() {
+            label.push_str(&format!(" · {}", shorten(r.definition.trim_end_matches('.'), 70)));
+        }
+        label.push_str(&format!(" · {} {}", group_digits(r.length), if r.protein { "aa" } else { "bp" }));
+        label
+    }
+}
+
+impl GenBankDialog {
+    /// Imports features onto the open document's reference (else its only or
+    /// selected sequence); `ncbi` is `None` without an email address in the
+    /// settings (only files can be read then).
+    pub fn features(od: &OpenDoc, ncbi: Option<(NetConfig, Credentials)>) -> Result<GenBankDialog, String> {
+        let (row, label) = od.feature_target()?;
+        let r = &od.doc.rows[row];
+        let accession = r.meta_value("accession").map(str::to_string).unwrap_or_else(|| accession_in(&r.name));
+        let target = FeatureTarget {
+            label,
+            seq: r.ungapped().to_ascii_uppercase(),
+            coords: RefCoords::new(r, od.width()),
+            existing: od.features.iter().map(|f| (f.kind.clone(), f.parts.clone())).collect(),
+        };
+        Ok(GenBankDialog::with(accession, ncbi, ImportInto::Features(target)))
+    }
+
+    /// Imports a record as a new document in library folder `folder`.
+    pub fn sequence(folder: Option<i64>, ncbi: Option<(NetConfig, Credentials)>) -> GenBankDialog {
+        let new = NewRecord { folder, records: Vec::new(), from: String::new(), chosen: 0, with_features: true };
+        GenBankDialog::with(String::new(), ncbi, ImportInto::Sequence(new))
+    }
+
+    fn with(accession: String, ncbi: Option<(NetConfig, Credentials)>, into: ImportInto) -> GenBankDialog {
+        GenBankDialog { accession, ncbi, into, request: 0, state: ImportState::Idle, color: ColorField::new(None).for_features() }
+    }
+
+    pub fn update(&mut self, m: GenBankMsg) -> Option<Task<Message>> {
         match m {
-            FeatureImportMsg::Accession(s) => self.accession = s,
-            FeatureImportMsg::Fetch => {
+            GenBankMsg::Accession(s) => self.accession = s,
+            GenBankMsg::Fetch => {
                 let (net, who) = self.ncbi.clone()?;
                 let acc = self.accession.trim().to_string();
                 if !entrez::valid_accession(&acc) {
                     self.state = ImportState::Failed("Enter an accession number, like MN908947.3.".into());
                     return None;
                 }
-                let len = self.target_seq.len();
+                // Features: a record of another length is not downloaded
+                // further; new sequences: nor is a very long record.
+                let target = match &self.into {
+                    ImportInto::Features(t) => Some(t.seq.len()),
+                    ImportInto::Sequence(_) => None,
+                };
                 self.state = ImportState::Busy(format!("Fetching {acc} from NCBI…"));
                 return Some(self.read_in_background(move || {
-                    // A record of another length is not downloaded further.
-                    let (text, _) = entrez::fetch_genbank(&net, &who, &acc, |l| l == len)?;
-                    Ok(("NCBI".to_string(), genbank::parse(&text)?))
+                    let (text, complete) = entrez::fetch_genbank(&net, &who, &acc, |l| target.map_or(l <= MAX_DOWNLOAD_LEN, |t| l == t))?;
+                    let records = genbank::parse(&text)?;
+                    if !complete && target.is_none() {
+                        return Err(too_long(&records));
+                    }
+                    Ok(("NCBI".to_string(), records))
                 }));
             }
-            FeatureImportMsg::OpenFile => {
+            GenBankMsg::OpenFile => {
                 return Some(Task::perform(
                     rfd::AsyncFileDialog::new()
                         .set_title("Open GenBank file")
                         .add_filter("GenBank", &["gb", "gbk", "gbff", "genbank"])
                         .add_filter("All files", &["*"])
                         .pick_file(),
-                    |f| Message::FeatureImport(FeatureImportMsg::FilePicked(f.map(|f| f.path().to_path_buf()))),
+                    |f| Message::GenBank(GenBankMsg::FilePicked(f.map(|f| f.path().to_path_buf()))),
                 ));
             }
-            FeatureImportMsg::FilePicked(None) => {}
-            FeatureImportMsg::FilePicked(Some(path)) => {
+            GenBankMsg::FilePicked(None) => {}
+            GenBankMsg::FilePicked(Some(path)) => {
                 self.state = ImportState::Busy(format!("Reading {}…", file_name(&path)));
                 return Some(self.read_in_background(move || {
                     let bytes = std::fs::read(&path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
                     Ok((file_name(&path), genbank::parse(&String::from_utf8_lossy(&bytes))?))
                 }));
             }
-            FeatureImportMsg::Loaded(request, p) => {
+            GenBankMsg::Loaded(request, p) => {
                 if request == self.request
                     && let Some(r) = p.take()
                 {
-                    self.state = match r {
-                        Ok((from, records)) => self.load(&from, &records),
-                        Err(e) => ImportState::Failed(e),
-                    };
+                    match r {
+                        Ok((from, records)) => self.load(from, records),
+                        Err(e) => self.state = ImportState::Failed(e),
+                    }
                 }
             }
-            FeatureImportMsg::Toggle(i, on) => {
+            GenBankMsg::Record(i) => {
+                if let ImportInto::Sequence(n) = &mut self.into
+                    && i < n.records.len()
+                {
+                    n.chosen = i;
+                    self.state = n.state();
+                }
+            }
+            GenBankMsg::WithFeatures(on) => {
+                if let ImportInto::Sequence(n) = &mut self.into {
+                    n.with_features = on;
+                }
+            }
+            GenBankMsg::Toggle(i, on) => {
                 if let ImportState::Loaded(r) = &mut self.state
                     && let Some(it) = r.items.get_mut(i).filter(|it| it.importable)
                 {
                     it.include = on;
                 }
             }
-            FeatureImportMsg::ToggleKind(kind, on) => self.set_included(|it| it.feature.kind == kind, on),
-            FeatureImportMsg::All(on) => self.set_included(|_| true, on),
-            FeatureImportMsg::Color(m) => self.color.update(m),
+            GenBankMsg::ToggleKind(kind, on) => self.set_included(|it| it.feature.kind == kind, on),
+            GenBankMsg::All(on) => self.set_included(|_| true, on),
+            GenBankMsg::Color(m) => self.color.update(m),
         }
         None
     }
@@ -1252,86 +1494,51 @@ impl FeatureImportDialog {
     fn read_in_background(&mut self, work: impl FnOnce() -> Result<(String, Vec<genbank::Record>), String> + Send + 'static) -> Task<Message> {
         self.request += 1;
         let request = self.request;
+        if let ImportInto::Sequence(n) = &mut self.into {
+            n.records.clear();
+        }
         job::background(work, move |r| {
             let r = r.unwrap_or_else(|| Err("Reading the record failed unexpectedly.".into()));
-            Message::FeatureImport(FeatureImportMsg::Loaded(request, job::Payload::new(r)))
+            Message::GenBank(GenBankMsg::Loaded(request, job::Payload::new(r)))
         })
     }
 
-    /// Takes the record with the target's length and maps its features.
-    fn load(&self, from: &str, records: &[genbank::Record]) -> ImportState {
-        let len = self.target_seq.len();
-        let Some(rec) = records.iter().find(|r| r.length == len) else {
-            let what = match records {
-                [r] if r.definition.is_empty() => format!("The record {} is {} bp long", r.version, group_digits(r.length)),
-                [r] => format!("The record {} ({}) is {} bp long", r.version, shorten(r.definition.trim_end_matches('.'), 80), group_digits(r.length)),
-                rs => format!("None of the {} records is {} bp long", rs.len(), group_digits(len)),
-            };
-            return ImportState::Failed(format!(
-                "{what}; {} has {} bases. Features are only imported onto a sequence of the same length (the same record and version).",
-                self.target_label,
-                group_digits(len)
-            ));
+    /// Shows the records read: for features the one with the target's
+    /// length, for a new sequence the first nucleotide record with a sequence.
+    fn load(&mut self, from: String, records: Vec<genbank::Record>) {
+        self.state = match &mut self.into {
+            ImportInto::Features(t) => t.load(&from, &records),
+            ImportInto::Sequence(n) => {
+                n.chosen = records.iter().position(|r| !r.protein && !r.sequence.is_empty()).unwrap_or(0);
+                n.records = records;
+                n.from = from;
+                n.state()
+            }
         };
-        // U and T count as the same base.
-        let norm = |b: u8| if b == b'U' { b'T' } else { b };
-        let differences = (rec.sequence.len() == len).then(|| rec.sequence.iter().zip(&self.target_seq).filter(|(a, b)| norm(**a) != norm(**b)).count());
-        let mut kinds: Vec<(String, usize)> = Vec::new();
-        let items = rec
-            .features
-            .iter()
-            .map(|f| {
-                match kinds.iter_mut().find(|k| k.0 == f.key) {
-                    Some(k) => k.1 += 1,
-                    None => kinds.push((f.key.clone(), 1)),
-                }
-                self.item(rec, f)
-            })
-            .collect();
-        let mut about = rec.version.clone();
-        if !rec.definition.is_empty() {
-            about.push_str(&format!(" · {}", rec.definition.trim_end_matches('.')));
-        }
-        about.push_str(&format!(" · {} bp · from {from}", group_digits(rec.length)));
-        ImportState::Loaded(LoadedRecord { source: rec.version.clone(), about, differences, items, kinds })
     }
 
-    /// A feature of the record on the document's columns.
-    fn item(&self, rec: &genbank::Record, f: &genbank::Feature) -> ImportItem {
-        let len = self.target_seq.len();
-        let mut feature = Feature {
-            id: 0,
-            name: f.name(),
-            kind: f.key.clone(),
-            strand: 0,
-            parts: Vec::new(),
-            location: f.location.clone(),
-            qualifiers: f.qualifiers.clone(),
-            source: rec.version.clone(),
-            color: None,
-        };
-        let unusable = |feature: Feature, note: String| ImportItem { feature, include: false, note, importable: false };
-        let loc = match genbank::parse_location(&f.location) {
-            Ok(l) => l,
-            Err(e) => return unusable(feature, format!("location not understood ({e})")),
-        };
-        feature.strand = loc.strand();
-        feature.parts = loc.spans.iter().filter(|s| s.start <= len).filter_map(|s| self.coords.columns(s.start, s.end.min(len))).collect();
-        if feature.parts.is_empty() {
-            let note = if loc.remote > 0 { "on another record" } else { "outside the sequence" };
-            return unusable(feature, note.into());
+    /// Whether the features chosen are imported (a sequence may come without).
+    fn with_features(&self) -> bool {
+        match &self.into {
+            ImportInto::Features(_) => true,
+            ImportInto::Sequence(n) => n.with_features,
         }
-        if self.existing.contains(&(feature.kind.clone(), feature.parts.clone())) {
-            return unusable(feature, "already imported".into());
-        }
-        let note = if loc.remote > 0 { "parts on other records left out".to_string() } else { String::new() };
-        ImportItem { include: f.key != "source", note, importable: true, feature }
     }
 
     /// The features chosen, in the chosen color.
     pub fn chosen(&self) -> Vec<Feature> {
         let ImportState::Loaded(r) = &self.state else { return Vec::new() };
+        if !self.with_features() {
+            return Vec::new();
+        }
         r.items.iter().filter(|it| it.include).map(|it| Feature { color: self.color.color, ..it.feature.clone() }).collect()
+    }
+
+    fn chosen_count(&self) -> usize {
+        match &self.state {
+            ImportState::Loaded(r) if self.with_features() => r.items.iter().filter(|it| it.include).count(),
+            _ => 0,
+        }
     }
 
     /// Where the chosen features come from.
@@ -1342,29 +1549,56 @@ impl FeatureImportDialog {
         }
     }
 
-    pub fn problem(&self) -> Option<String> {
-        let ImportState::Loaded(r) = &self.state else { return Some("Fetch a record from NCBI or open a GenBank file.".into()) };
-        if !r.items.iter().any(|it| it.include) {
-            return Some("Choose at least one feature.".into());
+    /// The document a sequence import creates (`None` for features or before a record is read).
+    pub fn new_document(&self) -> Option<NewDocument> {
+        let ImportInto::Sequence(n) = &self.into else { return None };
+        if !matches!(self.state, ImportState::Loaded(_)) {
+            return None;
         }
-        self.color.problem()
+        let rec = n.records.get(n.chosen)?;
+        let mut row = Row::from_gapped(rec.version.clone(), rec.definition.trim_end_matches('.').to_string(), seq::normalize(&rec.sequence));
+        row.meta = record_meta(rec);
+        Some(NewDocument { name: rec.version.clone(), row, description: format!("Imported from {} ({})", n.from, rec.version), folder: n.folder })
+    }
+
+    pub fn problem(&self) -> Option<String> {
+        if !matches!(self.state, ImportState::Loaded(_)) {
+            return Some("Fetch a record from NCBI or open a GenBank file.".into());
+        }
+        match self.chosen_count() {
+            0 if matches!(self.into, ImportInto::Features(_)) => Some("Choose at least one feature.".into()),
+            0 => None,
+            _ => self.color.problem(),
+        }
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        let fi = Message::FeatureImport;
+        let g = Message::GenBank;
         let busy = matches!(self.state, ImportState::Busy(_));
-        let intro = format!(
-            "Features (genes, CDS, …) of a GenBank record are added to {} ({} bases) and shown below the annotations. \
-             The record must have the same length.",
-            self.target_label,
-            group_digits(self.target_seq.len())
-        );
+        let (title, intro) = match &self.into {
+            ImportInto::Features(t) => (
+                "Import features",
+                format!(
+                    "Features (genes, CDS, …) of a GenBank record are added to {} ({} bases) and shown below the annotations. \
+                     The record must have the same length.",
+                    t.label,
+                    group_digits(t.seq.len())
+                ),
+            ),
+            ImportInto::Sequence(_) => (
+                "Import from NCBI / GenBank",
+                "A nucleotide record, downloaded from NCBI by its accession number or read from a GenBank file, \
+                 becomes a new document in the library, with or without its features (genes, CDS, …)."
+                    .to_string(),
+            ),
+        };
         let can_fetch = self.ncbi.is_some() && !busy && entrez::valid_accession(&self.accession);
-        let fetch = can_fetch.then_some(fi(FeatureImportMsg::Fetch));
+        let fetch = can_fetch.then_some(g(GenBankMsg::Fetch));
         let mut ncbi = row![
             text("NCBI accession").size(13).width(Length::Fixed(120.0)),
             text_input("e.g. MN908947.3", &self.accession)
-                .on_input(move |s| fi(FeatureImportMsg::Accession(s)))
+                .id(ACCESSION_INPUT)
+                .on_input(move |s| g(GenBankMsg::Accession(s)))
                 .on_submit_maybe(fetch.clone())
                 .padding(5)
                 .size(13)
@@ -1383,11 +1617,25 @@ impl FeatureImportDialog {
             button(text("Open GenBank file…").size(13))
                 .padding([5, 12])
                 .style(button::secondary)
-                .on_press_maybe((!busy).then_some(fi(FeatureImportMsg::OpenFile))),
+                .on_press_maybe((!busy).then_some(g(GenBankMsg::OpenFile))),
         ]
         .spacing(8)
         .align_y(iced::Center);
         let mut body = column![text(intro).size(13), ncbi, file].spacing(10);
+        if let ImportInto::Sequence(n) = &self.into
+            && n.records.len() > 1
+        {
+            let choices: Vec<RecordChoice> = n.records.iter().enumerate().map(|(index, r)| RecordChoice { index, label: NewRecord::label(r) }).collect();
+            let selected = choices.get(n.chosen).cloned();
+            body = body.push(
+                row![
+                    text(format!("Record ({} in the file)", n.records.len())).size(13).width(Length::Fixed(120.0)),
+                    pick_list(choices, selected, move |c: RecordChoice| g(GenBankMsg::Record(c.index))).text_size(13).width(Fill),
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
+            );
+        }
         match &self.state {
             ImportState::Idle => {}
             ImportState::Busy(m) => body = body.push(text(m.as_str()).size(13).style(style::muted)),
@@ -1395,36 +1643,66 @@ impl FeatureImportDialog {
             ImportState::Loaded(r) => body = body.push(self.record_view(r)),
         }
         let problem = self.problem();
-        let n = match &self.state {
-            ImportState::Loaded(r) => r.items.iter().filter(|it| it.include).count(),
-            _ => 0,
+        let n = self.chosen_count();
+        let (confirm, action) = match &self.into {
+            ImportInto::Features(_) if n == 1 => ("Import 1 feature".to_string(), Message::ImportFeatures),
+            ImportInto::Features(_) => (format!("Import {} features", group_digits(n)), Message::ImportFeatures),
+            ImportInto::Sequence(_) => match n {
+                0 => ("Import sequence".to_string(), Message::ImportRecord),
+                1 => ("Import sequence and 1 feature".to_string(), Message::ImportRecord),
+                n => (format!("Import sequence and {} features", group_digits(n)), Message::ImportRecord),
+            },
         };
-        let confirm = if n == 1 { "Import 1 feature".to_string() } else { format!("Import {} features", group_digits(n)) };
         let buttons = row![
             text(problem.clone().unwrap_or_default()).size(12).style(style::muted).width(Fill),
             button("Cancel").on_press(Message::CloseModal).style(button::secondary),
-            button(text(confirm)).on_press_maybe(problem.is_none().then_some(Message::ImportFeatures)).style(button::primary),
+            button(text(confirm)).on_press_maybe(problem.is_none().then_some(action)).style(button::primary),
         ]
         .spacing(10)
         .align_y(iced::Center);
-        dialog_frame("Import features", body.into(), buttons.into(), 880.0)
+        dialog_frame(title, body.into(), buttons.into(), 880.0)
     }
 
     fn record_view<'a>(&'a self, r: &'a LoadedRecord) -> Element<'a, Message> {
-        let fi = Message::FeatureImport;
-        let same = format!("✓ Same length as {} ({} bases)", self.target_label, group_digits(self.target_seq.len()));
-        let (check, differs) = match r.differences {
-            Some(0) => (format!("{same}; identical sequence."), false),
-            Some(n) => (format!("{same}; but the sequences differ at {} position(s).", group_digits(n)), true),
-            None => (format!("{same}."), false),
-        };
+        let g = Message::GenBank;
+        let mut view =
+            column![text(r.about.as_str()).size(13).font(Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT }).wrapping(text::Wrapping::WordOrGlyph)]
+                .spacing(8);
+        match &self.into {
+            ImportInto::Features(t) => {
+                let same = format!("✓ Same length as {} ({} bases)", t.label, group_digits(t.seq.len()));
+                let (check, differs) = match r.differences {
+                    Some(0) => (format!("{same}; identical sequence."), false),
+                    Some(n) => (format!("{same}; but the sequences differ at {} position(s).", group_digits(n)), true),
+                    None => (format!("{same}."), false),
+                };
+                view = view.push(text(check).size(12).style(if differs { style::danger_text } else { style::success_text }));
+            }
+            ImportInto::Sequence(n) => {
+                let count = r.items.len();
+                let label = match count {
+                    0 => "Import features (the record has none)".to_string(),
+                    1 => "Import features (1 in the record)".to_string(),
+                    c => format!("Import features ({} in the record)", group_digits(c)),
+                };
+                view = view.push(
+                    checkbox(n.with_features && count > 0)
+                        .label(label)
+                        .on_toggle_maybe((count > 0).then_some(move |b| g(GenBankMsg::WithFeatures(b))))
+                        .text_size(13),
+                );
+                if !n.with_features || count == 0 {
+                    return view.into();
+                }
+            }
+        }
         let kinds = row(r.kinds.iter().map(|(k, n)| {
             let on = r.items.iter().any(|it| it.feature.kind == *k && it.include);
             let any = r.items.iter().any(|it| it.feature.kind == *k && it.importable);
             let kind = k.clone();
             checkbox(on)
                 .label(format!("{k} ({})", group_digits(*n)))
-                .on_toggle_maybe(any.then_some(move |b| fi(FeatureImportMsg::ToggleKind(kind.clone(), b))))
+                .on_toggle_maybe(any.then_some(move |b| g(GenBankMsg::ToggleKind(kind.clone(), b))))
                 .text_size(12)
                 .into()
         }))
@@ -1437,7 +1715,7 @@ impl FeatureImportDialog {
         for (i, it) in r.items.iter().enumerate().take(IMPORT_LIST_MAX) {
             list = list.push(
                 row![
-                    checkbox(it.include).on_toggle_maybe(it.importable.then_some(move |b| fi(FeatureImportMsg::Toggle(i, b)))).size(14),
+                    checkbox(it.include).on_toggle_maybe(it.importable.then_some(move |b| g(GenBankMsg::Toggle(i, b)))).size(14),
                     text(it.feature.name.as_str()).size(12).width(Fill),
                     text(it.feature.kind.as_str()).size(12).width(w_kind),
                     text(shorten(&it.feature.location, 36)).size(12).width(w_loc),
@@ -1462,30 +1740,25 @@ impl FeatureImportDialog {
             .take(10)
             .map(|(k, _)| Chip::Rgb(style::feature_kind_color(k)))
             .collect();
-        column![
-            text(r.about.as_str()).size(13).font(Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT }).wrapping(text::Wrapping::WordOrGlyph),
-            text(check).size(12).style(if differs { style::danger_text } else { style::success_text }),
-            row![
-                text("Types").size(12).style(style::muted).width(Length::Fixed(50.0)),
-                kinds,
-            ]
-            .spacing(8),
-            row![
-                button(text("All").size(12)).padding([2, 8]).style(button::secondary).on_press(fi(FeatureImportMsg::All(true))),
-                button(text("None").size(12)).padding([2, 8]).style(button::secondary).on_press(fi(FeatureImportMsg::All(false))),
-                text("The source feature (the whole record) is left out unless chosen.").size(12).style(style::muted),
-            ]
-            .spacing(6)
-            .align_y(iced::Center),
-            scrollable(list.padding(iced::Padding { right: 12.0, ..Default::default() })).height(list_h),
-            row![
-                container(text("Color").size(13)).padding(iced::Padding { top: 4.0, ..Default::default() }),
-                self.color.view(chips, |m| Message::FeatureImport(FeatureImportMsg::Color(m))),
-            ]
-            .spacing(8),
-        ]
-        .spacing(8)
-        .into()
+        view.push(row![text("Types").size(12).style(style::muted).width(Length::Fixed(50.0)), kinds].spacing(8))
+            .push(
+                row![
+                    button(text("All").size(12)).padding([2, 8]).style(button::secondary).on_press(g(GenBankMsg::All(true))),
+                    button(text("None").size(12)).padding([2, 8]).style(button::secondary).on_press(g(GenBankMsg::All(false))),
+                    text("The source feature (the whole record) is left out unless chosen.").size(12).style(style::muted),
+                ]
+                .spacing(6)
+                .align_y(iced::Center),
+            )
+            .push(scrollable(list.padding(iced::Padding { right: 12.0, ..Default::default() })).height(list_h))
+            .push(
+                row![
+                    container(text("Color").size(13)).padding(iced::Padding { top: 4.0, ..Default::default() }),
+                    self.color.view(chips, |m| Message::GenBank(GenBankMsg::Color(m))),
+                ]
+                .spacing(8),
+            )
+            .into()
     }
 }
 
@@ -3194,7 +3467,7 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
         Modal::Annotation(d) => d.view(),
         Modal::SerialAnnotation(d) => d.view(),
         Modal::Color(d) => d.view(),
-        Modal::FeatureImport(d) => d.view(),
+        Modal::GenBank(d) => d.view(),
         Modal::Feature(d) => d.view(),
         Modal::ConfirmDeleteFeatures { ids, name, detail } => {
             let one = ids.len() == 1;
@@ -3399,17 +3672,17 @@ mod tests {
             Row::from_gapped("gi|123|gb|AB000001.1|".into(), String::new(), b"ACG--TACGTA".to_vec()),
             Row::from_gapped("s1".into(), String::new(), b"ACGTTTACGTA".to_vec()),
         ]));
-        let mut d = FeatureImportDialog::new(&od, None).unwrap();
+        let mut d = GenBankDialog::features(&od, None).unwrap();
         assert_eq!(d.accession, "AB000001.1");
         // Without an email address nothing is fetched.
-        assert!(d.update(FeatureImportMsg::Fetch).is_none());
+        assert!(d.update(GenBankMsg::Fetch).is_none());
         assert!(matches!(d.state, ImportState::Idle));
         let gb = "LOCUS       AB000001     9 bp    DNA     linear\nVERSION     AB000001.1\nFEATURES             Location/Qualifiers\n     \
                   source          1..9\n     gene            2..5\n                     /gene=\"g1\"\n     CDS             \
                   complement(join(1..2,7..9))\n                     /product=\"p1\"\n     misc_feature    X1.1:1..5\nORIGIN\n        \
                   1 acgtacgaa\n//\n";
         let recs = genbank::parse(gb).unwrap();
-        d.state = d.load("test", &recs);
+        d.load("test".into(), recs.clone());
         let ImportState::Loaded(r) = &d.state else { panic!("not loaded") };
         assert_eq!(r.differences, Some(1));
         assert_eq!(r.kinds.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(), ["source", "gene", "CDS", "misc_feature"]);
@@ -3419,26 +3692,73 @@ mod tests {
         assert_eq!((it(1).0.parts.clone(), it(1).0.strand, it(1).1), (vec![(1, 7)], 1, true));
         assert_eq!((it(2).0.parts.clone(), it(2).0.strand, it(2).0.name.as_str()), (vec![(0, 2), (8, 11)], -1, "p1"));
         assert_eq!((it(3).1, it(3).2, r.items[3].note.as_str()), (false, false, "on another record"));
-        d.update(FeatureImportMsg::ToggleKind("source".into(), true));
-        d.update(FeatureImportMsg::Toggle(1, false));
-        d.update(FeatureImportMsg::Color(ColorMsg::Pick(Some(Rgb(1, 2, 3)))));
+        d.update(GenBankMsg::ToggleKind("source".into(), true));
+        d.update(GenBankMsg::Toggle(1, false));
+        d.update(GenBankMsg::Color(ColorMsg::Pick(Some(Rgb(1, 2, 3)))));
         let chosen = d.chosen();
         assert_eq!(chosen.iter().map(|f| f.kind.as_str()).collect::<Vec<_>>(), ["source", "CDS"]);
         assert!(chosen.iter().all(|f| f.color == Some(Rgb(1, 2, 3)) && f.source == "AB000001.1"));
-        d.update(FeatureImportMsg::All(false));
+        assert!(d.new_document().is_none());
+        d.update(GenBankMsg::All(false));
         assert_eq!(d.problem().as_deref(), Some("Choose at least one feature."));
         // Imported features are not offered again.
         od.set_features(vec![Feature { id: 5, ..chosen[1].clone() }]);
-        let mut d = FeatureImportDialog::new(&od, None).unwrap();
-        d.state = d.load("test", &recs);
+        let mut d = GenBankDialog::features(&od, None).unwrap();
+        d.load("test".into(), recs);
         let ImportState::Loaded(r) = &d.state else { panic!("not loaded") };
         assert_eq!((r.items[2].importable, r.items[2].note.as_str()), (false, "already imported"));
-        // Another length is refused.
+        // Another length is refused, and so is a protein record.
         let other = genbank::parse("LOCUS       X  12 bp    DNA\nDEFINITION  Other.\nVERSION     X.1\n").unwrap();
-        let ImportState::Failed(e) = d.load("NCBI", &other) else { panic!("loaded") };
+        d.load("NCBI".into(), other);
+        let ImportState::Failed(e) = &d.state else { panic!("loaded") };
         assert!(e.starts_with("The record X.1 (Other) is 12 bp long; the reference “gi|123|gb|AB000001.1|” has 9 bases."), "{e}");
+        d.load("NCBI".into(), genbank::parse("LOCUS       P  9 aa\nVERSION     P.1\n").unwrap());
+        assert!(matches!(&d.state, ImportState::Failed(e) if e.contains("protein")));
         assert_eq!(accession_in("hCoV-19/x MN908947.3"), "");
         assert_eq!(accession_in("NC_045512.2 Severe acute"), "NC_045512.2");
+    }
+
+    #[test]
+    fn record_import() {
+        let mut d = GenBankDialog::sequence(Some(4), None);
+        assert_eq!(d.accession, "");
+        assert!(d.update(GenBankMsg::Fetch).is_none());
+        assert!(d.new_document().is_none());
+        assert_eq!(d.problem().as_deref(), Some("Fetch a record from NCBI or open a GenBank file."));
+        // A file with a protein record first: the nucleotide record is chosen.
+        let gb = "LOCUS       P  3 aa\nVERSION     P.1\nORIGIN\n        1 mes\n//\n\
+                  LOCUS       AB000001     9 bp    RNA     linear\nDEFINITION  Test virus, complete genome.\nVERSION     AB000001.1\n\
+                  FEATURES             Location/Qualifiers\n     source          1..9\n                     /organism=\"Test virus\"\n\
+                  \x20                    /host=\"Homo sapiens\"\n     gene            2..5\n                     /gene=\"g1\"\n     CDS             \
+                  complement(join(1..2,7..>12))\n                     /product=\"p1\"\nORIGIN\n        1 acguacgaa\n//\n";
+        d.load("x.gb".into(), genbank::parse(gb).unwrap());
+        let ImportState::Loaded(r) = &d.state else { panic!("not loaded") };
+        assert_eq!(r.about, "AB000001.1 · Test virus, complete genome · 9 bp · from x.gb");
+        // Positions are the new document's columns; parts past the end are cut.
+        assert_eq!(r.items[1].feature.parts, vec![(1, 5)]);
+        assert_eq!((r.items[2].feature.parts.clone(), r.items[2].feature.strand), (vec![(0, 2), (6, 9)], -1));
+        assert_eq!(d.chosen().iter().map(|f| f.kind.as_str()).collect::<Vec<_>>(), ["gene", "CDS"]);
+        let doc = d.new_document().unwrap();
+        assert_eq!((doc.name.as_str(), doc.folder, doc.description.as_str()), ("AB000001.1", Some(4), "Imported from x.gb (AB000001.1)"));
+        assert_eq!((doc.row.name.as_str(), doc.row.description.as_str(), doc.row.data.as_slice()), ("AB000001.1", "Test virus, complete genome", &b"ACGTACGAA"[..]));
+        assert_eq!(doc.row.meta_value("accession"), Some("AB000001.1"));
+        assert_eq!((doc.row.meta_value("organism"), doc.row.meta_value("host")), (Some("Test virus"), Some("Homo sapiens")));
+        // Without features only the sequence is imported.
+        d.update(GenBankMsg::WithFeatures(false));
+        assert!(d.chosen().is_empty());
+        assert_eq!(d.problem(), None);
+        d.update(GenBankMsg::WithFeatures(true));
+        d.update(GenBankMsg::All(false));
+        assert_eq!(d.problem(), None);
+        // The other record of the file is a protein.
+        d.update(GenBankMsg::Record(0));
+        assert!(matches!(&d.state, ImportState::Failed(e) if e.contains("protein")));
+        assert!(d.new_document().is_none());
+        // A record without a sequence cannot be imported.
+        d.load("NCBI".into(), genbank::parse("LOCUS       X  12 bp    DNA\nVERSION     X.1\n").unwrap());
+        assert!(matches!(&d.state, ImportState::Failed(e) if e.contains("no sequence")));
+        let chromosome = genbank::parse("LOCUS       NC_000001  248956422 bp DNA\nVERSION     NC_000001.11\n").unwrap();
+        assert!(too_long(&chromosome).starts_with("NC_000001.11 is 248,956,422 bp long."));
     }
 
     #[test]

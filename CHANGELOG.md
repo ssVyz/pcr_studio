@@ -7,6 +7,31 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.1.6] - 2026-11-02
+
+### Added
+
+- **Import from NCBI / GenBank** (File menu, next to **Import FASTA…**; also in the library's
+  right-click menu and on the start page): a nucleotide record becomes a new document with one
+  sequence. The record is **fetched from NCBI** by accession number (needs the email address in
+  Settings → NCBI) or read from a **GenBank file**; a file with several records offers them in a
+  list.
+  - **With or without features**: “Import features” brings the record's genes, CDS, … along,
+    chosen and colored as in **Import features** (all but `source` are chosen at first).
+  - The sequence is named by the accession (`MN908947.3`), with the record's description; its
+    metadata gets the accession and the source's organism, strain, isolate, serotype, segment,
+    host, country/location and collection date where the record has them.
+  - Protein records and records without a sequence are refused. Records over 20,000,000 bp (whole
+    chromosomes) are not downloaded from NCBI; their size is read from the header first.
+
+### Changed
+
+- NCBI records are fetched with `rettype=gbwithparts`, so records assembled from others (CON
+  records) come with their sequence; other records are unchanged.
+- The GenBank file reader notes protein records (`aa` on the LOCUS line); **Import features**
+  refuses them.
+- The buttons on the start page wrap onto a second line when they do not fit.
+
 ## [0.1.5] - 2026-11-02
 
 ### Added

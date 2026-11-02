@@ -98,7 +98,8 @@ fn gist(s: &str) -> String {
 }
 
 /// Downloads the GenBank flat file of nucleotide record `accession`
-/// (`efetch`, `db=nuccore`, `rettype=gb`). `accept_length` sees the length
+/// (`efetch`, `db=nuccore`, `rettype=gbwithparts`: as `gb`, but records
+/// assembled from others (CON) come with their sequence). `accept_length` sees the length
 /// on the LOCUS line first; if it returns false, the download stops after
 /// the header (up to the feature table), which is returned with `false`.
 pub fn fetch_genbank(net: &NetConfig, who: &Credentials, accession: &str, accept_length: impl Fn(usize) -> bool) -> Result<(String, bool), String> {
@@ -106,7 +107,7 @@ pub fn fetch_genbank(net: &NetConfig, who: &Credentials, accession: &str, accept
     if !valid_accession(acc) {
         return Err(format!("“{acc}” is not an accession number (like MN908947.3 or NC_045512)."));
     }
-    let mut resp = call(net, who, "efetch.fcgi", &[("db", "nuccore"), ("id", acc), ("rettype", "gb"), ("retmode", "text")])?;
+    let mut resp = call(net, who, "efetch.fcgi", &[("db", "nuccore"), ("id", acc), ("rettype", "gbwithparts"), ("retmode", "text")])?;
     if resp.status != 200 {
         return Err(error_message(resp.status, &mut resp.body));
     }

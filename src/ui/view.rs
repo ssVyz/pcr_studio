@@ -155,6 +155,7 @@ impl App {
                     Entry::item("New folder", "", Some(Message::NewFolder)),
                     Entry::Separator,
                     Entry::item("Import FASTA…", "Ctrl+O", idle.then_some(Message::ImportFasta)),
+                    Entry::item("Import from NCBI / GenBank…", "", idle.then_some(Message::OpenRecordImport)),
                     Entry::item("Import FASTQ (linked)…", "", idle.then_some(Message::ImportFastq)),
                 ];
             }
@@ -285,6 +286,7 @@ impl App {
             menu::MenuId::File => vec![
                 Entry::item("New sequence…", "Ctrl+N", when(idle, Message::NewSequence)),
                 Entry::item("Import FASTA…", "Ctrl+O", when(idle, Message::ImportFasta)),
+                Entry::item("Import from NCBI / GenBank…", "", when(idle, Message::OpenRecordImport)),
                 Entry::item("Import FASTQ (linked)…", "", when(idle, Message::ImportFastq)),
                 Entry::item("Import metadata table…", "", when(idle && writable, Message::ImportMetadata)),
                 Entry::item("Import features (NCBI, GenBank)…", "", when(idle && writable, Message::OpenFeatureImport)),
@@ -381,7 +383,7 @@ impl App {
         let dragging = self.drag.as_ref().is_some_and(|d| d.active);
         if self.library.is_empty() && self.folders.is_empty() {
             entries.push(
-                text("No documents yet. Import FASTA or FASTQ files, create a sequence (Ctrl+N) or generate demo data.").size(12).style(style::muted).into(),
+                text("No documents yet. Import FASTA or FASTQ files, a record from NCBI, create a sequence (Ctrl+N) or generate demo data.").size(12).style(style::muted).into(),
             );
         }
         // Free space below the entries: the top-level drop zone.
@@ -620,7 +622,7 @@ impl App {
             text("PCR Studio").size(28),
             text("Sequence alignment viewer for PCR design and inclusivity evaluation").size(15).style(style::muted),
             Space::new().height(12),
-            text("1. Import FASTA files (aligned or unaligned) or paste a sequence — they are stored in the library.").size(14),
+            text("1. Import FASTA files (aligned or unaligned), download a record from NCBI or paste a sequence — they are stored in the library.").size(14),
             text("    FASTQ files (also .gz) are linked: they stay on disk and the library points to them.").size(14),
             text("2. Open a document from the library (double-click it or press Open).").size(14),
             text("3. Map sequences to a reference, or view an existing alignment.").size(14),
@@ -628,11 +630,14 @@ impl App {
             Space::new().height(12),
             row![
                 button("Import FASTA…").on_press_maybe((!self.busy()).then_some(Message::ImportFasta)).style(button::primary),
+                button("Import from NCBI…").on_press_maybe((!self.busy()).then_some(Message::OpenRecordImport)).style(button::secondary),
                 button("Import FASTQ…").on_press_maybe((!self.busy()).then_some(Message::ImportFastq)).style(button::secondary),
                 button("New sequence…").on_press_maybe((!self.busy()).then_some(Message::NewSequence)).style(button::secondary),
                 button("Generate demo data").on_press_maybe((!self.busy()).then_some(Message::DemoData)).style(button::secondary),
             ]
-            .spacing(10),
+            .spacing(10)
+            .wrap()
+            .vertical_spacing(10),
         ]
         .spacing(6)
         .max_width(620);
