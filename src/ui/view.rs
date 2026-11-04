@@ -30,15 +30,25 @@ fn section<'a>(title: &'a str) -> Element<'a, Message> {
 
 impl App {
     pub(super) fn view(&self) -> Element<'_, Message> {
+        // iced keeps widget state (the library's scroll position, focus,
+        // ...) only while the widget tree keeps its shape: a widget of
+        // another kind in the same place starts over. So panels and overlays
+        // are added after what is always there, never wrapped around it.
         let (lib_w, opt_w) = self.panel_widths();
-        let body = row![self.library_panel(lib_w), self.splitter(Split::Library), self.center_panel()];
-        let body: Element<Message> =
-            if self.options_visible() { row![body, self.splitter(Split::Options), self.options_panel(opt_w)].into() } else { body.into() };
+        let mut body = row![self.library_panel(lib_w), self.splitter(Split::Library), self.center_panel()];
+        if self.options_visible() {
+            body = body.push(self.splitter(Split::Options)).push(self.options_panel(opt_w));
+        }
         let main = column![self.toolbar(), container(body).height(Fill), self.status_bar()];
         let base: Element<Message> = container(main).width(Fill).height(Fill).into();
+        stack(std::iter::once(base).chain(self.overlays())).into()
+    }
+
+    /// Layers above the window: a dialog, an open menu, a drag label, ...
+    fn overlays(&self) -> Vec<Element<'_, Message>> {
         if let Some(m) = &self.modal {
             let overlay = opaque(mouse_area(center(opaque(dialogs::view_modal(m))).style(style::backdrop)).on_press(Message::Noop));
-            stack![base, overlay].into()
+            vec![overlay]
         } else if let Some(id) = self.menu {
             // Clicking anywhere below the menu bar closes the menu; the bar
             // itself stays live so hovering another title switches menus.
@@ -47,7 +57,7 @@ impl App {
                 opaque(mouse_area(Space::new().width(Fill).height(Fill)).on_press(Message::CloseMenu).on_right_press(Message::CloseMenu)),
             ];
             let panel = iced::widget::pin(opaque(menu::panel(self.menu_entries(id)))).x(menu::title_x(id)).y(menu::BAR_H);
-            stack![base, dismiss, panel].into()
+            vec![dismiss.into(), panel.into()]
         } else if let Some(c) = self.context {
             let entries = self.context_entries(c.target);
             let h = menu::panel_height(&entries);
@@ -57,15 +67,15 @@ impl App {
             let y = if c.pos.y + h > self.window_size.height - 6.0 { (c.pos.y - h).max(0.0) } else { c.pos.y };
             let dismiss = opaque(mouse_area(Space::new().width(Fill).height(Fill)).on_press(Message::CloseContext).on_right_press(Message::CloseContext));
             let panel = iced::widget::pin(opaque(menu::panel_with_width(entries, w))).x(x).y(y);
-            stack![base, dismiss, panel].into()
+            vec![dismiss, panel.into()]
         } else if let Some(ghost) = self.drag_ghost() {
-            stack![base, ghost].into()
+            vec![ghost]
         } else if self.split_drag.is_some() {
             // Keep the resize cursor while the edge is dragged across other widgets.
             let cover = mouse_area(Space::new().width(Fill).height(Fill)).interaction(mouse::Interaction::ResizingHorizontally);
-            stack![base, cover].into()
+            vec![cover.into()]
         } else {
-            base
+            Vec::new()
         }
     }
 
@@ -127,7 +137,7 @@ impl App {
         let idle = !self.busy();
         let key = match target {
             ContextTarget::Entry(k) => k,
-            ContextTarget::Viewer { annotation, feature, col } => {
+            ContextTarget::Viewer { annotation, feature, col, row } => {
                 let od = self.open.as_ref();
                 let selection = od.is_some_and(|o| o.selection.is_some());
                 let report = od.is_some_and(|o| o.report.is_some());
@@ -147,9 +157,16 @@ impl App {
                     entries.push(Entry::danger(self.features_label("Delete feature…", "Delete"), writable.then_some(Message::AskDeleteSelectedFeatures)));
                     entries.push(Entry::Separator);
                 }
-                // Selected rows (a right-clicked name is selected).
-                if od.is_some_and(|o| !o.chosen_rows().is_empty()) {
+                // The right-clicked row (also the reference), then the selected
+                // rows (a right-clicked name is selected).
+                if let Some(r) = row {
+                    entries.push(Entry::item("Copy row sequence", "", Some(Message::CopyRowSequence(r))));
+                }
+                let chosen = od.is_some_and(|o| !o.chosen_rows().is_empty());
+                if chosen {
                     entries.extend(self.row_entries(false));
+                }
+                if row.is_some() || chosen {
                     entries.push(Entry::Separator);
                 }
                 entries.extend([
@@ -211,6 +228,11 @@ impl App {
                     Entry::item("New sequence…", "", idle.then_some(Message::NewSequence)),
                     Entry::item("New subfolder", "", Some(Message::NewFolder)),
                     Entry::item("Rename…", "", Some(Message::AskRenameFolder(id))),
+                    Entry::Separator,
+                    // Into this folder: right-clicking selected it.
+                    Entry::item("Import FASTA…", "", idle.then_some(Message::ImportFasta)),
+                    Entry::item("Import from NCBI / GenBank…", "", idle.then_some(Message::OpenRecordImport)),
+                    Entry::item("Import FASTQ (linked)…", "", idle.then_some(Message::ImportFastq)),
                     Entry::Separator,
                     Entry::danger("Delete folder…", Some(Message::AskDeleteFolder(id))),
                 ]
@@ -433,13 +455,13 @@ impl App {
         // Clicks on free space (entries capture their own clicks) clear the
         // selection; right-clicks open the library menu.
         let list = mouse_area(list).on_press(Message::LibClearSelection).on_right_press(Message::LibContextEmpty);
-        let list: Element<Message> = if dragging {
+        // Always a stack, so the list keeps its scroll position (see `view`).
+        let mut list = stack![list];
+        if dragging {
             // Invisible strips at the edges scroll the list while dragging.
             let zone = |z: i8| mouse_area(Space::new().width(Fill).height(28)).on_enter(Message::DragZone(z)).on_exit(Message::DragZone(0));
-            stack![list, column![zone(-1), Space::new().height(Fill), zone(1)]].into()
-        } else {
-            list.into()
-        };
+            list = list.push(column![zone(-1), Space::new().height(Fill), zone(1)]);
+        }
         let idle = !self.busy();
         let (open, rename, delete) = match (self.library_selected, self.folder_selected) {
             (Some(d), _) => (idle.then_some(Message::OpenDocument(d)), Some(Message::AskRename(d)), idle.then_some(Message::AskDelete(d))),
@@ -1538,5 +1560,178 @@ fn drop_zone_style(theme: &Theme, active: bool, ok: bool) -> container::Style {
         background: (active && ok).then(|| p.primary.weak.color.into()),
         border: iced::Border { color, width: 1.0, radius: 5.0.into() },
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::canvas::ViewMsg;
+    use super::super::state::OpenDoc;
+    use super::super::{App, LibKey, Message, Split, menu};
+    use crate::db::Db;
+    use crate::model::{DocKind, Document, Row};
+    use iced::Element;
+    use iced::advanced::widget::{Tree, tree};
+    use iced::widget::{Space, scrollable};
+
+    /// A window on a new library file with a folder and a document in it;
+    /// returns the window, the folder and the document.
+    fn test_app(name: &str) -> (App, i64, i64) {
+        let path = std::env::temp_dir().join(format!("pcr_studio_view_{}_{name}.db", std::process::id()));
+        remove_db(&path);
+        let mut db = Db::open(&path).unwrap();
+        let folder = db.create_folder("f", None).unwrap();
+        let doc = Document::new(vec![Row::from_gapped("s".into(), String::new(), b"ACGT".to_vec())]);
+        let id = db.insert_document("d", DocKind::Sequences, &doc, None, "", Some(folder), &|_| {}).unwrap();
+        (App::new(db, path, None), folder, id)
+    }
+
+    fn remove_db(path: &std::path::Path) {
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    /// Address of the library list's scroll state (the window's first
+    /// scrollable). iced keeps the state while the widget tree keeps its
+    /// shape; a new address means it was rebuilt and the list jumped back to
+    /// the top.
+    fn library_scroll(tree: &Tree) -> *const () {
+        fn find(t: &Tree, tag: tree::Tag) -> Option<*const ()> {
+            if t.tag == tag
+                && let tree::State::Some(s) = &t.state
+            {
+                return Some(&**s as *const dyn std::any::Any as *const ());
+            }
+            t.children.iter().find_map(|c| find(c, tag))
+        }
+        let probe: Element<Message> = scrollable(Space::new()).into();
+        find(tree, probe.as_widget().tag()).expect("no scrollable in the window")
+    }
+
+    /// Menus, dialogs, drags and the options panel come and go without
+    /// resetting the library's scroll position.
+    #[test]
+    fn library_keeps_scroll_position() {
+        let (mut app, folder, doc) = test_app("scroll");
+        let mut tree = Tree::new(app.view());
+        let start = library_scroll(&tree);
+        let mut check = |app: &App, what: &str| {
+            tree.diff(app.view());
+            assert!(library_scroll(&tree) == start, "library scroll position lost: {what}");
+        };
+        let _ = app.update(Message::LibContext(LibKey::Doc(doc)));
+        check(&app, "right-click on a document");
+        let _ = app.update(Message::AskDelete(doc));
+        check(&app, "delete dialog");
+        let _ = app.update(Message::CloseModal);
+        check(&app, "dialog closed");
+        let _ = app.update(Message::LibContext(LibKey::Folder(folder)));
+        check(&app, "right-click on a folder");
+        let _ = app.update(Message::CloseContext);
+        check(&app, "right-click menu closed");
+        let _ = app.update(Message::LibContextEmpty);
+        check(&app, "right-click on free space");
+        let _ = app.update(Message::CloseContext);
+        let _ = app.update(Message::ToggleMenu(menu::MenuId::File));
+        check(&app, "menu bar menu");
+        let _ = app.update(Message::CloseMenu);
+        check(&app, "menu bar menu closed");
+        let _ = app.update(Message::LibPress(LibKey::Doc(doc)));
+        let _ = app.update(Message::DragMove(iced::Point::new(10.0, 10.0)));
+        let _ = app.update(Message::DragMove(iced::Point::new(10.0, 60.0)));
+        check(&app, "dragging an entry");
+        app.drag = None;
+        check(&app, "drag ended");
+        let _ = app.update(Message::SplitPress(Split::Library));
+        check(&app, "resizing the library");
+        let _ = app.update(Message::SplitRelease);
+        check(&app, "resizing done");
+        // Opening a document shows the display options panel next to it.
+        let info = app.library.iter().find(|d| d.id == doc).cloned().unwrap();
+        let rows = Document::new(vec![Row::from_gapped("s".into(), String::new(), b"ACGT".to_vec())]);
+        app.open = Some(OpenDoc::new(info, rows, Vec::new(), &app.settings.view));
+        check(&app, "document opened");
+        app.settings.show_options = false;
+        check(&app, "options panel hidden");
+        close(app);
+    }
+
+    fn close(app: App) {
+        let path = app.db_path.clone();
+        drop(app);
+        remove_db(&path);
+    }
+
+    /// Action of the menu entry `label` (`None`: shown disabled).
+    fn action(entries: &[menu::Entry], label: &str) -> Option<Message> {
+        entries
+            .iter()
+            .find_map(|e| match e {
+                menu::Entry::Item { label: l, action, .. } if l == label => Some(action.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no menu entry “{label}”"))
+    }
+
+    fn has_entry(entries: &[menu::Entry], label: &str) -> bool {
+        entries.iter().any(|e| matches!(e, menu::Entry::Item { label: l, .. } if l == label))
+    }
+
+    /// The imports are in the menu of a folder (into that folder) and of
+    /// free space (to the top level).
+    #[test]
+    fn folder_menu_imports_into_the_folder() {
+        let (mut app, folder, doc) = test_app("folder_menu");
+        let _ = app.update(Message::LibContext(LibKey::Doc(doc)));
+        let _ = app.update(Message::LibContext(LibKey::Folder(folder)));
+        let entries = app.context_entries(app.context.unwrap().target);
+        assert!(matches!(action(&entries, "Import FASTA…"), Some(Message::ImportFasta)));
+        assert!(matches!(action(&entries, "Import from NCBI / GenBank…"), Some(Message::OpenRecordImport)));
+        assert!(matches!(action(&entries, "Import FASTQ (linked)…"), Some(Message::ImportFastq)));
+        assert_eq!(app.target_folder(), Some(folder));
+        let _ = app.update(Message::LibContextEmpty);
+        let entries = app.context_entries(app.context.unwrap().target);
+        assert!(matches!(action(&entries, "Import FASTA…"), Some(Message::ImportFasta)));
+        assert!(matches!(action(&entries, "Import FASTQ (linked)…"), Some(Message::ImportFastq)));
+        assert_eq!(app.target_folder(), None);
+        close(app);
+    }
+
+    /// Right-clicking a sequence name offers its bases (without gaps) for
+    /// the clipboard, also for the reference; elsewhere there is no entry.
+    #[test]
+    fn copy_row_sequence() {
+        let (mut app, _, doc) = test_app("copy_row");
+        let mut info = app.library.iter().find(|d| d.id == doc).cloned().unwrap();
+        info.reference = Some(0);
+        let rows = Document::new(vec![
+            Row::from_gapped("ref".into(), String::new(), b"ACGTACGT".to_vec()),
+            Row::from_gapped("s1".into(), String::new(), b"--GT-CG-".to_vec()),
+        ]);
+        app.open = Some(OpenDoc::new(info, rows, Vec::new(), &app.settings.view));
+        let right_click = |app: &mut App, item: Option<usize>, reference: bool| {
+            let at = ViewMsg::Context { pos: iced::Point::ORIGIN, annotation: None, feature: None, col: None, item, reference };
+            let _ = app.update(Message::View(at));
+            app.context_entries(app.context.unwrap().target)
+        };
+        // A sequence's name (the reference is pinned above the others).
+        let item = app.open.as_ref().unwrap().item_of_row(1);
+        assert!(item.is_some());
+        let entries = right_click(&mut app, item, false);
+        assert!(matches!(action(&entries, "Copy row sequence"), Some(Message::CopyRowSequence(1))));
+        let _ = app.update(Message::CopyRowSequence(1));
+        assert_eq!(app.status, "Sequence of “s1” copied to the clipboard (4 bp)");
+        assert_eq!(app.open.as_ref().unwrap().doc.rows[1].ungapped(), b"GTCG");
+        // The reference's name.
+        let entries = right_click(&mut app, None, true);
+        assert!(matches!(action(&entries, "Copy row sequence"), Some(Message::CopyRowSequence(0))));
+        let _ = app.update(Message::CopyRowSequence(0));
+        assert_eq!(app.status, "Sequence of “ref” copied to the clipboard (8 bp)");
+        // Not on a name.
+        let _ = app.update(Message::CloseContext);
+        let entries = right_click(&mut app, None, false);
+        assert!(!has_entry(&entries, "Copy row sequence"));
+        close(app);
     }
 }

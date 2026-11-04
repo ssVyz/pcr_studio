@@ -173,8 +173,9 @@ pub enum ContextTarget {
     /// Free space in the library list.
     Empty,
     /// The sequence viewer, on an annotation or a feature (id) or neither;
-    /// `col` is the alignment column under the cursor.
-    Viewer { annotation: Option<i64>, feature: Option<i64>, col: Option<usize> },
+    /// `col` is the alignment column under the cursor, `row` the row whose
+    /// name was right-clicked.
+    Viewer { annotation: Option<i64>, feature: Option<i64>, col: Option<usize>, row: Option<usize> },
 }
 
 /// What to do with the selected rows of the open document.
@@ -404,6 +405,8 @@ pub enum Message {
     PrimerOrientation(Orientation),
     CopyOligo,
     CopyReport,
+    /// Copy the bases of a row of the open document (gaps removed).
+    CopyRowSequence(usize),
     /// Open the oligo report whenever columns are selected.
     ToggleAutoReport(bool),
     ToggleCollapseGaps(bool),
@@ -544,11 +547,7 @@ impl App {
                 (db, Some(format!("{e}. Using {} instead.", fallback.display())))
             }
         };
-        let settings: AppSettings = db.setting(SETTINGS_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        let library = db.list_documents().unwrap_or_default();
-        let linked = db.list_linked().unwrap_or_default().into_iter().collect();
-        let folders = db.list_folders().unwrap_or_default();
-        let status = format!("Library: {} · {} document(s)", db_path.display(), library.len());
+        let mut app = App::new(db, db_path, error);
         // FASTA files given on the command line ("Open with…") are imported
         // right away; FASTQ files open the dialog that links them.
         let paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).filter(|p| p.is_file()).collect();
@@ -556,7 +555,20 @@ impl App {
         let import = if fasta.is_empty() { Task::none() } else { Task::done(Message::ImportPicked(Some(fasta))) };
         let link = if fastq.is_empty() { Task::none() } else { Task::done(Message::FastqPicked(Some(fastq))) };
         let size = iced::window::latest().and_then(iced::window::size).map(Message::WindowSize);
-        let mut app = App {
+        let check = app.check_tools(tools::ALL);
+        let links = app.check_links(None);
+        (app, Task::batch([import, link, size, check, links]))
+    }
+
+    /// The window's state for library `db` (the file `db_path`); `error` is
+    /// shown at once.
+    fn new(db: Db, db_path: PathBuf, error: Option<String>) -> App {
+        let settings: AppSettings = db.setting(SETTINGS_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let library = db.list_documents().unwrap_or_default();
+        let linked = db.list_linked().unwrap_or_default().into_iter().collect();
+        let folders = db.list_folders().unwrap_or_default();
+        let status = format!("Library: {} · {} document(s)", db_path.display(), library.len());
+        App {
             db,
             db_path,
             library,
@@ -582,10 +594,7 @@ impl App {
             modal: None,
             status,
             error,
-        };
-        let check = app.check_tools(tools::ALL);
-        let links = app.check_links(None);
-        (app, Task::batch([import, link, size, check, links]))
+        }
     }
 
     fn title(&self) -> String {
@@ -1696,6 +1705,9 @@ impl App {
                         self.reload_library();
                         self.status = format!("Imported {} file(s)", ids.len());
                         if let Some(&last) = ids.last() {
+                            // Show it, also in a collapsed folder.
+                            let folder = self.library.iter().find(|d| d.id == last).and_then(|d| d.folder);
+                            self.reveal_folder(folder);
                             return self.open_document(last);
                         }
                     }
@@ -1911,6 +1923,13 @@ impl App {
                         self.status = "Report copied to the clipboard".into();
                         return iced::clipboard::write(text);
                     }
+            }
+            Message::CopyRowSequence(row) => {
+                if let Some(r) = self.open.as_ref().and_then(|o| o.doc.rows.get(row)) {
+                    let bases = r.ungapped();
+                    self.status = format!("Sequence of “{}” copied to the clipboard ({} bp)", r.name, canvas::group_digits(bases.len()));
+                    return iced::clipboard::write(String::from_utf8_lossy(&bases).into_owned());
+                }
             }
             Message::ToggleAutoReport(b) => self.set_pref(|p| p.auto_report = b),
             Message::ToggleCollapseGaps(b) => {
@@ -2266,18 +2285,21 @@ impl App {
                 self.resize_annotation(id, start, end, done);
                 return Task::none();
             }
-            ViewMsg::Context { pos, annotation, feature, col, item } => {
+            ViewMsg::Context { pos, annotation, feature, col, item, reference } => {
                 // Right-click selects the annotation, feature or row (by its
                 // name), like the library entries (one of several selected
                 // keeps them); the oligo report stays as it is.
+                let row = self.open.as_ref().and_then(|od| item.and_then(|i| od.item_row(i)));
                 if let Some(od) = self.open.as_mut()
-                    && let Some(row) = item.and_then(|i| od.item_row(i))
+                    && let Some(row) = row
                     && !od.selected_rows.contains(&row)
                 {
                     od.selected_rows.clear();
                     od.selected_rows.insert(row);
                     od.last_clicked_item = item;
                 }
+                // The reference's name: copying its sequence, no selection.
+                let row = row.or_else(|| self.open.as_ref().filter(|_| reference).and_then(|od| od.reference));
                 if let Some(id) = annotation {
                     let popup = self.open.as_ref().is_some_and(|o| o.popup_open);
                     if self.open.as_ref().is_some_and(|o| o.selected_annotations.contains(&id)) {
@@ -2294,7 +2316,7 @@ impl App {
                     self.focus_feature(id, false);
                 }
                 self.menu = None;
-                self.context = Some(ContextMenu { target: ContextTarget::Viewer { annotation, feature, col }, pos });
+                self.context = Some(ContextMenu { target: ContextTarget::Viewer { annotation, feature, col, row }, pos });
                 return Task::none();
             }
             _ => {}

@@ -7,6 +7,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.1.9] - 2026-11-04
+
+### Added
+
+- **Import into a folder**: a folder's right-click menu in the library now has **Import FASTA…**
+  (copy or link), **Import from NCBI / GenBank…** and **Import FASTQ (linked)…**; the new
+  documents go into that folder. Right-clicking free space in the library still imports to the
+  top level. A FASTA file imported into a collapsed folder now expands it, as linking already did.
+- **Copy row sequence** in the sequence viewer's right-click menu, on a sequence name (also the
+  reference's): copies that one sequence to the clipboard as plain bases, gaps removed, without
+  its name.
+
+### Fixed
+
+- The library list no longer jumps back to the top when you right-click an entry, open a menu or
+  a dialog, drag an entry, resize a panel, or open the first document (the display options panel
+  appears). It stays where it was, so you can see what you are deleting or renaming. Other
+  scroll positions and input focus in the window are kept in the same cases.
+
 ## [0.1.8] - 2026-11-02
 
 ### Added
