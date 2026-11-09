@@ -343,6 +343,18 @@ pub fn sample(set: &LinkedSet, seed: u64, cancel: &AtomicBool, progress: &(dyn F
     Ok(Preview { doc: Document::new(rows), kind: DocKind::Sequences, complete, qual })
 }
 
+/// Whether [`preview`] reads every record of `set`, judged from the scan
+/// results without reading the files: then the viewer holds all sequences
+/// and tools that need all of them can run.
+pub fn shows_all(set: &LinkedSet) -> bool {
+    let s = &set.summary;
+    match set.format {
+        Format::Fastq => units(set).is_ok_and(|u| u <= sample_size(set)),
+        // The preview reads the first file and stops at either limit.
+        Format::Fasta => set.files.len() == 1 && s.records <= PREVIEW_SEQUENCES as u64 && s.bases < PREVIEW_BASES,
+    }
+}
+
 /// Reads (pairs for paired sets) the viewer shows at once.
 fn sample_size(set: &LinkedSet) -> u64 {
     match set.layout {
@@ -529,6 +541,7 @@ mod tests {
         // The preview alternates R1 and R2.
         let p = preview(&set).unwrap();
         assert!(p.complete && p.kind == DocKind::Sequences);
+        assert!(shows_all(&set));
         let mates: Vec<&str> = p.doc.rows.iter().map(|r| r.meta_value("Mate").unwrap()).collect();
         assert_eq!(mates, ["R1", "R2", "R1", "R2"]);
         assert_eq!(p.doc.rows[1].data, b"TTTT");
@@ -553,6 +566,7 @@ mod tests {
         assert_eq!((s.records, s.bases, s.min_len, s.max_len, s.width, s.aligned, s.mean_quality), (2, 9, 4, 5, 5, true, None));
         let p = preview(&set).unwrap();
         assert!(p.complete && p.kind == DocKind::Alignment);
+        assert!(shows_all(&set));
         let cancel = AtomicBool::new(false);
         let as_fastq = scan_files(&[(fa.clone(), Format::Fastq)], &cancel, &|_| {});
         assert!(as_fastq[0].as_ref().unwrap_err().contains("is a FASTA file"));
@@ -628,16 +642,19 @@ mod tests {
         // The first reads: all from the first lane.
         let first = preview(&set).unwrap();
         assert_eq!((first.doc.rows[0].name.as_str(), first.doc.rows[999].name.as_str()), ("L1:0", "L1:499"));
+        assert!(!first.complete && !shows_all(&set));
         // Single files: the whole set when it is small, and cancelling.
         let one = &files[..1];
         let set = build_set(Format::Fastq, Layout::Single, &[(one[0].0.clone(), Role::Single)], scan(&paths[..1])).unwrap();
         let p = sample(&set, 1, &cancel, &|_| {}).unwrap();
         assert!(p.complete && p.doc.rows.len() == 600 && p.doc.rows[0].meta.is_empty());
+        assert!(preview(&set).unwrap().complete && shows_all(&set));
         let many = dir.join("many.fastq");
         let names: Vec<String> = (0..10_000).map(|i| format!("r{i}")).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         std::fs::write(&many, fastq(&refs, &vec!["ACGT"; 10_000])).unwrap();
         let set = build_set(Format::Fastq, Layout::Single, &[(many.clone(), Role::Single)], scan(&[(many, Format::Fastq)])).unwrap();
+        assert!(!preview(&set).unwrap().complete && !shows_all(&set));
         cancel.store(true, Ordering::Relaxed);
         assert_eq!(sample(&set, 1, &cancel, &|_| {}).err().as_deref(), Some("Cancelled"));
         let _ = std::fs::remove_dir_all(&dir);

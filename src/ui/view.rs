@@ -3,7 +3,9 @@
 use super::canvas::{AlignmentView, group_digits};
 use super::dialogs::{self, ModalMsg};
 use super::state::{BASE_COL_W, GraphMode, Highlight, OpenDoc, ReadDisplay};
-use super::{App, ContextTarget, DropTarget, FolderChoice, GroupChoice, JUMP_INPUT, LIB_SCROLL, LibKey, Message, RowAction, SEARCH_INPUT, Split, icons, menu, style};
+use super::{
+    App, ContextTarget, DropTarget, FileTool, FolderChoice, GroupChoice, JUMP_INPUT, LIB_SCROLL, LibKey, Message, RowAction, SEARCH_INPUT, Split, icons, menu, style,
+};
 use crate::display::{Item, RowSort, SortKey};
 use crate::linked;
 use crate::model::{ConsensusThreshold, DocKind};
@@ -204,22 +206,24 @@ impl App {
             }
         };
         match key {
-            LibKey::Doc(id) if self.library.iter().any(|d| d.id == id && d.kind == DocKind::Linked) => vec![
-                Entry::item("Open", "", idle.then_some(Message::OpenDocument(id))),
-                Entry::item("Linked files…", "", Some(Message::LinkedFiles(id))),
-                Entry::item("Rename…", "", Some(Message::AskRename(id))),
-                Entry::Separator,
-                Entry::danger("Delete…", idle.then_some(Message::AskDelete(id))),
-            ],
             LibKey::Doc(id) => {
-                let single = self.library.iter().any(|d| d.id == id && d.n_rows == 1 && d.kind.has_rows());
-                vec![
-                    Entry::item("Open", "", idle.then_some(Message::OpenDocument(id))),
-                    Entry::item("Edit sequence…", "", (idle && single).then_some(Message::EditSequence(id))),
-                    Entry::item("Rename…", "", Some(Message::AskRename(id))),
-                    Entry::Separator,
-                    Entry::danger("Delete…", idle.then_some(Message::AskDelete(id))),
-                ]
+                let kind = self.library.iter().find(|d| d.id == id).map(|d| d.kind);
+                let mut entries = vec![Entry::item("Open", "", idle.then_some(Message::OpenDocument(id)))];
+                if kind == Some(DocKind::Linked) {
+                    entries.push(Entry::item("Linked files…", "", Some(Message::LinkedFiles(id))));
+                } else {
+                    let single = self.library.iter().any(|d| d.id == id && d.n_rows == 1 && d.kind.has_rows());
+                    entries.push(Entry::item("Edit sequence…", "", (idle && single).then_some(Message::EditSequence(id))));
+                }
+                entries.extend([Entry::item("Rename…", "", Some(Message::AskRename(id))), Entry::Separator]);
+                // Whole-document tools (they open the document first); text
+                // documents have no sequences for them.
+                if kind.is_some_and(|k| k != DocKind::Text) {
+                    entries.extend(FileTool::ALL.map(|t| Entry::item(t.label(), "", (idle && self.file_tool_accepts(t, id)).then_some(Message::FileTool(t, id)))));
+                    entries.push(Entry::Separator);
+                }
+                entries.push(Entry::danger("Delete…", idle.then_some(Message::AskDelete(id))));
+                entries
             }
             LibKey::Folder(id) => {
                 let collapsed = self.folders.iter().find(|f| f.id == id).is_some_and(|f| f.collapsed);
@@ -402,16 +406,21 @@ impl App {
                     Entry::item("Reset panel sizes", "", Some(Message::ResetPanels)),
                 ]
             }
-            menu::MenuId::Tools => vec![
-                Entry::item("Map to reference…", "Ctrl+M", when(idle && complete, Message::OpenMapDialog)),
-                Entry::item("Metadata from sequence names…", "", when(writable, Message::OpenNameFields)),
-                Entry::Separator,
-                self.primersearch_entry(selection && complete),
-                Entry::Separator,
-                Entry::item("Oligo report for selection", "", when(report, Message::ShowPopup)),
-                Entry::item("Find sequence…", "Ctrl+F", when(doc, Message::FocusSearch)),
-                Entry::item("Go to position…", "Ctrl+G", when(doc, Message::FocusJump)),
-            ],
+            // Whole-document tools first (also in a document's right-click
+            // menu in the library).
+            menu::MenuId::Tools => FileTool::ALL
+                .map(|t| Entry::item(t.label(), t.shortcut(), when(idle && complete, t.message())))
+                .into_iter()
+                .chain([
+                    Entry::item("Metadata from sequence names…", "", when(writable, Message::OpenNameFields)),
+                    Entry::Separator,
+                    self.primersearch_entry(selection && complete),
+                    Entry::Separator,
+                    Entry::item("Oligo report for selection", "", when(report, Message::ShowPopup)),
+                    Entry::item("Find sequence…", "Ctrl+F", when(doc, Message::FocusSearch)),
+                    Entry::item("Go to position…", "Ctrl+G", when(doc, Message::FocusJump)),
+                ])
+                .collect(),
         }
     }
 
@@ -1566,8 +1575,10 @@ fn drop_zone_style(theme: &Theme, active: bool, ok: bool) -> container::Style {
 #[cfg(test)]
 mod tests {
     use super::super::canvas::ViewMsg;
+    use super::super::dialogs::Modal;
+    use super::super::job::Payload;
     use super::super::state::OpenDoc;
-    use super::super::{App, LibKey, Message, Split, menu};
+    use super::super::{App, FileTool, LibKey, LoadedDoc, Message, Split, menu};
     use crate::db::Db;
     use crate::model::{DocKind, Document, Row};
     use iced::Element;
@@ -1695,6 +1706,47 @@ mod tests {
         assert!(matches!(action(&entries, "Import FASTA…"), Some(Message::ImportFasta)));
         assert!(matches!(action(&entries, "Import FASTQ (linked)…"), Some(Message::ImportFastq)));
         assert_eq!(app.target_folder(), None);
+        close(app);
+    }
+
+    /// A document's right-click menu in the library offers the whole-document
+    /// tools: they open the document first, then start. Text documents have
+    /// none.
+    #[test]
+    fn library_menu_maps_a_document() {
+        let (mut app, _, doc) = test_app("file_tool");
+        let _ = app.update(Message::LibContext(LibKey::Doc(doc)));
+        let entries = app.context_entries(app.context.unwrap().target);
+        assert!(matches!(action(&entries, "Map to reference…"), Some(Message::FileTool(FileTool::Map, d)) if d == doc));
+        let _ = app.update(Message::CloseContext);
+        // Not open: the document opens, then the dialog appears.
+        let _ = app.update(Message::FileTool(FileTool::Map, doc));
+        assert_eq!(app.open_then, Some((doc, FileTool::Map)));
+        assert!(app.modal.is_none());
+        // Let the loading thread finish with the library file; the test
+        // delivers its result itself.
+        let progress = app.job.as_ref().expect("the document is being opened").progress.clone();
+        let started = std::time::Instant::now();
+        while std::sync::Arc::strong_count(&progress) > 2 && started.elapsed().as_secs() < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (info, rows, anns) = app.db.load_document(doc, &|_| {}).unwrap();
+        let open = OpenDoc::new(info, rows, anns, &app.settings.view);
+        let _ = app.update(Message::DocLoaded(Payload::new(Ok(LoadedDoc { open }))));
+        assert!(matches!(app.modal, Some(Modal::Map(_))));
+        assert_eq!(app.open_then, None);
+        // Already open: the dialog at once.
+        app.modal = None;
+        let _ = app.update(Message::FileTool(FileTool::Map, doc));
+        assert!(matches!(app.modal, Some(Modal::Map(_))) && app.job.is_none());
+        app.modal = None;
+        let text = app.db.insert_text_document("t", "text", "", None).unwrap();
+        app.reload_library();
+        let _ = app.update(Message::LibContext(LibKey::Doc(text)));
+        let entries = app.context_entries(app.context.unwrap().target);
+        assert!(!has_entry(&entries, "Map to reference…") && has_entry(&entries, "Open"));
+        let _ = app.update(Message::FileTool(FileTool::Map, text));
+        assert!(app.modal.is_none() && app.open_then.is_none());
         close(app);
     }
 

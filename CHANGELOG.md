@@ -7,6 +7,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.1.10] - 2026-11-09
+
+### Added
+
+- **Map to reference from the library**: a document's right-click menu in the library now has
+  **Map to reference…**. It opens the document (if it is not open already), then the Map to
+  Reference dialog for it, so you don't have to open the document first. It is there for
+  documents with sequences; text documents don't show it. For linked files it is available only
+  when the viewer shows all of their sequences (small read sets and FASTA files), as in the Tools
+  menu. Tools that work on a whole document (the top of the Tools menu) now all appear there;
+  Map to reference is the only one so far.
+
 ## [0.1.9] - 2026-11-04
 
 ### Added

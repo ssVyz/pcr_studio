@@ -189,6 +189,38 @@ pub enum RowAction {
     Delete,
 }
 
+/// A tool that works on a whole document: the top of the Tools menu (on the
+/// open document) and a document's right-click menu in the library (opens
+/// that document first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTool {
+    Map,
+}
+
+impl FileTool {
+    pub const ALL: [FileTool; 1] = [FileTool::Map];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FileTool::Map => "Map to reference…",
+        }
+    }
+
+    /// Shortcut on the open document.
+    pub fn shortcut(self) -> &'static str {
+        match self {
+            FileTool::Map => "Ctrl+M",
+        }
+    }
+
+    /// Starts the tool on the open document.
+    fn message(self) -> Message {
+        match self {
+            FileTool::Map => Message::OpenMapDialog,
+        }
+    }
+}
+
 /// Where a dragged library entry would land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropTarget {
@@ -336,6 +368,8 @@ pub enum Message {
     LibCursor(iced::Point),
     /// Right-click on a library entry.
     LibContext(LibKey),
+    /// A whole-document tool on library document `id`, opened first.
+    FileTool(FileTool, i64),
     CloseContext,
     WindowSize(iced::Size),
     SplitPress(Split),
@@ -526,6 +560,8 @@ pub struct App {
     lib_multi: Vec<LibKey>,
     modifiers: keyboard::Modifiers,
     open: Option<OpenDoc>,
+    /// Tool to start once the document being opened (id) is shown.
+    open_then: Option<(i64, FileTool)>,
     settings: AppSettings,
     job: Option<Job>,
     /// Status of each external tool (by id).
@@ -587,6 +623,7 @@ impl App {
             lib_multi: Vec::new(),
             modifiers: keyboard::Modifiers::default(),
             open: None,
+            open_then: None,
             settings,
             job: None,
             tool_status: HashMap::new(),
@@ -1181,6 +1218,29 @@ impl App {
         true
     }
 
+    /// Whether `tool` can run on library document `id`, judged before it is
+    /// opened: a document with sequences, or linked files the viewer reads
+    /// completely.
+    fn file_tool_accepts(&self, tool: FileTool, id: i64) -> bool {
+        let Some(d) = self.library.iter().find(|d| d.id == id) else { return false };
+        match tool {
+            FileTool::Map => match d.kind {
+                DocKind::Text => false,
+                DocKind::Linked => self.linked.get(&id).is_some_and(linked::scan::shows_all),
+                _ => d.n_rows > 0,
+            },
+        }
+    }
+
+    /// Starts the tool waiting for the document just shown (see
+    /// [`Message::FileTool`]).
+    fn start_tool_after_open(&mut self) -> Task<Message> {
+        match self.open_then.take() {
+            Some((id, tool)) if self.open.as_ref().is_some_and(|o| o.info.id == id) => self.update(tool.message()),
+            _ => Task::none(),
+        }
+    }
+
     /// Whether the open document can be changed (linked files are read-only).
     fn open_writable(&self) -> bool {
         self.open.as_ref().is_some_and(|o| o.linked.is_none())
@@ -1300,6 +1360,16 @@ impl App {
                 self.menu = None;
                 let pos = iced::Point::new(self.lib_cursor.x, self.lib_cursor.y + menu::BAR_H);
                 self.context = Some(ContextMenu { target: ContextTarget::Entry(key), pos });
+            }
+            Message::FileTool(tool, id) => {
+                if self.busy() || !self.file_tool_accepts(tool, id) {
+                    return Task::none();
+                }
+                if self.open.as_ref().is_some_and(|o| o.info.id == id) {
+                    return self.update(tool.message());
+                }
+                self.open_then = Some((id, tool));
+                return self.open_document(id);
             }
             Message::CloseContext => self.context = None,
             Message::SplitPress(s) => {
@@ -1442,10 +1512,14 @@ impl App {
             Message::DocLoaded(p) => {
                 self.job = None;
                 match p.take() {
-                    Some(Ok(loaded)) => self.show_document(loaded),
+                    Some(Ok(loaded)) => {
+                        self.show_document(loaded);
+                        return self.start_tool_after_open();
+                    }
                     Some(Err(e)) => self.error = Some(e),
                     None => {}
                 }
+                self.open_then = None;
             }
             Message::ImportFasta => {
                 if self.busy() {
@@ -1658,6 +1732,7 @@ impl App {
                             self.link_states.insert(loaded.open.info.id, vec![FileState::Ok; l.set.files.len()]);
                         }
                         self.show_document(*loaded);
+                        return self.start_tool_after_open();
                     }
                     Some(Ok(LinkedOpen::Broken(id, states))) => {
                         let what = linked::problem_label(&states).unwrap_or_default();
@@ -1669,6 +1744,7 @@ impl App {
                     Some(Err(e)) => self.error = Some(e),
                     None => {}
                 }
+                self.open_then = None;
             }
             Message::SampleReads => return self.sample_reads(),
             Message::ImportPicked(Some(paths)) if !paths.is_empty() => {
