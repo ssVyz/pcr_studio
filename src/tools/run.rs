@@ -1,5 +1,6 @@
 //! Runs a tool as a child process: no console window, stdout collected,
-//! JSON-lines events from stderr (`--progress jsonl` convention), cancellable.
+//! stderr passed on line by line (JSON-lines events of the `--progress jsonl`
+//! convention, or plain text), cancellable.
 
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read};
@@ -58,6 +59,14 @@ impl Handle {
     }
 }
 
+/// One line the tool wrote to stderr.
+pub enum Line<'a> {
+    /// A JSON object (progress or other event).
+    Event(&'a Value),
+    /// Plain text (e.g. progress messages of a tool in text mode).
+    Text(&'a str),
+}
+
 /// What a finished (or killed) run produced.
 #[derive(Debug, Default)]
 pub struct Output {
@@ -83,9 +92,10 @@ impl Output {
     }
 }
 
-/// Runs `cmd` to completion. Every JSON object on stderr goes to `on_event`
-/// (from a reader thread); setting `cancel` kills the process.
-pub fn run(mut cmd: Command, handle: &Handle, cancel: &AtomicBool, on_event: &(dyn Fn(&Value) + Sync)) -> Result<Output, String> {
+/// Runs `cmd` to completion. Every stderr line except an error event goes to
+/// `on_line` as it arrives (from a reader thread); setting `cancel` kills the
+/// process.
+pub fn run(mut cmd: Command, handle: &Handle, cancel: &AtomicBool, on_line: &(dyn Fn(Line) + Sync)) -> Result<Output, String> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let program = cmd.get_program().to_string_lossy().into_owned();
     let mut child = cmd.spawn().map_err(|e| format!("Cannot start {program}: {e}"))?;
@@ -109,8 +119,11 @@ pub fn run(mut cmd: Command, handle: &Handle, cancel: &AtomicBool, on_event: &(d
                     let line = String::from_utf8_lossy(&line).trim().to_string();
                     match serde_json::from_str::<Value>(&line).ok().filter(Value::is_object) {
                         Some(ev) if ev["type"] == "error" => error = ev["message"].as_str().map(|m| m.trim().to_string()),
-                        Some(ev) => on_event(&ev),
-                        None if !line.is_empty() => plain.push(line),
+                        Some(ev) => on_line(Line::Event(&ev)),
+                        None if !line.is_empty() => {
+                            on_line(Line::Text(&line));
+                            plain.push(line);
+                        }
                         None => {}
                     }
                 }

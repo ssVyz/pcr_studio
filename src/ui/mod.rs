@@ -21,11 +21,13 @@ use crate::net::entrez::{self, Credentials};
 use crate::primer::{self, OligoSource, Orientation, PrimerOptions};
 use crate::search::{self, Scope};
 use crate::tools::primersearch as ps;
+use crate::tools::simpletrim as st;
 use crate::tools::{self, ToolConfig, ToolSpec, ToolStatus};
 use canvas::ViewMsg;
 use dialogs::{
-    AnnotationDialog, ColorDialog, EditTarget, ExportDialog, ExportRows, FeatureDialog, GenBankDialog, ImportFastaDialog, ImportInto, LinkFastqDialog, LinkedDialog,
+    AnalyzeDialog, AnnotationDialog, ColorDialog, EditTarget, ExportDialog, ExportRows, FeatureDialog, GenBankDialog, ImportFastaDialog, ImportInto, LinkFastqDialog, LinkedDialog,
     LinkedMsg, MapDialog, Modal, PrimersearchDialog, RefChoice, RowsConfirm, SequenceDialog, SerialAnnotationDialog, SettingsDialog, TextView, TextViewMsg, TrimConfirm,
+    LibraryTarget,
 };
 use iced::keyboard::{self, Key, key::Named};
 use iced::{Subscription, Task, Theme};
@@ -293,6 +295,14 @@ struct ToolRun {
     started: Instant,
 }
 
+/// How a read analysis (simpletrim analyze) ended.
+pub enum AnalyzeOutcome {
+    /// The report, not saved yet; it is saved as `target` on request.
+    Done { text: String, target: LibraryTarget, status: String },
+    Cancelled,
+    Failed(String),
+}
+
 /// How a tool run ended.
 pub enum RunOutcome {
     /// The output was saved as library document `id`.
@@ -512,6 +522,13 @@ pub enum Message {
     Primersearch(dialogs::PrimersearchMsg),
     RunPrimersearch,
     PrimersearchDone(Payload<RunOutcome>),
+    /// The read analysis dialog for linked FASTQ document `id`.
+    OpenAnalyze(i64),
+    Analyze(dialogs::AnalyzeMsg),
+    RunAnalyze,
+    AnalyzeDone(Payload<AnalyzeOutcome>),
+    /// Shows the report that finished while something else was on screen.
+    ShowReport,
     CancelToolRun,
     TextView(TextViewMsg),
     TextSavePicked(Option<PathBuf>),
@@ -567,6 +584,9 @@ pub struct App {
     /// Status of each external tool (by id).
     tool_status: HashMap<&'static str, ToolStatus>,
     tool_run: Option<ToolRun>,
+    /// A tool's report that finished while something else was on screen
+    /// (shown from the status bar).
+    pending_report: Option<TextView>,
     modal: Option<Modal>,
     status: String,
     error: Option<String>,
@@ -628,6 +648,7 @@ impl App {
             job: None,
             tool_status: HashMap::new(),
             tool_run: None,
+            pending_report: None,
             modal: None,
             status,
             error,
@@ -912,6 +933,11 @@ impl App {
 
     fn tool_ready(&self, id: &str) -> bool {
         self.tool_status.get(id).is_some_and(ToolStatus::is_ready)
+    }
+
+    /// Whether library document `id` is a linked FASTQ read set.
+    fn is_linked_fastq(&self, id: i64) -> bool {
+        self.linked.get(&id).is_some_and(|s| s.format == Format::Fastq)
     }
 
     /// Checks the tools in the background with their current settings.
@@ -2249,12 +2275,28 @@ impl App {
             }
             Message::RunPrimersearch => return self.run_primersearch(),
             Message::PrimersearchDone(p) => return self.primersearch_done(p.take()),
+            Message::OpenAnalyze(id) => self.open_analyze(id),
+            Message::Analyze(m) => {
+                if let Some(Modal::Analyze(d)) = self.modal.as_mut() {
+                    d.update(m);
+                }
+            }
+            Message::RunAnalyze => return self.run_analyze(),
+            Message::AnalyzeDone(p) => self.analyze_done(p.take()),
+            Message::ShowReport => {
+                if self.modal.is_none()
+                    && let Some(v) = self.pending_report.take()
+                {
+                    self.modal = Some(Modal::TextView(v));
+                }
+            }
             Message::CancelToolRun => {
                 if let Some(r) = &self.tool_run {
                     r.job.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                     self.status = format!("Stopping {}…", r.name);
                 }
             }
+            Message::TextView(TextViewMsg::SaveToLibrary) => self.save_report(),
             Message::TextView(m) => {
                 if let Some(Modal::TextView(v)) = self.modal.as_mut() {
                     if matches!(m, TextViewMsg::Copy) {
@@ -3625,15 +3667,17 @@ impl App {
                 let mut cmd = tools::run::command(&path);
                 cmd.args(&args);
                 p.set(0.0, "Starting");
-                let on_event = |ev: &serde_json::Value| {
-                    if let Some((fraction, message)) = ps::progress(ev) {
+                let on_line = |line: tools::run::Line| {
+                    if let tools::run::Line::Event(ev) = line
+                        && let Some((fraction, message)) = ps::progress(ev)
+                    {
                         match fraction {
                             Some(f) => p.set(f, &message),
                             None => p.set_message(&message),
                         }
                     }
                 };
-                let out = match tools::run::run(cmd, &h, &p.cancel, &on_event) {
+                let out = match tools::run::run(cmd, &h, &p.cancel, &on_line) {
                     Ok(out) => out,
                     Err(e) => return RunOutcome::Failed(e),
                 };
@@ -3705,6 +3749,200 @@ impl App {
             None => self.error = Some("primersearch run failed unexpectedly".into()),
         }
         Task::none()
+    }
+
+    /// Opens the read analysis dialog for linked FASTQ document `id`.
+    fn open_analyze(&mut self, id: i64) {
+        let version = match self.tool_status.get(tools::SIMPLETRIM.id) {
+            Some(ToolStatus::Ready { version, .. }) => version.clone(),
+            _ => {
+                self.error = Some("simpletrim is not available: set it up in Edit → Settings → External tools.".into());
+                return;
+            }
+        };
+        if let Some(r) = &self.tool_run {
+            self.error = Some(format!("{} is running; wait for it to finish or stop it in the status bar.", r.name));
+            return;
+        }
+        let (Some(d), Some(set)) = (self.library.iter().find(|d| d.id == id), self.linked.get(&id)) else { return };
+        if set.format != linked::Format::Fastq {
+            return;
+        }
+        match st::inputs(set) {
+            Ok(inputs) if !inputs.is_empty() => {
+                self.modal = Some(Modal::Analyze(AnalyzeDialog {
+                    doc_id: id,
+                    doc_name: d.name.clone(),
+                    kind: set.kind_label(),
+                    technology: set.technology,
+                    folder: d.folder,
+                    inputs,
+                    chosen: 0,
+                    all_reads: false,
+                    version,
+                }));
+            }
+            Ok(_) => self.error = Some(format!("“{}” has no files", d.name)),
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// Runs simpletrim analyze on the dialog's file or lane. It runs alongside
+    /// other work; the report is shown when it finishes (not saved).
+    fn run_analyze(&mut self) -> Task<Message> {
+        let Some(Modal::Analyze(d)) = self.modal.as_ref() else { return Task::none() };
+        let Some(ToolStatus::Ready { path, version }) = self.tool_status.get(tools::SIMPLETRIM.id).cloned() else {
+            self.error = Some("simpletrim is not available: set it up in Edit → Settings → External tools.".into());
+            return Task::none();
+        };
+        if self.tool_run.is_some() {
+            return Task::none();
+        }
+        let Some(set) = self.linked.get(&d.doc_id).cloned() else { return Task::none() };
+        let input = d.input().clone();
+        let all_reads = d.all_reads;
+        let (doc_name, kind, folder, name) = (d.doc_name.clone(), d.kind.clone(), d.folder, d.report_name());
+        self.modal = None;
+        self.status = format!("simpletrim is analyzing “{doc_name}”; the report opens when it finishes");
+        let db_path = self.db_path.clone();
+        let handle = Arc::new(tools::run::Handle::default());
+        let h = handle.clone();
+        let (job, task) = job::spawn(
+            "simpletrim",
+            true,
+            move |p| {
+                p.set(0.0, "Checking the files");
+                let files = st::linked_files(&set, &input);
+                for f in &files {
+                    match linked::check(f).0 {
+                        FileState::Ok => {}
+                        FileState::Missing => return AnalyzeOutcome::Failed(format!("{} is missing. Use Linked files… to locate it.", f.path.display())),
+                        FileState::Changed => {
+                            return AnalyzeOutcome::Failed(format!("{} has changed since it was linked. Use Linked files… to check it.", f.path.display()));
+                        }
+                    }
+                }
+                // Reads (pairs) simpletrim will read, for the progress bar.
+                let records = files.first().map_or(0, |f| f.records);
+                let expected = if all_reads { records } else { records.min(st::DEFAULT_MAX_READS) }.max(1);
+                let db = match Db::open(&db_path) {
+                    Ok(db) => db,
+                    Err(e) => return AnalyzeOutcome::Failed(e),
+                };
+                let started = db.now_local();
+                let clock = Instant::now();
+                let args = st::analyze_args(&input, all_reads, st::threads());
+                let mut cmd = tools::run::command(&path);
+                cmd.args(&args);
+                p.set(0.0, "Starting");
+                let on_line = |line: tools::run::Line| {
+                    if let tools::run::Line::Text(l) = line
+                        && let Some(message) = st::status_line(l)
+                    {
+                        match st::reads_done(l) {
+                            Some(n) => p.set((n as f32 / expected as f32).min(1.0), &message),
+                            None => p.set_message(&message),
+                        }
+                    }
+                };
+                let out = match tools::run::run(cmd, &h, &p.cancel, &on_line) {
+                    Ok(out) => out,
+                    Err(e) => return AnalyzeOutcome::Failed(e),
+                };
+                if out.cancelled {
+                    return AnalyzeOutcome::Cancelled;
+                }
+                if out.code != Some(0) {
+                    return AnalyzeOutcome::Failed(format!("simpletrim stopped with an error:\n{}", st::error_text(&out)));
+                }
+                if out.stdout.trim().is_empty() {
+                    return AnalyzeOutcome::Failed("simpletrim finished without a report".into());
+                }
+                let seconds = clock.elapsed().as_secs_f64();
+                let finished = db.now_local();
+                let command = st::command_line(&args);
+                let report = st::Report {
+                    document: &doc_name,
+                    kind: &kind,
+                    input: &input,
+                    all_reads,
+                    version: &version,
+                    path: &path,
+                    command: &command,
+                    started: &started,
+                    finished: &finished,
+                    seconds,
+                };
+                let took = ps::duration(seconds);
+                let mut description = format!("simpletrim {version} analyze of “{doc_name}”");
+                if !input.part.is_empty() {
+                    description.push_str(&format!(" ({})", input.part.to_lowercase()));
+                }
+                description.push_str(&format!(", {}", if all_reads { "all reads" } else { "first reads" }));
+                AnalyzeOutcome::Done {
+                    text: report.text(&out.stdout),
+                    target: LibraryTarget { name, description, folder, saved: None },
+                    status: format!("simpletrim finished after {took}"),
+                }
+            },
+            |r| Message::AnalyzeDone(Payload::new(r.unwrap_or_else(|| AnalyzeOutcome::Failed("simpletrim run failed unexpectedly".into())))),
+        );
+        self.tool_run = Some(ToolRun { name: "simpletrim", job, handle, started: Instant::now() });
+        task
+    }
+
+    /// Shows the report of a read analysis, or keeps it for the status bar
+    /// while something else is on screen.
+    fn analyze_done(&mut self, outcome: Option<AnalyzeOutcome>) {
+        self.tool_run = None;
+        let quiet = self.modal.is_none() && self.menu.is_none() && self.context.is_none() && self.drag.is_none() && self.split_drag.is_none();
+        match outcome {
+            Some(AnalyzeOutcome::Done { text, target, status }) => {
+                let info = format!("{} · not saved yet", target.description);
+                let view = TextView::unsaved(info, &text, target);
+                if quiet {
+                    self.status = status;
+                    self.modal = Some(Modal::TextView(view));
+                } else {
+                    self.status = format!("{status}: the report is ready");
+                    self.pending_report = Some(view);
+                }
+            }
+            Some(AnalyzeOutcome::Cancelled) => self.status = "simpletrim run stopped".into(),
+            Some(AnalyzeOutcome::Failed(e)) => {
+                self.status = "simpletrim failed".into();
+                if quiet {
+                    self.modal = Some(Modal::Info { title: "simpletrim failed".into(), text: e });
+                } else {
+                    self.error = Some(e.replace('\n', " "));
+                }
+            }
+            None => self.error = Some("simpletrim run failed unexpectedly".into()),
+        }
+    }
+
+    /// Saves the report in the text viewer as a library text document.
+    fn save_report(&mut self) {
+        let Some(Modal::TextView(v)) = self.modal.as_mut() else { return };
+        let Some(target) = v.save.as_mut().filter(|t| t.saved.is_none()) else { return };
+        let name = target.name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        match self.db.insert_text_document(&name, &v.content.text(), &target.description, target.folder) {
+            Ok(id) => {
+                target.saved = Some(id);
+                v.name = name.clone();
+                v.info = format!("{} · saved in the library", target.description);
+                self.reload_library();
+                let folder = self.library.iter().find(|d| d.id == id).and_then(|d| d.folder);
+                self.reveal_folder(folder);
+                self.lib_multi.clear();
+                self.set_primary(Some(LibKey::Doc(id)));
+                self.status = format!("Saved “{name}” in the library");
+            }
+            Err(e) => self.error = Some(format!("The report could not be saved: {e}")),
+        }
     }
 
     /// Saves the selected columns of all sequences (without the reference) as a

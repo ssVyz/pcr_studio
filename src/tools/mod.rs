@@ -1,4 +1,4 @@
-//! External command-line tools (e.g. primersearch): where their binaries are,
+//! External command-line tools (primersearch, simpletrim): where their binaries are,
 //! whether they work, and running them. A tool that is not available only
 //! disables the features that need it.
 //!
@@ -7,6 +7,7 @@
 
 pub mod primersearch;
 pub mod run;
+pub mod simpletrim;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -35,8 +36,17 @@ pub const PRIMERSEARCH: ToolSpec = ToolSpec {
     purpose: "Finds primer sets covering the selected columns (Tools menu).",
 };
 
+pub const SIMPLETRIM: ToolSpec = ToolSpec {
+    id: "simpletrim",
+    name: "simpletrim",
+    exe: "simpletrim",
+    // The version `analyze` was checked with.
+    min_version: (0, 0, 5),
+    purpose: "Checks the reads of linked FASTQ files (Analyze reads…, library right-click).",
+};
+
 /// All tools, in the order the settings list them.
-pub const ALL: [&ToolSpec; 1] = [&PRIMERSEARCH];
+pub const ALL: [&ToolSpec; 2] = [&PRIMERSEARCH, &SIMPLETRIM];
 
 /// Where a tool's binary comes from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +214,8 @@ mod tests {
     fn versions() {
         assert_eq!(parse_version("primersearch 0.1.1\n"), Some((0, 1, 1)));
         assert_eq!(parse_version("tool v2.10\n"), Some((2, 10, 0)));
+        assert_eq!(parse_version("simpletrim 0.0.5\n"), Some((0, 0, 5)));
+        assert!((0, 0, 5) >= SIMPLETRIM.min_version);
         assert_eq!(parse_version("primersearch\n"), None);
         assert_eq!(parse_version(""), None);
         assert!((0, 1, 1) >= PRIMERSEARCH.min_version && (0, 1, 0) < PRIMERSEARCH.min_version);

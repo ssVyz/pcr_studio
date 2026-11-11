@@ -220,6 +220,11 @@ impl App {
                 // documents have no sequences for them.
                 if kind.is_some_and(|k| k != DocKind::Text) {
                     entries.extend(FileTool::ALL.map(|t| Entry::item(t.label(), "", (idle && self.file_tool_accepts(t, id)).then_some(Message::FileTool(t, id)))));
+                    // Only offered when simpletrim is set up; works on the files
+                    // without opening the document.
+                    if self.tool_ready(tools::SIMPLETRIM.id) && self.is_linked_fastq(id) {
+                        entries.push(Entry::item("Analyze reads (simpletrim)…", "", self.tool_run.is_none().then_some(Message::OpenAnalyze(id))));
+                    }
                     entries.push(Entry::Separator);
                 }
                 entries.push(Entry::danger("Delete…", idle.then_some(Message::AskDelete(id))));
@@ -415,6 +420,7 @@ impl App {
                     Entry::item("Metadata from sequence names…", "", when(writable, Message::OpenNameFields)),
                     Entry::Separator,
                     self.primersearch_entry(selection && complete),
+                    self.analyze_entry(),
                     Entry::Separator,
                     Entry::item("Oligo report for selection", "", when(report, Message::ShowPopup)),
                     Entry::item("Find sequence…", "Ctrl+F", when(doc, Message::FocusSearch)),
@@ -434,6 +440,20 @@ impl App {
             (true, false) => "Find primers in selection (primersearch)…",
         };
         menu::Entry::item(label, "", (ready && selection && self.tool_run.is_none()).then_some(Message::OpenPrimersearch))
+    }
+
+    /// Tools menu entry for the read analysis of the open linked FASTQ
+    /// document; disabled (with the reason) when simpletrim is not set up or a
+    /// tool is running.
+    fn analyze_entry(&self) -> menu::Entry {
+        let ready = self.tool_ready(tools::SIMPLETRIM.id);
+        let open = self.open.as_ref().map(|o| o.info.id).filter(|&id| self.is_linked_fastq(id));
+        let label = match (ready, &self.tool_run) {
+            (false, _) => "Analyze reads (simpletrim not available)".to_string(),
+            (true, Some(r)) => format!("Analyze reads ({} is running)", r.name),
+            (true, None) => "Analyze reads of linked FASTQ (simpletrim)…".to_string(),
+        };
+        menu::Entry::item(label, "", open.filter(|_| ready && self.tool_run.is_none()).map(Message::OpenAnalyze))
     }
 
     fn library_panel(&self, width: f32) -> Element<'_, Message> {
@@ -1359,6 +1379,11 @@ impl App {
             text(self.hover_text().unwrap_or_else(|| self.status.clone())).size(12).into()
         };
         let mut right = row![].spacing(18).align_y(Alignment::Center);
+        if self.pending_report.is_some() {
+            right = right.push(
+                button(text("Show report").size(11)).padding([1, 8]).style(button::primary).on_press_maybe(self.modal.is_none().then_some(Message::ShowReport)),
+            );
+        }
         if let Some(t) = &self.tool_run {
             let label = format!("{} · {} · {}", t.name, ellipsize_middle(&t.job.progress.message(), 80), clock(t.started.elapsed()));
             right = right.push(
@@ -1747,6 +1772,94 @@ mod tests {
         assert!(!has_entry(&entries, "Map to reference…") && has_entry(&entries, "Open"));
         let _ = app.update(Message::FileTool(FileTool::Map, text));
         assert!(app.modal.is_none() && app.open_then.is_none());
+        close(app);
+    }
+
+    /// A linked FASTQ set offers the read analysis once simpletrim is set up;
+    /// the dialog picks a lane, and the finished report can be saved in the
+    /// library (also when it waited behind another dialog).
+    #[test]
+    fn read_analysis_of_linked_fastq() {
+        use super::super::dialogs::{AnalyzeMsg, LibraryTarget, TextViewMsg};
+        use super::super::{AnalyzeOutcome, menu::MenuId};
+        use crate::linked::{Format, Layout, LinkedFile, LinkedSet, Role, Summary, Technology};
+        use crate::tools::{self, ToolStatus};
+        let (mut app, folder, _) = test_app("analyze");
+        let file = |name: &str, role| LinkedFile {
+            path: std::path::PathBuf::from("C:/runs").join(name),
+            role,
+            size: 1,
+            modified: None,
+            fingerprint: 0,
+            content_hash: 0,
+            records: 10,
+            bases: 1000,
+        };
+        let set = LinkedSet {
+            format: Format::Fastq,
+            layout: Layout::Paired,
+            technology: Technology::Illumina,
+            files: vec![file("x_L001_R1.fq.gz", Role::R1), file("x_L001_R2.fq.gz", Role::R2), file("x_L002_R1.fq.gz", Role::R1), file("x_L002_R2.fq.gz", Role::R2)],
+            summary: Summary::default(),
+        };
+        let id = app.db.insert_linked_document("Run 7", &set, "", Some(folder)).unwrap();
+        app.reload_library();
+        let label = "Analyze reads (simpletrim)…";
+        let _ = app.update(Message::LibContext(LibKey::Doc(id)));
+        assert!(!has_entry(&app.context_entries(app.context.unwrap().target), label), "offered without simpletrim");
+        app.tool_status.insert(tools::SIMPLETRIM.id, ToolStatus::Ready { path: "simpletrim.exe".into(), version: "0.0.5".into() });
+        let entries = app.context_entries(app.context.unwrap().target);
+        assert!(matches!(action(&entries, label), Some(Message::OpenAnalyze(d)) if d == id));
+        // The Tools menu works on the open document; none is open.
+        assert!(action(&app.menu_entries(MenuId::Tools), "Analyze reads of linked FASTQ (simpletrim)…").is_none());
+        let _ = app.update(Message::CloseContext);
+
+        let _ = app.update(Message::OpenAnalyze(id));
+        let Some(Modal::Analyze(d)) = &app.modal else { panic!("no analysis dialog") };
+        assert_eq!(d.inputs.len(), 2);
+        assert_eq!(d.report_name(), "Run 7 – read analysis (lane 1)");
+        let lane2 = d.inputs[1].clone();
+        let _ = app.update(Message::Analyze(AnalyzeMsg::Input(lane2)));
+        let Some(Modal::Analyze(d)) = &app.modal else { panic!("no analysis dialog") };
+        assert_eq!((d.chosen, d.report_name().as_str()), (1, "Run 7 – read analysis (lane 2)"));
+        assert!(d.input().r2.as_ref().is_some_and(|p| p.ends_with("x_L002_R2.fq.gz")));
+        let _ = Tree::new(app.view());
+        app.modal = None;
+
+        let done = || {
+            Some(AnalyzeOutcome::Done {
+                text: "REPORT".into(),
+                target: LibraryTarget { name: "Run 7 – read analysis".into(), description: "about".into(), folder: Some(folder), saved: None },
+                status: "simpletrim finished after 1.0 s".into(),
+            })
+        };
+        app.analyze_done(done());
+        let Some(Modal::TextView(v)) = &app.modal else { panic!("the report is not shown") };
+        assert!(v.save.as_ref().is_some_and(|t| t.saved.is_none()));
+        let _ = Tree::new(app.view());
+        let docs = app.library.len();
+        let _ = app.update(Message::TextView(TextViewMsg::LibraryName("Lane check".into())));
+        let _ = app.update(Message::TextView(TextViewMsg::SaveToLibrary));
+        let saved = app.library.iter().find(|d| d.name == "Lane check").expect("report not saved");
+        assert_eq!((saved.kind, saved.folder, saved.description.as_str()), (DocKind::Text, Some(folder), "about"));
+        assert_eq!(app.db.text_content(saved.id).unwrap().trim(), "REPORT");
+        let Some(Modal::TextView(v)) = &app.modal else { panic!("the report closed") };
+        assert_eq!(v.save.as_ref().and_then(|t| t.saved), Some(saved.id));
+        let _ = Tree::new(app.view());
+        // Saved once only.
+        let _ = app.update(Message::TextView(TextViewMsg::SaveToLibrary));
+        assert_eq!(app.library.len(), docs + 1);
+
+        // Another dialog is open: the report waits for the status bar.
+        app.modal = Some(Modal::Info { title: "t".into(), text: "x".into() });
+        app.analyze_done(done());
+        assert!(matches!(app.modal, Some(Modal::Info { .. })) && app.pending_report.is_some());
+        let _ = Tree::new(app.view());
+        let _ = app.update(Message::ShowReport);
+        assert!(matches!(app.modal, Some(Modal::Info { .. })), "replaced an open dialog");
+        app.modal = None;
+        let _ = app.update(Message::ShowReport);
+        assert!(matches!(app.modal, Some(Modal::TextView(_))) && app.pending_report.is_none());
         close(app);
     }
 

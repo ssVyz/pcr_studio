@@ -7,6 +7,50 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.1.11] - 2026-11-11
+
+### Added
+
+- **Analyze reads (simpletrim)**: a quality check of linked FASTQ reads with simpletrim
+  (`simpletrim analyze`, sister repo `C:\repos\simpletrim_rs`, version 0.0.5 or newer). It is a
+  new external tool, bundled like primersearch (`assets/tools/simpletrim.exe`) and set up in
+  **Edit → Settings → External tools**.
+  - **Analyze reads (simpletrim)…** is in the right-click menu of a linked FASTQ document in
+    the library (shown when simpletrim is set up). It works on the files directly, so the
+    document does not have to be opened. The Tools menu has **Analyze reads of linked FASTQ
+    (simpletrim)…** for the open document, greyed out with the reason when simpletrim is not
+    available or a tool is running.
+  - The dialog shows the read set. simpletrim reads one file or one R1/R2 pair per run, so for a
+    set with several lanes or files you pick one (the first by default). By default simpletrim
+    reads the first 1,000,000 reads or pairs (long reads: up to 500 Mb); **Read all reads** lifts
+    both limits.
+  - The run goes on alongside other work, like primersearch (status bar: simpletrim's current
+    step, elapsed time, **Stop**; a progress bar when it reports read counts). It uses all CPU
+    cores. The files are checked first: a missing or changed file stops the run with a pointer
+    to **Linked files…**.
+  - The report opens in the text viewer when the run finishes. It is not saved automatically:
+    **Save to library** (with an editable name, default "<read set> – read analysis", plus
+    "(lane N)" for one lane of several) saves it as a text document in the read set's folder.
+    **Copy all** and **Save as .txt…** work as for other text documents. If a dialog or menu is
+    open when the run finishes, the report waits behind a **Show report** button in the status
+    bar. Closing the viewer without saving discards the report.
+  - The report is simpletrim's own text output (run in text mode), headed by the document, the
+    analyzed lane or file and its full paths, the read limit, the tool version and path, the
+    command line, and start and finish times.
+
+### Changed
+
+- The tool runner (`tools::run::run`) now passes plain-text stderr lines to the caller as they
+  arrive (`run::Line::Text`), next to JSON events (`run::Line::Event`), so tools without a JSON
+  progress stream can show their progress messages.
+
+### Internal
+
+- `tools::simpletrim` (inputs of a read set, arguments, status and error lines, report header)
+  with tests; one runs the bundled simpletrim on a generated FASTQ file (skipped when
+  `assets/tools` has none). `linked::scan::sources` is public. A UI test covers the menus, the
+  dialog, and showing and saving the report.
+
 ## [0.1.10] - 2026-11-09
 
 ### Added

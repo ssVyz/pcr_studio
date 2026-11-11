@@ -365,7 +365,7 @@ fn sample_size(set: &LinkedSet) -> u64 {
 
 /// Where the reads of a FASTQ set come from: single files, or the R1 and R2
 /// files of each lane.
-fn sources(set: &LinkedSet) -> Result<Vec<&[LinkedFile]>, String> {
+pub fn sources(set: &LinkedSet) -> Result<Vec<&[LinkedFile]>, String> {
     match set.layout {
         Layout::Paired if set.files.len() < 2 || !set.files.len().is_multiple_of(2) => Err("A paired read set needs R1 and R2 files".into()),
         Layout::Paired => Ok(set.files.chunks(2).collect()),

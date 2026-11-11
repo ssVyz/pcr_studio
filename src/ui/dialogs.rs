@@ -1,6 +1,6 @@
 //! Modal dialogs: new/edit sequence, annotations, feature import, map to
-//! reference, export, settings, primersearch, text viewer, rename,
-//! confirmations.
+//! reference, export, settings, primersearch, read analysis (simpletrim),
+//! text viewer, rename, confirmations.
 
 use super::canvas::group_digits;
 use super::job;
@@ -19,6 +19,7 @@ use crate::search::{self, Placement, Strands};
 use crate::seq::{self, GAP};
 use crate::thermo::TmConditions;
 use crate::tools::primersearch::{self as ps, Criterion, InputStats, Mode};
+use crate::tools::simpletrim::{self as st, AnalyzeInput};
 use crate::tools::{self, ToolConfig, ToolSource, ToolSpec, ToolStatus};
 use iced::widget::{Space, button, checkbox, column, container, pick_list, radio, row, rule, scrollable, text, text_editor, text_input};
 use iced::{Element, Fill, Font, Length, Task};
@@ -74,6 +75,7 @@ pub enum Modal {
     NameFields { delimiter: String, keys: String },
     Info { title: String, text: String },
     Primersearch(PrimersearchDialog),
+    Analyze(AnalyzeDialog),
     TextView(TextView),
     /// Exit requested while a tool runs; `detail` describes the run.
     ConfirmExit { detail: String },
@@ -3361,13 +3363,119 @@ impl LinkedDialog {
     }
 }
 
+// ---------------------------------------------------------------- read analysis
+
+/// Runs `simpletrim analyze` on one file or lane of a linked FASTQ set.
+pub struct AnalyzeDialog {
+    pub doc_id: i64,
+    pub doc_name: String,
+    /// "FASTQ · paired-end · 2 lanes".
+    pub kind: String,
+    pub technology: Technology,
+    /// Folder of the read set (where a saved report goes).
+    pub folder: Option<i64>,
+    /// Files or lanes; at least one.
+    pub inputs: Vec<AnalyzeInput>,
+    pub chosen: usize,
+    pub all_reads: bool,
+    pub version: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum AnalyzeMsg {
+    Input(AnalyzeInput),
+    AllReads(bool),
+}
+
+impl AnalyzeDialog {
+    pub fn update(&mut self, m: AnalyzeMsg) {
+        match m {
+            AnalyzeMsg::Input(i) => self.chosen = self.inputs.iter().position(|x| *x == i).unwrap_or(self.chosen),
+            AnalyzeMsg::AllReads(b) => self.all_reads = b,
+        }
+    }
+
+    pub fn input(&self) -> &AnalyzeInput {
+        &self.inputs[self.chosen.min(self.inputs.len() - 1)]
+    }
+
+    /// Name of the report in the library.
+    pub fn report_name(&self) -> String {
+        match self.input().part.split_once(" of ") {
+            Some((part, _)) => format!("{} – read analysis ({})", self.doc_name, part.to_lowercase()),
+            None => format!("{} – read analysis", self.doc_name),
+        }
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let m = Message::Analyze;
+        let muted = |t: String| text(t).size(12).style(style::muted).wrapping(text::Wrapping::WordOrGlyph);
+        let input = self.input();
+        let mut about = format!("{} · {}", self.doc_name, self.kind);
+        if self.technology != Technology::Unknown {
+            about.push_str(&format!(" · {}", self.technology));
+        }
+        let mut body = column![text(about).size(13).wrapping(text::Wrapping::WordOrGlyph)].spacing(10);
+        if self.inputs.len() > 1 {
+            let lane = input.r2.is_some();
+            body = body.push(pick_list(&self.inputs[..], Some(input), move |i| m(AnalyzeMsg::Input(i))).text_size(13).width(Fill)).push(muted(
+                if lane {
+                    "simpletrim analyzes one lane (its R1 and R2 files together) per run."
+                } else {
+                    "simpletrim analyzes one file per run."
+                }
+                .into(),
+            ));
+        } else {
+            body = body.push(text(input.label()).size(13).wrapping(text::Wrapping::WordOrGlyph));
+        }
+        let unit = if input.r2.is_some() { "read pairs" } else { "reads" };
+        body = body
+            .push(rule::horizontal(1))
+            .push(checkbox(self.all_reads).label(format!("Read all {unit} (slower)")).on_toggle(move |b| m(AnalyzeMsg::AllReads(b))).text_size(13))
+            .push(muted(format!(
+                "Otherwise simpletrim reads the first {} {unit} (long reads: up to 500 Mb), which is usually enough.",
+                group_digits(st::DEFAULT_MAX_READS as usize)
+            )))
+            .push(rule::horizontal(1))
+            .push(muted(
+                "The report covers read lengths, qualities, adapters, poly-G tails, pair overlap and suggested trim settings. \
+                 It opens when simpletrim finishes; you can then save it in the library. The files are only read. \
+                 PCR Studio stays usable while it runs."
+                    .into(),
+            ))
+            .push(muted(format!("simpletrim {}", self.version)));
+        let buttons = row![
+            Space::new().width(Fill),
+            button("Cancel").on_press(Message::CloseModal).style(button::secondary),
+            button("Analyze").on_press(Message::RunAnalyze).style(button::primary),
+        ]
+        .spacing(10);
+        dialog_frame("Analyze reads (simpletrim)", body.into(), buttons.into(), 560.0)
+    }
+}
+
 // ---------------------------------------------------------------- text viewer
 
-/// Shows a text document (read-only; text can be selected and copied).
+/// A text that is not in the library yet (a tool's report) and where it goes
+/// when saved.
+#[derive(Debug, Clone)]
+pub struct LibraryTarget {
+    pub name: String,
+    pub description: String,
+    pub folder: Option<i64>,
+    /// Saved as this document.
+    pub saved: Option<i64>,
+}
+
+/// Shows a text document (read-only; text can be selected and copied), or a
+/// tool's report that can be saved in the library.
 pub struct TextView {
     pub name: String,
     pub info: String,
     pub content: text_editor::Content,
+    /// Set for a text that is not (or only just) saved in the library.
+    pub save: Option<LibraryTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -3375,11 +3483,19 @@ pub enum TextViewMsg {
     Action(text_editor::Action),
     Copy,
     SaveAs,
+    LibraryName(String),
+    /// Handled by the app (needs the library).
+    SaveToLibrary,
 }
 
 impl TextView {
     pub fn new(name: String, info: String, content: &str) -> TextView {
-        TextView { name, info, content: text_editor::Content::with_text(content) }
+        TextView { name, info, content: text_editor::Content::with_text(content), save: None }
+    }
+
+    /// A report not saved yet; it is saved as `target`.
+    pub fn unsaved(info: String, content: &str, target: LibraryTarget) -> TextView {
+        TextView { name: target.name.clone(), info, content: text_editor::Content::with_text(content), save: Some(target) }
     }
 
     pub fn update(&mut self, m: TextViewMsg) -> Option<Task<Message>> {
@@ -3400,6 +3516,13 @@ impl TextView {
                     .save_file(),
                 |f| Message::TextSavePicked(f.map(|f| f.path().to_path_buf())),
             )),
+            TextViewMsg::LibraryName(s) => {
+                if let Some(t) = self.save.as_mut().filter(|t| t.saved.is_none()) {
+                    t.name = s;
+                }
+                None
+            }
+            TextViewMsg::SaveToLibrary => None,
         }
     }
 
@@ -3416,13 +3539,36 @@ impl TextView {
                 .wrapping(text::Wrapping::WordOrGlyph),
         ]
         .spacing(10);
-        let buttons = row![
+        let mut buttons = row![
             button("Copy all").on_press(t(TextViewMsg::Copy)).style(button::secondary),
             button("Save as .txt…").on_press(t(TextViewMsg::SaveAs)).style(button::secondary),
             Space::new().width(Fill),
-            button("Close").on_press(Message::CloseModal).style(button::primary),
         ]
-        .spacing(10);
+        .spacing(10)
+        .align_y(iced::Center);
+        match &self.save {
+            Some(target) if target.saved.is_none() => {
+                let ok = !target.name.trim().is_empty();
+                buttons = buttons.extend([
+                    text_input("Name in the library", &target.name)
+                        .on_input(move |s| t(TextViewMsg::LibraryName(s)))
+                        .on_submit_maybe(ok.then_some(t(TextViewMsg::SaveToLibrary)))
+                        .padding(5)
+                        .size(13)
+                        .width(Length::Fixed(320.0))
+                        .into(),
+                    button("Save to library").on_press_maybe(ok.then_some(t(TextViewMsg::SaveToLibrary))).style(button::primary).into(),
+                    button("Close").on_press(Message::CloseModal).style(button::secondary).into(),
+                ]);
+            }
+            Some(_) => {
+                buttons = buttons.extend([
+                    text("Saved in the library").size(13).style(style::muted).into(),
+                    button("Close").on_press(Message::CloseModal).style(button::primary).into(),
+                ]);
+            }
+            None => buttons = buttons.push(button("Close").on_press(Message::CloseModal).style(button::primary)),
+        }
         dialog_frame(self.name.as_str(), body.into(), buttons.into(), 1040.0)
     }
 }
@@ -3731,6 +3877,7 @@ pub fn view_modal(modal: &Modal) -> Element<'_, Message> {
             dialog_frame(title.as_str(), body.into(), buttons.into(), 480.0)
         }
         Modal::Primersearch(d) => d.view(),
+        Modal::Analyze(d) => d.view(),
         Modal::TextView(v) => v.view(),
         Modal::ConfirmExit { detail } => {
             let body = column![

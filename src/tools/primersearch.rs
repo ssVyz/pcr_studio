@@ -530,7 +530,12 @@ mod tests {
             let mut cmd = run::command(&path);
             cmd.args(args(p, &c, input));
             let events = std::sync::Mutex::new(Vec::new());
-            let out = run::run(cmd, &run::Handle::default(), &AtomicBool::new(cancel), &|ev| events.lock().unwrap().push(ev.clone())).unwrap();
+            let on_line = |line: run::Line| {
+                if let run::Line::Event(ev) = line {
+                    events.lock().unwrap().push(ev.clone());
+                }
+            };
+            let out = run::run(cmd, &run::Handle::default(), &AtomicBool::new(cancel), &on_line).unwrap();
             (out, events.into_inner().unwrap())
         };
         let (out, events) = go(&Params::default(), &file.path, false);
