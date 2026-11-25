@@ -3555,9 +3555,11 @@ impl App {
                     RefChoice::ThisDocument(None) => return Err("Choose a reference sequence".to_string()),
                     RefChoice::OtherDocument(id) => {
                         p.set(0.0, "Loading reference");
-                        let (info, rdoc, _) = db.load_document(id, &|_| {})?;
-                        let r = info.reference.unwrap_or(0);
-                        rdoc.rows.get(r).cloned().ok_or("The reference document is empty")?
+                        let (_, rdoc, _) = db.load_document(id, &|_| {})?;
+                        match rdoc.rows.as_slice() {
+                            [r] => r.clone(),
+                            _ => return Err("The reference document must contain exactly one sequence".to_string()),
+                        }
                     }
                 };
                 let queries: Vec<&Row> = query_rows.iter().map(|&i| &doc.rows[i]).collect();
@@ -3991,7 +3993,7 @@ impl App {
     /// document, or the open one when nothing is selected.
     fn editable_sequence(&self) -> Option<i64> {
         let id = self.library_selected.or_else(|| self.open.as_ref().map(|o| o.info.id))?;
-        self.library.iter().find(|d| d.id == id && d.n_rows == 1 && d.kind.has_rows()).map(|d| d.id)
+        self.library.iter().find(|d| d.id == id && d.is_single_sequence()).map(|d| d.id)
     }
 
     /// Creates the document of the sequence dialog, or saves the edited sequence.

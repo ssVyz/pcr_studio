@@ -303,6 +303,14 @@ pub struct DocInfo {
     pub folder: Option<i64>,
 }
 
+impl DocInfo {
+    /// Holds exactly one sequence: usable as a mapping reference and editable
+    /// with the sequence dialog.
+    pub fn is_single_sequence(&self) -> bool {
+        self.n_rows == 1 && self.kind.has_rows()
+    }
+}
+
 /// A library folder.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Folder {

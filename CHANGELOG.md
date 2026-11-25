@@ -7,6 +7,22 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Every code change gets an entry here and a patch bump (see `CLAUDE.md`).
 
+## [0.1.12] - 2026-11-25
+
+### Fixed
+
+- **Map to reference**: the list of library documents to use as the reference now only shows
+  documents that contain exactly one sequence. It used to list every document with sequences,
+  including multi-sequence FASTAs, alignments and contigs, and then silently mapped to that
+  document's reference row or its first sequence. The option is now labelled **A
+  single-sequence document from the library** and is greyed out when the library has none. The
+  mapping job also refuses a reference document that does not hold exactly one sequence.
+
+### Changed
+
+- The single-sequence check behind **Edit sequence…** and the mapping reference list is now one
+  shared helper (`DocInfo::is_single_sequence`); behaviour unchanged.
+
 ## [0.1.11] - 2026-11-11
 
 ### Added

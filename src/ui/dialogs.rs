@@ -1964,7 +1964,9 @@ impl MapDialog {
             reference: RefChoice::ThisDocument(reference),
             ref_filter: String::new(),
             candidates: Vec::new(),
-            docs: library.iter().filter(|x| x.id != od.info.id && x.kind.has_rows()).map(|x| DocOption { id: x.id, name: x.name.clone() }).collect(),
+            // Only single-sequence documents: with several there is no telling
+            // which one is meant.
+            docs: library.iter().filter(|x| x.id != od.info.id && x.is_single_sequence()).map(|x| DocOption { id: x.id, name: x.name.clone() }).collect(),
             sensitivity: last.sensitivity,
             word_len: last.word_len.to_string(),
             repeats: last.max_word_repeats.to_string(),
@@ -2104,7 +2106,7 @@ impl MapDialog {
                 let selected = self.docs.iter().find(|d| d.id == *id).cloned();
                 column![
                     pick_list(self.docs.clone(), selected, move |d| m(MapMsg::RefDoc(d))).width(Fill),
-                    text("Uses that document's reference sequence (or its first sequence).").size(12).style(style::muted),
+                    text("Lists the documents that contain a single sequence.").size(12).style(style::muted),
                 ]
                 .spacing(6)
                 .into()
@@ -2131,7 +2133,7 @@ impl MapDialog {
             text("Reference").size(15),
             checkbox(this_doc).label("A sequence of this document").on_toggle(move |b| m(MapMsg::UseThisDocument(b))),
             checkbox(!this_doc)
-                .label("Another document from the library")
+                .label("A single-sequence document from the library")
                 .on_toggle_maybe((!self.docs.is_empty()).then_some(move |b: bool| m(MapMsg::UseThisDocument(!b)))),
             ref_section,
             rule::horizontal(1),
@@ -3919,6 +3921,24 @@ mod tests {
             folder: None,
         };
         OpenDoc::new(info, doc, Vec::new(), &ViewPrefs::default())
+    }
+
+    #[test]
+    fn map_reference_documents_hold_one_sequence() {
+        let od = open(&["ACGT", "ACGA"], None);
+        let doc = |id: i64, kind: DocKind, n_rows: usize| DocInfo { id, name: format!("d{id}"), kind, n_rows, ..od.info.clone() };
+        let library = [
+            doc(1, DocKind::Alignment, 1), // the open document itself
+            doc(2, DocKind::Sequences, 1),
+            doc(3, DocKind::Sequences, 5),
+            doc(4, DocKind::Alignment, 1),
+            doc(5, DocKind::Contig, 3),
+            doc(6, DocKind::Text, 0),
+            doc(7, DocKind::Linked, 1),
+            doc(8, DocKind::Sequences, 0),
+        ];
+        let d = MapDialog::new(&od, &MapParams::default(), &library);
+        assert_eq!(d.docs.iter().map(|o| o.id).collect::<Vec<_>>(), [2, 4]);
     }
 
     #[test]

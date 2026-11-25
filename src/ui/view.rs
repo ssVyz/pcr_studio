@@ -212,7 +212,7 @@ impl App {
                 if kind == Some(DocKind::Linked) {
                     entries.push(Entry::item("Linked files…", "", Some(Message::LinkedFiles(id))));
                 } else {
-                    let single = self.library.iter().any(|d| d.id == id && d.n_rows == 1 && d.kind.has_rows());
+                    let single = self.library.iter().any(|d| d.id == id && d.is_single_sequence());
                     entries.push(Entry::item("Edit sequence…", "", (idle && single).then_some(Message::EditSequence(id))));
                 }
                 entries.extend([Entry::item("Rename…", "", Some(Message::AskRename(id))), Entry::Separator]);
